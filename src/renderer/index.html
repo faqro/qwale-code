@@ -12,11 +12,89 @@
 
   <main class="workspace">
     <section class="explorer">
-      <div class="panel-title panel-title-split">
-        <span>Explorer</span>
-        <span id="projectInfo" class="project-info">No folder opened</span>
+      <div id="explorerResizeHandle" class="explorer-resize-handle"></div>
+      <div class="explorer-shell">
+        <aside class="explorer-side-tabs" aria-label="Explorer Views">
+          <button id="sidebarTabExplorer" class="explorer-side-tab active" type="button" title="Explorer">
+            <span class="explorer-side-icon explorer-side-icon-files" aria-hidden="true"></span>
+          </button>
+          <button id="sidebarTabSourceControl" class="explorer-side-tab" type="button" title="Version Control">
+            <span class="explorer-side-icon explorer-side-icon-branch" aria-hidden="true"></span>
+          </button>
+        </aside>
+
+        <div id="explorerPanelView" class="explorer-panel-view active">
+          <div class="panel-title panel-title-split">
+            <span>Explorer</span>
+            <span id="projectInfo" class="project-info">No folder opened</span>
+          </div>
+          <div id="treeRoot" class="tree"></div>
+        </div>
+
+        <div id="sourceControlPanelView" class="explorer-panel-view">
+          <div class="panel-title">Version Control</div>
+          <div class="scm-panel-body">
+            <div id="scmBranchInfo" class="scm-branch-info">No repository loaded.</div>
+
+            <div id="scmSetupSection" class="scm-section">
+              <div class="scm-label">Repository setup</div>
+              <button id="scmInitRepoBtn" class="scm-btn" type="button">Initialize Repository</button>
+              <div class="scm-publish-row">
+                <select id="scmHostSelect" class="scm-select">
+                  <option value="github">GitHub</option>
+                  <option value="gitlab">GitLab</option>
+                  <option value="bitbucket">Bitbucket</option>
+                  <option value="custom">Custom</option>
+                </select>
+                <button id="scmOpenHostBtn" class="scm-btn" type="button">Open Host</button>
+              </div>
+              <input id="scmRemoteUrlInput" class="scm-input" type="text" placeholder="https://host/user/repo.git" />
+              <button id="scmPublishBtn" class="scm-btn" type="button">Publish Repository</button>
+            </div>
+
+            <div class="scm-section">
+              <label class="scm-label" for="scmCommitMessage">Commit message</label>
+              <textarea id="scmCommitMessage" class="scm-commit-input" rows="2" placeholder="Describe your changes..."></textarea>
+
+              <div class="scm-label">Changed files</div>
+              <div id="scmChangedFiles" class="scm-files-list"></div>
+
+              <button id="scmCommitBtn" class="scm-btn scm-btn-primary" type="button">Commit</button>
+            </div>
+
+            <div class="scm-section scm-actions-row">
+              <button id="scmPushBtn" class="scm-btn" type="button">Push</button>
+              <div id="scmSyncSplit" class="scm-sync-split">
+                <button id="scmSyncBtn" class="scm-btn" type="button">Fetch</button>
+                <button id="scmSyncMenuBtn" class="scm-btn scm-sync-menu-btn" type="button" title="Sync actions">
+                  <span class="terminal-chevron" aria-hidden="true"></span>
+                </button>
+                <div id="scmSyncMenu" class="scm-sync-menu hidden">
+                  <button id="scmSyncFetchOption" class="scm-sync-menu-item" type="button">Fetch</button>
+                </div>
+              </div>
+              <button id="scmRefreshBtn" class="scm-btn" type="button">Refresh</button>
+            </div>
+
+            <div class="scm-section">
+              <div class="scm-label">Branches</div>
+              <div class="scm-branch-row">
+                <select id="scmBranchSelect" class="scm-select"></select>
+                <button id="scmSwitchBranchBtn" class="scm-btn" type="button">Switch</button>
+              </div>
+              <div class="scm-branch-row">
+                <input id="scmNewBranchInput" class="scm-input" type="text" placeholder="new-branch-name" />
+                <button id="scmCreateBranchBtn" class="scm-btn" type="button">Create</button>
+              </div>
+            </div>
+
+            <div class="scm-section">
+              <div class="scm-label">Commit graph</div>
+              <div id="scmGraph" class="scm-graph"></div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div id="treeRoot" class="tree"></div>
     </section>
 
     <section class="editor-area">
