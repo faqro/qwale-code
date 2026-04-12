@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   setAppTheme: (mode) => ipcRenderer.invoke('app:setTheme', mode),
   getAppInfo: () => ipcRenderer.invoke('app:getInfo'),
   openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
+  runAiCommand: (payload) => ipcRenderer.invoke('ai:runCommand', payload),
   getTerminalProfiles: () => ipcRenderer.invoke('terminal:getProfiles'),
   createTerminal: (payload) => ipcRenderer.invoke('terminal:create', payload),
   sendTerminalInput: (payload) => ipcRenderer.send('terminal:input', payload),

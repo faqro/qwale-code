@@ -1163,6 +1163,38 @@ ipcMain.on('terminal:kill', (_, { termId }) => {
   }
 });
 
+ipcMain.handle('ai:runCommand', async (event, { command }) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  if (!projectPath) {
+    throw new Error('Open a project first.');
+  }
+
+  const cmd = String(command || '').trim();
+  if (!cmd) {
+    throw new Error('Command is required.');
+  }
+
+  return new Promise((resolve) => {
+    execFile(process.platform === 'win32' ? 'powershell.exe' : (process.env.SHELL || 'bash'),
+      process.platform === 'win32' ? ['-NoProfile', '-Command', cmd] : ['-lc', cmd],
+      {
+        cwd: projectPath,
+        windowsHide: true,
+        timeout: 60000,
+        maxBuffer: 1024 * 1024
+      },
+      (error, stdout, stderr) => {
+        resolve({
+          ok: !error,
+          code: error && typeof error.code === 'number' ? error.code : 0,
+          stdout: (stdout || '').trimEnd(),
+          stderr: (stderr || '').trimEnd(),
+          message: error ? (error.message || 'Command failed.') : ''
+        });
+      });
+  });
+});
+
 app.whenReady().then(async () => {
   await loadRecentProjects();
   createAppMenu();

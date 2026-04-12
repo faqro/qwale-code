@@ -7,6 +7,22 @@ const explorerPanelView = document.getElementById('explorerPanelView');
 const sourceControlPanelView = document.getElementById('sourceControlPanelView');
 const workspace = document.querySelector('.workspace');
 const explorerResizeHandle = document.getElementById('explorerResizeHandle');
+const aiResizeHandle = document.getElementById('aiResizeHandle');
+const aiPanel = document.getElementById('aiPanel');
+const aiPanelToggleBtn = document.getElementById('aiPanelToggleBtn');
+const aiPanelOpenBtn = document.getElementById('aiPanelOpenBtn');
+const aiKeySection = document.getElementById('aiKeySection');
+const aiModelSelect = document.getElementById('aiModelSelect');
+const aiApiKeyInput = document.getElementById('aiApiKeyInput');
+const aiSaveKeyBtn = document.getElementById('aiSaveKeyBtn');
+const aiClearKeyBtn = document.getElementById('aiClearKeyBtn');
+const aiChatSection = document.getElementById('aiChatSection');
+const aiMessages = document.getElementById('aiMessages');
+const aiClearChatBtn = document.getElementById('aiClearChatBtn');
+const aiPromptInput = document.getElementById('aiPromptInput');
+const aiSendBtn = document.getElementById('aiSendBtn');
+const aiStopBtn = document.getElementById('aiStopBtn');
+const aiAuthOnlyElements = document.querySelectorAll('.ai-auth-only');
 const projectInfo = document.getElementById('projectInfo');
 const treeRoot = document.getElementById('treeRoot');
 const editorTabs = document.getElementById('editorTabs');
@@ -90,6 +106,14 @@ let scmSyncMode = 'fetch';
 let scmState = 'no-project';
 let sidebarResizeState = null;
 let themeMode = 'dark';
+let aiResizeState = null;
+let leftSidebarWidth = 300;
+let aiPanelWidth = 360;
+let aiPanelOpen = true;
+let aiBusy = false;
+let aiAbortController = null;
+let aiConversation = [];
+let aiConversationCursor = -1;
 
 const openFiles = new Map();
 const terminalSessions = new Map();
@@ -111,6 +135,443 @@ const fitAddon = new FitAddon.FitAddon();
 terminal.loadAddon(fitAddon);
 terminal.open(terminalContainer);
 
+function updateWorkspaceColumns() {
+  if (!Number.isFinite(aiPanelWidth) || aiPanelWidth < 220) {
+    aiPanelWidth = 360;
+  }
+
+  if (aiPanelOpen) {
+    const right = Math.max(280, Math.round(aiPanelWidth));
+    workspace.style.gridTemplateColumns = `${leftSidebarWidth}px minmax(0, 1fr) ${right}px`;
+    aiPanel.classList.remove('hidden');
+    aiPanel.classList.remove('closed');
+  } else {
+    workspace.style.gridTemplateColumns = `${leftSidebarWidth}px minmax(0, 1fr)`;
+    aiPanel.classList.add('closed');
+    aiPanel.classList.add('hidden');
+  }
+
+  aiPanelOpenBtn.classList.toggle('hidden', aiPanelOpen);
+}
+
+function addAiMessage(role, text, options = {}) {
+  const item = document.createElement('div');
+  item.className = `ai-message ${role}`;
+
+  if (typeof options.convIndex === 'number') {
+    item.dataset.convIndex = String(options.convIndex);
+  }
+
+  if (role === 'user' && typeof options.convIndex === 'number' && options.rewindable !== false) {
+    const content = document.createElement('div');
+    content.className = 'ai-user-message-content';
+    content.textContent = text;
+
+    const rewindBtn = document.createElement('button');
+    rewindBtn.type = 'button';
+    rewindBtn.className = 'ai-rewind-btn';
+    rewindBtn.title = 'Edit this prompt from here';
+    rewindBtn.textContent = '↺';
+    rewindBtn.addEventListener('click', () => {
+      jumpToBeforeUserMessage(options.convIndex, text);
+    });
+
+    item.appendChild(content);
+    item.appendChild(rewindBtn);
+  } else {
+    item.textContent = text;
+  }
+
+  aiMessages.appendChild(item);
+  aiMessages.scrollTop = aiMessages.scrollHeight;
+}
+
+function addAiActivity(text) {
+  addAiMessage('activity', text);
+}
+
+function setAiConversationCursor(index) {
+  if (!aiConversation.length) {
+    aiConversationCursor = -1;
+    return;
+  }
+
+  if (index < 0) {
+    aiConversationCursor = -1;
+    return;
+  }
+
+  aiConversationCursor = Math.min(index, aiConversation.length - 1);
+}
+
+function recordAiConversation(role, content) {
+  aiConversation.push({ role, content: String(content || '') });
+  aiConversationCursor = aiConversation.length - 1;
+  syncAiChatControls();
+  return aiConversationCursor;
+}
+
+function pruneAiMessagesAfterCursor() {
+  const messageNodes = aiMessages.querySelectorAll('.ai-message[data-conv-index]');
+  for (const node of messageNodes) {
+    const convIndex = Number(node.dataset.convIndex);
+    if (!Number.isNaN(convIndex) && convIndex > aiConversationCursor) {
+      node.remove();
+    }
+  }
+}
+
+function jumpToBeforeUserMessage(userMessageIndex, userPromptText) {
+  if (aiBusy) {
+    return;
+  }
+
+  setAiConversationCursor(userMessageIndex - 1);
+  aiPromptInput.value = String(userPromptText || '');
+  autoResizeAiPrompt();
+  aiPromptInput.focus();
+  addAiActivity('Context moved before this message. Edit the prompt and send to continue from here.');
+}
+
+function ensureAiNotStopped(signal) {
+  if (signal && signal.aborted) {
+    throw new Error('AI request stopped by user.');
+  }
+}
+
+function setAiAuthState() {
+  const hasKey = Boolean(localStorage.getItem('openai-api-key'));
+  const savedModel = localStorage.getItem('openai-model') || 'gpt-5.4-mini';
+  aiModelSelect.value = savedModel;
+  aiKeySection.classList.remove('hidden');
+  aiClearKeyBtn.classList.toggle('hidden', !hasKey);
+  aiAuthOnlyElements.forEach((el) => {
+    el.classList.toggle('hidden', hasKey);
+  });
+  aiChatSection.classList.toggle('hidden', !hasKey);
+  syncAiChatControls();
+}
+
+function setAiBusy(isBusy) {
+  aiBusy = isBusy;
+  aiSendBtn.classList.toggle('loading', isBusy);
+  aiSendBtn.textContent = isBusy ? 'Working' : 'Send';
+  aiStopBtn.classList.toggle('hidden', !isBusy);
+  aiStopBtn.disabled = !isBusy;
+  syncAiChatControls();
+}
+
+function clearAiConversationHistory() {
+  if (aiAbortController) {
+    aiAbortController.abort();
+  }
+
+  aiConversation = [];
+  aiConversationCursor = -1;
+  aiMessages.innerHTML = '';
+  syncAiChatControls();
+}
+
+function syncAiChatControls() {
+  const hasProject = Boolean(project.rootPath);
+  const hasKey = Boolean(localStorage.getItem('openai-api-key'));
+  const canChat = hasProject && hasKey;
+
+  aiPromptInput.disabled = !canChat || aiBusy;
+  aiSendBtn.disabled = !canChat || aiBusy;
+  aiModelSelect.disabled = !canChat || aiBusy;
+  aiClearChatBtn.disabled = !canChat || aiBusy || aiConversation.length === 0;
+
+  aiPromptInput.placeholder = hasProject
+    ? 'Ask AI to edit code, create files, or run commands...'
+    : 'Open a folder to use AI chat';
+
+  const rewindButtons = aiMessages.querySelectorAll('.ai-rewind-btn');
+  rewindButtons.forEach((button) => {
+    button.disabled = !canChat || aiBusy;
+  });
+}
+
+function autoResizeAiPrompt() {
+  aiPromptInput.style.height = 'auto';
+  const maxHeight = 180;
+  const nextHeight = Math.min(maxHeight, aiPromptInput.scrollHeight);
+  aiPromptInput.style.height = `${Math.max(64, nextHeight)}px`;
+}
+
+function getAiTools() {
+  return [
+    {
+      type: 'function',
+      name: 'get_project_tree',
+      description: 'Get opened project tree structure.',
+      parameters: { type: 'object', properties: {} }
+    },
+    {
+      type: 'function',
+      name: 'read_file',
+      description: 'Read file content by project-relative path.',
+      parameters: {
+        type: 'object',
+        properties: { filePath: { type: 'string' } },
+        required: ['filePath']
+      }
+    },
+    {
+      type: 'function',
+      name: 'write_file',
+      description: 'Write content to a file by project-relative path.',
+      parameters: {
+        type: 'object',
+        properties: { filePath: { type: 'string' }, content: { type: 'string' } },
+        required: ['filePath', 'content']
+      }
+    },
+    {
+      type: 'function',
+      name: 'create_file',
+      description: 'Create a new file in a folder path with name.',
+      parameters: {
+        type: 'object',
+        properties: { parentPath: { type: 'string' }, name: { type: 'string' } },
+        required: ['parentPath', 'name']
+      }
+    },
+    {
+      type: 'function',
+      name: 'create_folder',
+      description: 'Create a new folder in a folder path with name.',
+      parameters: {
+        type: 'object',
+        properties: { parentPath: { type: 'string' }, name: { type: 'string' } },
+        required: ['parentPath', 'name']
+      }
+    },
+    {
+      type: 'function',
+      name: 'delete_path',
+      description: 'Delete a file or folder by path.',
+      parameters: {
+        type: 'object',
+        properties: { targetPath: { type: 'string' } },
+        required: ['targetPath']
+      }
+    },
+    {
+      type: 'function',
+      name: 'run_command',
+      description: 'Run a terminal command in opened project directory.',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command']
+      }
+    }
+  ];
+}
+
+function toAbsoluteProjectPath(inputPath) {
+  if (!project.rootPath) {
+    throw new Error('Open a project first.');
+  }
+
+  if (!inputPath) {
+    throw new Error('Path is required.');
+  }
+
+  if (/^[A-Za-z]:[\\/]/.test(inputPath) || inputPath.startsWith('/') || inputPath.startsWith('\\\\')) {
+    return inputPath;
+  }
+
+  return `${project.rootPath}${project.rootPath.endsWith('\\') || project.rootPath.endsWith('/') ? '' : '\\'}${inputPath}`;
+}
+
+async function runAiTool(name, args, signal) {
+  ensureAiNotStopped(signal);
+
+  if (name === 'get_project_tree') {
+    addAiActivity('Refreshing project tree...');
+    const refreshed = await api.refreshProject();
+    return JSON.stringify(refreshed);
+  }
+
+  if (name === 'read_file') {
+    addAiActivity(`Reading file: ${String(args.filePath || '')}`);
+    const abs = toAbsoluteProjectPath(args.filePath);
+    const payload = await api.readFile(abs);
+    return typeof payload === 'string' ? payload : payload.content;
+  }
+
+  if (name === 'write_file') {
+    addAiActivity(`Edited file: ${String(args.filePath || '')}`);
+    const abs = toAbsoluteProjectPath(args.filePath);
+    await api.writeFile({ filePath: abs, content: String(args.content || '') });
+    await refreshProjectTree();
+    return 'ok';
+  }
+
+  if (name === 'create_file') {
+    addAiActivity(`Created file: ${String(args.parentPath || '')}/${String(args.name || '')}`);
+    const parent = toAbsoluteProjectPath(args.parentPath);
+    await api.createFile({ parentPath: parent, name: String(args.name || '') });
+    await refreshProjectTree();
+    return 'ok';
+  }
+
+  if (name === 'create_folder') {
+    addAiActivity(`Created folder: ${String(args.parentPath || '')}/${String(args.name || '')}`);
+    const parent = toAbsoluteProjectPath(args.parentPath);
+    await api.createFolder({ parentPath: parent, name: String(args.name || '') });
+    await refreshProjectTree();
+    return 'ok';
+  }
+
+  if (name === 'delete_path') {
+    addAiActivity(`Deleted path: ${String(args.targetPath || '')}`);
+    const target = toAbsoluteProjectPath(args.targetPath);
+    await api.deletePath({ targetPath: target });
+    await refreshProjectTree();
+    return 'ok';
+  }
+
+  if (name === 'run_command') {
+    const command = String(args.command || '');
+    addAiActivity(`Running command: ${command}`);
+    const result = await api.runAiCommand({ command });
+    const exitCode = result && typeof result.exitCode !== 'undefined' ? result.exitCode : 'unknown';
+    addAiActivity(`Command finished (exit ${exitCode}): ${command}`);
+    return JSON.stringify(result);
+  }
+
+  throw new Error(`Unknown tool: ${name}`);
+}
+
+async function sendAiChat(conversationMessages, signal) {
+  const apiKey = localStorage.getItem('openai-api-key');
+  const model = localStorage.getItem('openai-model') || 'gpt-5.4-mini';
+  if (!apiKey) {
+    throw new Error('Add OpenAI API key first.');
+  }
+
+  const inputMessages = [
+    {
+      role: 'system',
+      content: 'You are an AI coding assistant in a local Electron IDE. Prefer using tools to inspect and change files. Keep responses concise and explain what changed.'
+    }
+  ];
+
+  for (const entry of conversationMessages) {
+    if (entry && (entry.role === 'user' || entry.role === 'assistant')) {
+      inputMessages.push({ role: entry.role, content: String(entry.content || '') });
+    }
+  }
+
+  const extractResponseText = (payload) => {
+    if (typeof payload.output_text === 'string' && payload.output_text.trim()) {
+      return payload.output_text.trim();
+    }
+
+    const output = Array.isArray(payload.output) ? payload.output : [];
+    const textParts = [];
+
+    for (const item of output) {
+      if (item && item.type === 'message' && Array.isArray(item.content)) {
+        for (const part of item.content) {
+          if (part && part.type === 'output_text' && typeof part.text === 'string') {
+            textParts.push(part.text);
+          }
+        }
+      } else if (item && item.type === 'output_text' && typeof item.text === 'string') {
+        textParts.push(item.text);
+      }
+    }
+
+    return textParts.join('\n').trim();
+  };
+
+  const extractToolCalls = (payload) => {
+    const output = Array.isArray(payload.output) ? payload.output : [];
+    return output.filter((item) => item && item.type === 'function_call');
+  };
+
+  let previousResponseId = null;
+  let pendingToolOutputs = null;
+
+  for (let step = 0; step < 8; step += 1) {
+    ensureAiNotStopped(signal);
+
+    addAiActivity('Assistant is thinking...');
+    const body = {
+      model,
+      tools: getAiTools()
+    };
+
+    if (previousResponseId && Array.isArray(pendingToolOutputs)) {
+      body.previous_response_id = previousResponseId;
+      body.input = pendingToolOutputs;
+    } else {
+      body.input = inputMessages;
+    }
+
+    const response = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      signal,
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const txt = await response.text();
+      throw new Error(txt || 'OpenAI request failed.');
+    }
+
+    const data = await response.json();
+    if (!data || typeof data !== 'object') {
+      throw new Error('No response from model.');
+    }
+
+    previousResponseId = typeof data.id === 'string' ? data.id : previousResponseId;
+
+    const toolCalls = extractToolCalls(data);
+    if (!toolCalls.length) {
+      const text = extractResponseText(data);
+      return text || 'Done.';
+    }
+
+    pendingToolOutputs = [];
+
+    for (const call of toolCalls) {
+      ensureAiNotStopped(signal);
+
+      const toolName = call.name ? call.name : '';
+      let args = {};
+      try {
+        args = call.arguments ? JSON.parse(call.arguments) : {};
+      } catch {
+        args = {};
+      }
+
+      let toolResult;
+      try {
+        toolResult = await runAiTool(toolName, args, signal);
+      } catch (error) {
+        toolResult = `Tool error: ${error.message}`;
+      }
+
+      pendingToolOutputs.push({
+        type: 'function_call_output',
+        call_id: call.call_id || call.id,
+        output: String(toolResult)
+      });
+    }
+  }
+
+  return 'Stopped after maximum tool steps.';
+}
+
 function applyTheme(mode) {
   themeMode = mode === 'light' ? 'light' : 'dark';
   document.body.classList.toggle('light-theme', themeMode === 'light');
@@ -124,7 +585,7 @@ function applyTheme(mode) {
   terminal.options.theme = {
     background: isLight ? '#ffffff' : '#0d1723',
     foreground: isLight ? '#1f2a3a' : '#d6e9ff',
-    cursor: isLight ? '#6f67ff' : '#45d483'
+    cursor: isLight ? '#6f67ff' : '#766ff0'
   };
 
   api.setAppTheme(themeMode).catch(() => {});
@@ -651,7 +1112,8 @@ function getSidebarWidthBounds() {
 function applySidebarWidth(width) {
   const bounds = getSidebarWidthBounds();
   const clamped = Math.min(bounds.max, Math.max(bounds.min, Math.round(width)));
-  workspace.style.gridTemplateColumns = `${clamped}px 1fr`;
+  leftSidebarWidth = clamped;
+  updateWorkspaceColumns();
 }
 
 async function runScmFetch() {
@@ -2272,7 +2734,13 @@ function renderTree() {
 }
 
 async function refreshProjectTree() {
+  const hadProject = Boolean(project.rootPath);
   project = await api.refreshProject();
+
+  if (hadProject && !project.rootPath) {
+    clearAiConversationHistory();
+  }
+
   projectInfo.textContent = project.rootPath ? `${project.rootName}  |  ${project.rootPath}` : 'No folder opened';
 
   if (project.rootPath && !expandedFolders.has(project.rootPath)) {
@@ -2281,6 +2749,7 @@ async function refreshProjectTree() {
 
   renderTree();
   refreshFileSearchIndex();
+  syncAiChatControls();
 }
 
 async function openFile(filePath, options = {}) {
@@ -2539,6 +3008,7 @@ async function applyOpenedProject(opened) {
   selectedNodePath = project.rootPath;
   renderTree();
   refreshFileSearchIndex();
+  syncAiChatControls();
   if (activeSidebarPanel === 'source-control') {
     await refreshSourceControlPanel();
   }
@@ -2585,6 +3055,7 @@ async function closeFolder() {
   renderTree();
   refreshFileSearchIndex();
   applyScmState('no-project');
+  clearAiConversationHistory();
   updateEditorTitle();
   renderTabs();
 
@@ -2858,6 +3329,13 @@ document.addEventListener('keydown', async (event) => {
 
 let resizeState = null;
 
+function clearResizeState() {
+  sidebarResizeState = null;
+  aiResizeState = null;
+  resizeState = null;
+  document.body.style.userSelect = '';
+}
+
 explorerResizeHandle.addEventListener('mousedown', (event) => {
   event.preventDefault();
   const explorer = document.querySelector('.explorer');
@@ -2867,6 +3345,116 @@ explorerResizeHandle.addEventListener('mousedown', (event) => {
   };
   document.body.style.userSelect = 'none';
 });
+
+aiResizeHandle.addEventListener('mousedown', (event) => {
+  event.preventDefault();
+  aiResizeState = {
+    startX: event.clientX,
+    startWidth: aiPanel.getBoundingClientRect().width
+  };
+  document.body.style.userSelect = 'none';
+});
+
+aiPanelToggleBtn.addEventListener('click', () => {
+  aiPanelOpen = false;
+  updateWorkspaceColumns();
+});
+
+aiPanelOpenBtn.addEventListener('click', () => {
+  aiPanelOpen = true;
+  updateWorkspaceColumns();
+});
+
+aiSaveKeyBtn.addEventListener('click', () => {
+  const key = aiApiKeyInput.value.trim();
+  if (!key) {
+    alert('Enter a valid OpenAI API key.');
+    return;
+  }
+
+  localStorage.setItem('openai-model', aiModelSelect.value || 'gpt-5.4-mini');
+  localStorage.setItem('openai-api-key', key);
+  aiApiKeyInput.value = '';
+  setAiAuthState();
+});
+
+aiModelSelect.addEventListener('change', () => {
+  localStorage.setItem('openai-model', aiModelSelect.value || 'gpt-5.4-mini');
+});
+
+aiClearKeyBtn.addEventListener('click', () => {
+  if (aiAbortController) {
+    aiAbortController.abort();
+  }
+  localStorage.removeItem('openai-api-key');
+  aiApiKeyInput.value = '';
+  setAiAuthState();
+});
+
+aiClearChatBtn.addEventListener('click', () => {
+  clearAiConversationHistory();
+});
+
+aiSendBtn.addEventListener('click', async () => {
+  if (!project.rootPath) {
+    alert('Open a project folder first.');
+    return;
+  }
+
+  const prompt = aiPromptInput.value.trim();
+  if (!prompt || aiBusy) {
+    return;
+  }
+
+  if (aiConversationCursor < aiConversation.length - 1) {
+    aiConversation = aiConversation.slice(0, aiConversationCursor + 1);
+    pruneAiMessagesAfterCursor();
+    addAiActivity('Started a new branch from the selected point.');
+  }
+
+  aiPromptInput.value = '';
+  autoResizeAiPrompt();
+  const userIndex = recordAiConversation('user', prompt);
+  addAiMessage('user', prompt, { convIndex: userIndex });
+  aiAbortController = new AbortController();
+  setAiBusy(true);
+
+  try {
+    const reply = await sendAiChat(aiConversation.slice(0, aiConversationCursor + 1), aiAbortController.signal);
+    const assistantIndex = recordAiConversation('assistant', reply);
+    addAiMessage('assistant', reply, { convIndex: assistantIndex });
+  } catch (error) {
+    if (error.name === 'AbortError' || error.message === 'AI request stopped by user.') {
+      addAiActivity('Stopped by user.');
+    } else {
+      addAiMessage('assistant', `Error: ${error.message}`);
+    }
+  } finally {
+    aiAbortController = null;
+    setAiBusy(false);
+  }
+});
+
+aiStopBtn.addEventListener('click', () => {
+  if (!aiBusy || !aiAbortController) {
+    return;
+  }
+
+  aiAbortController.abort();
+});
+
+aiPromptInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey && !aiBusy) {
+    event.preventDefault();
+    aiSendBtn.click();
+  }
+});
+
+aiPromptInput.addEventListener('input', () => {
+  autoResizeAiPrompt();
+});
+
+syncAiChatControls();
 
 terminalResizeHandle.addEventListener('mousedown', (event) => {
   resizeState = {
@@ -2880,6 +3468,14 @@ document.addEventListener('mousemove', (event) => {
   if (sidebarResizeState) {
     const deltaX = event.clientX - sidebarResizeState.startX;
     applySidebarWidth(sidebarResizeState.startWidth + deltaX);
+  }
+
+  if (aiResizeState && aiPanelOpen) {
+    const deltaX = aiResizeState.startX - event.clientX;
+    const nextWidth = aiResizeState.startWidth + deltaX;
+    const maxWidth = Math.max(280, Math.floor(workspace.getBoundingClientRect().width - leftSidebarWidth - 260));
+    aiPanelWidth = Math.min(maxWidth, Math.max(280, Math.round(nextWidth)));
+    updateWorkspaceColumns();
   }
 
   if (!resizeState) {
@@ -2902,17 +3498,19 @@ document.addEventListener('mousemove', (event) => {
 });
 
 document.addEventListener('mouseup', () => {
-  sidebarResizeState = null;
-  resizeState = null;
-  document.body.style.userSelect = '';
+  clearResizeState();
+});
+
+window.addEventListener('blur', () => {
+  clearResizeState();
 });
 
 window.addEventListener('resize', () => {
-  if (workspace.style.gridTemplateColumns) {
-    const currentLeft = parseFloat(workspace.style.gridTemplateColumns);
-    if (Number.isFinite(currentLeft)) {
-      applySidebarWidth(currentLeft);
-    }
+  applySidebarWidth(leftSidebarWidth);
+  if (aiPanelOpen) {
+    const maxWidth = Math.max(280, Math.floor(workspace.getBoundingClientRect().width - leftSidebarWidth - 260));
+    aiPanelWidth = Math.min(aiPanelWidth, maxWidth);
+    updateWorkspaceColumns();
   }
 
   fitAddon.fit();
@@ -2946,6 +3544,9 @@ window.addEventListener('beforeunload', (event) => {
 Promise.all([refreshProjectTree(), initMonacoEditor(), refreshRecentProjectsCache()])
   .then(() => {
     applyTheme(localStorage.getItem('qwale-theme') || 'dark');
+    aiPanelOpen = true;
+    setAiAuthState();
+    updateWorkspaceColumns();
     renderMenuBar();
     return initTerminalSystem();
   })

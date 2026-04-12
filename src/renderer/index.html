@@ -98,13 +98,60 @@
     </section>
 
     <section class="editor-area">
-      <div id="editorTabs" class="editor-tabs"></div>
+      <div id="aiResizeHandle" class="ai-resize-handle"></div>
+      <div class="editor-tabs-bar">
+        <div id="editorTabs" class="editor-tabs"></div>
+        <button id="aiPanelOpenBtn" class="ai-panel-open-btn hidden" type="button" title="Open AI panel" aria-label="Open AI panel">
+          <span class="ai-panel-open-icon" aria-hidden="true"></span>
+        </button>
+      </div>
       <div id="editor"></div>
       <div id="editorStatusBar" class="editor-status-bar">
         <span id="statusPosition">Ln -, Col -</span>
         <span id="statusEncoding">UTF-8</span>
       </div>
     </section>
+
+    <aside id="aiPanel" class="ai-panel">
+      <div class="ai-panel-header">
+        <span>AI Code</span>
+        <div class="ai-header-actions">
+          <button id="aiClearKeyBtn" class="ai-header-btn ai-clear-key-btn hidden" type="button">Clear API Key</button>
+          <button id="aiPanelToggleBtn" class="ai-header-btn ai-clear-key-btn" type="button" title="Hide AI panel">Hide</button>
+        </div>
+      </div>
+
+      <div id="aiKeySection" class="ai-key-section">
+        <p class="ai-key-text ai-auth-only">Enter your OpenAI API key to start AI coding chat.</p>
+        <input id="aiApiKeyInput" class="ai-input ai-auth-only" type="password" placeholder="sk-..." />
+        <div class="ai-auth-actions">
+          <button id="aiSaveKeyBtn" class="ai-btn ai-btn-primary ai-auth-only" type="button">Save Key</button>
+        </div>
+      </div>
+
+      <div id="aiChatSection" class="ai-chat-section hidden">
+        <div id="aiMessages" class="ai-messages"></div>
+        <div class="ai-input-row">
+          <div class="ai-history-row">
+            <button id="aiClearChatBtn" class="ai-btn ai-history-clear-btn" type="button">Clear Chat</button>
+          </div>
+          <textarea id="aiPromptInput" class="ai-prompt" rows="3" placeholder="Ask AI to edit code, create files, or run commands..."></textarea>
+          <div class="ai-send-row">
+            <select id="aiModelSelect" class="ai-input">
+              <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+              <option value="gpt-5.1-codex-mini">gpt-5.1-codex-mini</option>
+              <option value="gpt-5.1-codex">gpt-5.1-codex</option>
+              <option value="gpt-5.3-codex">gpt-5.3-codex</option>
+            </select>
+            <button id="aiSendBtn" class="ai-btn ai-btn-primary" type="button">Send</button>
+            <button id="aiStopBtn" class="ai-btn ai-stop-btn hidden" type="button" title="Stop AI">
+              <span class="ai-stop-icon" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
   </main>
 
   <section id="terminalPanel" class="terminal-panel">
