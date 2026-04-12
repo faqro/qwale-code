@@ -1,4 +1,4 @@
-# QwaleCode
+# QwaleCode 🚀 💻
 
 Lightweight coding IDE built by Faraaz Jan.
 
@@ -8,9 +8,9 @@ QwaleCode is an Electron-based desktop IDE focused on a compact, VS Code-style w
 
 The application is organized into three main areas:
 
-- Explorer and Source Control on the left
-- Code editor in the center
-- AI Code panel on the right
+- Explorer and Source Control on the left 📁🎛️
+- Code editor in the center ✍️
+- AI Code panel on the right 🤖
 
 It also includes a bottom terminal panel with multiple terminal sessions, file search, recent projects, theming, and menu-driven file/edit/window actions.
 
