@@ -1,12 +1,40 @@
 const api = window.qwaleApi;
 
 const appMenubar = document.getElementById('appMenubar');
+const sidebarTabExplorer = document.getElementById('sidebarTabExplorer');
+const sidebarTabSourceControl = document.getElementById('sidebarTabSourceControl');
+const explorerPanelView = document.getElementById('explorerPanelView');
+const sourceControlPanelView = document.getElementById('sourceControlPanelView');
+const workspace = document.querySelector('.workspace');
+const explorerResizeHandle = document.getElementById('explorerResizeHandle');
 const projectInfo = document.getElementById('projectInfo');
 const treeRoot = document.getElementById('treeRoot');
 const editorTabs = document.getElementById('editorTabs');
 const editor = document.getElementById('editor');
 const statusPosition = document.getElementById('statusPosition');
 const statusEncoding = document.getElementById('statusEncoding');
+const scmBranchInfo = document.getElementById('scmBranchInfo');
+const scmSetupSection = document.getElementById('scmSetupSection');
+const scmInitRepoBtn = document.getElementById('scmInitRepoBtn');
+const scmHostSelect = document.getElementById('scmHostSelect');
+const scmOpenHostBtn = document.getElementById('scmOpenHostBtn');
+const scmRemoteUrlInput = document.getElementById('scmRemoteUrlInput');
+const scmPublishBtn = document.getElementById('scmPublishBtn');
+const scmCommitMessage = document.getElementById('scmCommitMessage');
+const scmCommitBtn = document.getElementById('scmCommitBtn');
+const scmPushBtn = document.getElementById('scmPushBtn');
+const scmSyncSplit = document.getElementById('scmSyncSplit');
+const scmSyncBtn = document.getElementById('scmSyncBtn');
+const scmSyncMenuBtn = document.getElementById('scmSyncMenuBtn');
+const scmSyncMenu = document.getElementById('scmSyncMenu');
+const scmSyncFetchOption = document.getElementById('scmSyncFetchOption');
+const scmRefreshBtn = document.getElementById('scmRefreshBtn');
+const scmBranchSelect = document.getElementById('scmBranchSelect');
+const scmSwitchBranchBtn = document.getElementById('scmSwitchBranchBtn');
+const scmNewBranchInput = document.getElementById('scmNewBranchInput');
+const scmCreateBranchBtn = document.getElementById('scmCreateBranchBtn');
+const scmChangedFiles = document.getElementById('scmChangedFiles');
+const scmGraph = document.getElementById('scmGraph');
 const terminalPanel = document.getElementById('terminalPanel');
 const terminalContainer = document.getElementById('terminalContainer');
 const terminalResizeHandle = document.getElementById('terminalResizeHandle');
@@ -56,6 +84,12 @@ let fileSearchResults = null;
 let fileSearchQuery = '';
 let fileSearchDocumentClickBound = false;
 let fileSearchIndex = [];
+let activeSidebarPanel = 'explorer';
+let scmRefreshInProgress = false;
+let scmSyncMode = 'fetch';
+let scmState = 'no-project';
+let sidebarResizeState = null;
+let themeMode = 'dark';
 
 const openFiles = new Map();
 const terminalSessions = new Map();
@@ -76,6 +110,30 @@ const terminal = new Terminal({
 const fitAddon = new FitAddon.FitAddon();
 terminal.loadAddon(fitAddon);
 terminal.open(terminalContainer);
+
+function applyTheme(mode) {
+  themeMode = mode === 'light' ? 'light' : 'dark';
+  document.body.classList.toggle('light-theme', themeMode === 'light');
+  localStorage.setItem('qwale-theme', themeMode);
+
+  const isLight = themeMode === 'light';
+  if (window.monaco && window.monaco.editor) {
+    window.monaco.editor.setTheme(isLight ? 'vs' : 'vs-dark');
+  }
+
+  terminal.options.theme = {
+    background: isLight ? '#ffffff' : '#0d1723',
+    foreground: isLight ? '#1f2a3a' : '#d6e9ff',
+    cursor: isLight ? '#6f67ff' : '#45d483'
+  };
+
+  api.setAppTheme(themeMode).catch(() => {});
+}
+
+function toggleThemeMode() {
+  applyTheme(themeMode === 'light' ? 'dark' : 'light');
+  renderMenuBar();
+}
 
 terminal.onData((data) => {
   if (!activeTerminalId) {
@@ -276,6 +334,374 @@ async function initTerminalSystem() {
 
 function getFileName(filePath) {
   return filePath.split(/[/\\]/).pop();
+}
+
+function setSidebarPanel(panelName) {
+  activeSidebarPanel = panelName;
+  const isExplorer = panelName === 'explorer';
+
+  sidebarTabExplorer.classList.toggle('active', isExplorer);
+  sidebarTabSourceControl.classList.toggle('active', !isExplorer);
+  explorerPanelView.classList.toggle('active', isExplorer);
+  sourceControlPanelView.classList.toggle('active', !isExplorer);
+
+  if (!isExplorer) {
+    refreshSourceControlPanel();
+  }
+}
+
+function renderChangedFilesList(files) {
+  scmChangedFiles.innerHTML = '';
+
+  if (!Array.isArray(files) || files.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'scm-empty';
+    empty.textContent = 'No changed files.';
+    scmChangedFiles.appendChild(empty);
+    return;
+  }
+
+  for (const file of files) {
+    const row = document.createElement('div');
+    row.className = 'scm-file-row';
+
+    const status = document.createElement('span');
+    status.className = 'scm-file-status';
+    status.textContent = file.code;
+
+    const name = document.createElement('span');
+    name.className = 'scm-file-path';
+    name.textContent = file.path;
+
+    row.appendChild(status);
+    row.appendChild(name);
+    scmChangedFiles.appendChild(row);
+  }
+}
+
+function renderBranches(branches) {
+  scmBranchSelect.innerHTML = '';
+
+  if (!Array.isArray(branches) || !branches.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No branches';
+    scmBranchSelect.appendChild(option);
+    scmBranchSelect.disabled = true;
+    scmSwitchBranchBtn.disabled = true;
+    return;
+  }
+
+  scmBranchSelect.disabled = false;
+  scmSwitchBranchBtn.disabled = false;
+
+  for (const branch of branches) {
+    const option = document.createElement('option');
+    option.value = branch.name;
+    option.textContent = branch.current ? `${branch.name} (current)` : branch.name;
+    if (branch.current) {
+      option.selected = true;
+    }
+    scmBranchSelect.appendChild(option);
+  }
+}
+
+function firstAvailableLane(lanes) {
+  for (let i = 0; i < lanes.length; i += 1) {
+    if (!lanes[i]) {
+      return i;
+    }
+  }
+  return lanes.length;
+}
+
+function buildGraphRows(commits) {
+  const rows = [];
+  const lanes = [];
+
+  for (const commit of commits) {
+    let lane = lanes.indexOf(commit.hash);
+    if (lane === -1) {
+      lane = firstAvailableLane(lanes);
+      lanes[lane] = commit.hash;
+    }
+
+    const before = [...lanes];
+
+    lanes[lane] = null;
+    const parentLanes = [];
+    for (let i = 0; i < commit.parents.length; i += 1) {
+      const parentHash = commit.parents[i];
+      if (!parentHash) {
+        continue;
+      }
+
+      if (i === 0) {
+        lanes[lane] = parentHash;
+        parentLanes.push(lane);
+      } else {
+        let parentLane = lanes.indexOf(parentHash);
+        if (parentLane === -1) {
+          parentLane = firstAvailableLane(lanes);
+          lanes[parentLane] = parentHash;
+        }
+        parentLanes.push(parentLane);
+      }
+    }
+
+    while (lanes.length > 0 && !lanes[lanes.length - 1]) {
+      lanes.pop();
+    }
+
+    const after = [...lanes];
+    rows.push({ commit, lane, before, after, parentLanes });
+  }
+
+  return rows;
+}
+
+function renderCommitGraph(commits) {
+  scmGraph.innerHTML = '';
+
+  if (!Array.isArray(commits) || !commits.length) {
+    const empty = document.createElement('div');
+    empty.className = 'scm-empty';
+    empty.textContent = 'No commits yet.';
+    scmGraph.appendChild(empty);
+    return;
+  }
+
+  const rows = buildGraphRows(commits);
+  const laneColors = ['#45d483', '#74c3ff', '#ffcc66', '#e88cff', '#ff8a65', '#4dd0e1', '#9ccc65', '#f48fb1'];
+
+  for (const row of rows) {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'scm-graph-row';
+
+    const laneCount = Math.max(row.lane + 1, row.before.length, row.after.length, 1);
+    const laneArea = document.createElement('div');
+    laneArea.className = 'scm-graph-lane-area';
+    laneArea.style.width = `${laneCount * 14}px`;
+
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', `0 0 ${laneCount * 14} 24`);
+    svg.setAttribute('width', `${laneCount * 14}`);
+    svg.setAttribute('height', '24');
+    svg.classList.add('scm-graph-svg');
+
+    for (let i = 0; i < laneCount; i += 1) {
+      const inBefore = Boolean(row.before[i]);
+      const inAfter = Boolean(row.after[i]);
+      if (!inBefore && !inAfter && i !== row.lane) {
+        continue;
+      }
+
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      const x = i * 14 + 7;
+      line.setAttribute('x1', String(x));
+      line.setAttribute('y1', '0');
+      line.setAttribute('x2', String(x));
+      line.setAttribute('y2', '24');
+      line.setAttribute('stroke', laneColors[i % laneColors.length]);
+      line.setAttribute('stroke-opacity', '0.6');
+      line.setAttribute('stroke-width', '1.8');
+      svg.appendChild(line);
+    }
+
+    for (const parentLane of row.parentLanes) {
+      if (parentLane === row.lane) {
+        continue;
+      }
+
+      const link = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      link.setAttribute('x1', String(row.lane * 14 + 7));
+      link.setAttribute('y1', '12');
+      link.setAttribute('x2', String(parentLane * 14 + 7));
+      link.setAttribute('y2', '24');
+      link.setAttribute('stroke', laneColors[parentLane % laneColors.length]);
+      link.setAttribute('stroke-opacity', '0.9');
+      link.setAttribute('stroke-width', '1.8');
+      svg.appendChild(link);
+    }
+
+    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circle.setAttribute('cx', String(row.lane * 14 + 7));
+    circle.setAttribute('cy', '12');
+    circle.setAttribute('r', '4.2');
+    circle.setAttribute('fill', laneColors[row.lane % laneColors.length]);
+    circle.setAttribute('stroke', '#0f1d2d');
+    circle.setAttribute('stroke-width', '1.4');
+    svg.appendChild(circle);
+
+    laneArea.appendChild(svg);
+
+    const info = document.createElement('div');
+    info.className = 'scm-graph-info';
+
+    const top = document.createElement('div');
+    top.className = 'scm-graph-topline';
+
+    const hash = document.createElement('span');
+    hash.className = 'scm-graph-hash';
+    hash.textContent = row.commit.shortHash;
+    top.appendChild(hash);
+
+    if (row.commit.refs) {
+      const refs = document.createElement('span');
+      refs.className = 'scm-graph-refs';
+      refs.textContent = row.commit.refs;
+      top.appendChild(refs);
+    }
+
+    const subject = document.createElement('div');
+    subject.className = 'scm-graph-subject';
+    subject.textContent = row.commit.subject || '(no message)';
+
+    info.appendChild(top);
+    info.appendChild(subject);
+
+    rowEl.appendChild(laneArea);
+    rowEl.appendChild(info);
+    scmGraph.appendChild(rowEl);
+  }
+}
+
+function closeScmSyncMenu() {
+  scmSyncMenu.classList.add('hidden');
+}
+
+function hasRemoteChangesToPull(branchLine) {
+  return /\[.*behind\s+\d+/i.test(branchLine || '');
+}
+
+function updateScmSyncButton() {
+  const isPullMode = scmSyncMode === 'pull';
+  scmSyncBtn.textContent = isPullMode ? 'Pull' : 'Fetch';
+  scmSyncMenuBtn.style.display = isPullMode ? 'inline-flex' : 'none';
+  scmSyncSplit.classList.toggle('single', !isPullMode);
+  if (!isPullMode) {
+    closeScmSyncMenu();
+  }
+}
+
+function getHostCreateRepoUrl(hostId) {
+  if (hostId === 'gitlab') {
+    return 'https://gitlab.com/projects/new';
+  }
+
+  if (hostId === 'bitbucket') {
+    return 'https://bitbucket.org/repo/create';
+  }
+
+  if (hostId === 'custom') {
+    return null;
+  }
+
+  return 'https://github.com/new';
+}
+
+function setScmInteractiveState(enabled) {
+  scmCommitMessage.disabled = !enabled;
+  scmCommitBtn.disabled = !enabled;
+  scmPushBtn.disabled = !enabled;
+  scmSyncBtn.disabled = !enabled;
+  scmRefreshBtn.disabled = !enabled;
+  scmSwitchBranchBtn.disabled = !enabled;
+  scmCreateBranchBtn.disabled = !enabled;
+  scmNewBranchInput.disabled = !enabled;
+  scmBranchSelect.disabled = !enabled;
+}
+
+function resetScmDataViews() {
+  scmChangedFiles.innerHTML = '';
+  scmGraph.innerHTML = '';
+  renderBranches([]);
+}
+
+function applyScmState(state) {
+  scmState = state;
+
+  if (state === 'ready') {
+    scmSetupSection.style.display = 'none';
+    setScmInteractiveState(true);
+    return;
+  }
+
+  scmSetupSection.style.display = 'grid';
+  setScmInteractiveState(false);
+  resetScmDataViews();
+  scmSyncMode = 'fetch';
+  updateScmSyncButton();
+
+  if (state === 'no-repo') {
+    scmBranchInfo.textContent = 'No Git repository found in this folder.';
+  } else {
+    scmBranchInfo.textContent = 'Open a project folder to start source control.';
+  }
+}
+
+function getSidebarWidthBounds() {
+  const workspaceRect = workspace.getBoundingClientRect();
+  return {
+    min: 220,
+    max: Math.max(300, Math.floor(workspaceRect.width - 280))
+  };
+}
+
+function applySidebarWidth(width) {
+  const bounds = getSidebarWidthBounds();
+  const clamped = Math.min(bounds.max, Math.max(bounds.min, Math.round(width)));
+  workspace.style.gridTemplateColumns = `${clamped}px 1fr`;
+}
+
+async function runScmFetch() {
+  await api.gitFetch();
+  await refreshSourceControlPanel();
+}
+
+async function runScmPull() {
+  await api.gitPull();
+  await refreshProjectTree();
+  await refreshSourceControlPanel();
+}
+
+async function refreshSourceControlPanel() {
+  if (scmRefreshInProgress) {
+    return;
+  }
+
+  if (!project.rootPath) {
+    applyScmState('no-project');
+    return;
+  }
+
+  scmRefreshInProgress = true;
+
+  try {
+    const overview = await api.getGitOverview();
+    if (overview.state === 'no-project') {
+      applyScmState('no-project');
+      return;
+    }
+
+    if (overview.state === 'no-repo') {
+      applyScmState('no-repo');
+      return;
+    }
+
+    applyScmState('ready');
+    scmBranchInfo.textContent = overview.branchLine || 'Git repository';
+    scmSyncMode = hasRemoteChangesToPull(overview.branchLine) ? 'pull' : 'fetch';
+    updateScmSyncButton();
+    renderChangedFilesList(overview.files || []);
+    renderBranches(overview.branches || []);
+    renderCommitGraph(overview.graphCommits || []);
+  } catch (error) {
+    applyScmState('no-project');
+    scmBranchInfo.textContent = error.message || 'Source control unavailable.';
+  } finally {
+    scmRefreshInProgress = false;
+  }
 }
 
 function getRelativeProjectPath(filePath) {
@@ -892,6 +1318,7 @@ function renderMenuBar() {
       items: [
         { label: 'Reload', action: () => api.dispatchAppCommand('view:reload') },
         { label: 'Toggle Developer Tools', action: () => api.dispatchAppCommand('view:toggleDevTools') },
+        { label: themeMode === 'light' ? 'Switch to Dark Mode' : 'Switch to Light Mode', shortcut: 'Ctrl+Alt+L', action: () => toggleThemeMode() },
         { divider: true },
         { label: 'Zoom In', action: () => api.dispatchAppCommand('view:zoomIn') },
         { label: 'Zoom Out', action: () => api.dispatchAppCommand('view:zoomOut') },
@@ -1592,6 +2019,11 @@ function buildTreeNode(node) {
   row.className = 'tree-node';
   row.dataset.path = node.path;
 
+  if (node.ignored) {
+    row.classList.add('ignored');
+    row.title = 'Ignored by .gitignore';
+  }
+
   if (selectedNodePath === node.path) {
     row.classList.add('selected');
   }
@@ -2107,6 +2539,9 @@ async function applyOpenedProject(opened) {
   selectedNodePath = project.rootPath;
   renderTree();
   refreshFileSearchIndex();
+  if (activeSidebarPanel === 'source-control') {
+    await refreshSourceControlPanel();
+  }
 
   killAllTerminalSessions();
   await createTerminalSession('powershell');
@@ -2149,12 +2584,163 @@ async function closeFolder() {
   projectInfo.textContent = 'No folder opened';
   renderTree();
   refreshFileSearchIndex();
+  applyScmState('no-project');
   updateEditorTitle();
   renderTabs();
 
   killAllTerminalSessions();
   await createTerminalSession('powershell');
 }
+
+sidebarTabExplorer.addEventListener('click', () => {
+  setSidebarPanel('explorer');
+});
+
+sidebarTabSourceControl.addEventListener('click', () => {
+  setSidebarPanel('source-control');
+});
+
+scmRefreshBtn.addEventListener('click', async () => {
+  await refreshSourceControlPanel();
+});
+
+scmCommitBtn.addEventListener('click', async () => {
+  const message = scmCommitMessage.value.trim();
+  if (!message) {
+    alert('Enter a commit message.');
+    return;
+  }
+
+  try {
+    await api.gitCommit({ message });
+    scmCommitMessage.value = '';
+    await refreshProjectTree();
+    await refreshSourceControlPanel();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmPushBtn.addEventListener('click', async () => {
+  try {
+    await api.gitPush();
+    await refreshSourceControlPanel();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmSyncBtn.addEventListener('click', async () => {
+  try {
+    if (scmSyncMode === 'pull') {
+      await runScmPull();
+    } else {
+      await runScmFetch();
+    }
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmSyncMenuBtn.addEventListener('click', (event) => {
+  event.stopPropagation();
+  scmSyncMenu.classList.toggle('hidden');
+});
+
+scmSyncFetchOption.addEventListener('click', async (event) => {
+  event.stopPropagation();
+  closeScmSyncMenu();
+  try {
+    await runScmFetch();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('.scm-sync-split')) {
+    closeScmSyncMenu();
+  }
+});
+
+scmSwitchBranchBtn.addEventListener('click', async () => {
+  const selected = scmBranchSelect.value;
+  if (!selected) {
+    return;
+  }
+
+  try {
+    await api.gitSwitchBranch({ name: selected });
+    await refreshProjectTree();
+    await refreshSourceControlPanel();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmCreateBranchBtn.addEventListener('click', async () => {
+  const name = scmNewBranchInput.value.trim();
+  if (!name) {
+    alert('Enter a branch name.');
+    return;
+  }
+
+  try {
+    await api.gitCreateBranch({ name });
+    scmNewBranchInput.value = '';
+    await refreshSourceControlPanel();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmInitRepoBtn.addEventListener('click', async () => {
+  if (!project.rootPath) {
+    alert('Open a project folder first.');
+    return;
+  }
+
+  try {
+    await api.gitInitRepo();
+    await refreshSourceControlPanel();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmOpenHostBtn.addEventListener('click', async () => {
+  const hostUrl = getHostCreateRepoUrl(scmHostSelect.value);
+  if (!hostUrl) {
+    alert('Select a host, then provide the repository URL below.');
+    return;
+  }
+
+  try {
+    await api.openExternal(hostUrl);
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmPublishBtn.addEventListener('click', async () => {
+  if (!project.rootPath) {
+    alert('Open a project folder first.');
+    return;
+  }
+
+  const remoteUrl = scmRemoteUrlInput.value.trim();
+  if (!remoteUrl) {
+    alert('Enter the remote repository URL before publishing.');
+    return;
+  }
+
+  try {
+    await api.gitPublish({ remoteUrl });
+    await refreshSourceControlPanel();
+  } catch (error) {
+    alert(error.message);
+  }
+});
 
 newTerminalBtn.addEventListener('click', async () => {
   try {
@@ -2222,6 +2808,8 @@ if (api.onMenuAction) {
         if (monacoEditor) {
           monacoEditor.trigger('menu', 'editor.action.startFindReplaceAction', null);
         }
+      } else if (action === 'view:toggleTheme') {
+        toggleThemeMode();
       } else if (action === 'project:recentCleared') {
         await refreshRecentProjectsCache();
         renderMenuBar();
@@ -2233,6 +2821,12 @@ if (api.onMenuAction) {
 }
 
 document.addEventListener('keydown', async (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.altKey && event.key.toLowerCase() === 'l') {
+    event.preventDefault();
+    toggleThemeMode();
+    return;
+  }
+
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'o') {
     event.preventDefault();
     try {
@@ -2264,6 +2858,16 @@ document.addEventListener('keydown', async (event) => {
 
 let resizeState = null;
 
+explorerResizeHandle.addEventListener('mousedown', (event) => {
+  event.preventDefault();
+  const explorer = document.querySelector('.explorer');
+  sidebarResizeState = {
+    startX: event.clientX,
+    startWidth: explorer.getBoundingClientRect().width
+  };
+  document.body.style.userSelect = 'none';
+});
+
 terminalResizeHandle.addEventListener('mousedown', (event) => {
   resizeState = {
     startY: event.clientY,
@@ -2273,7 +2877,15 @@ terminalResizeHandle.addEventListener('mousedown', (event) => {
 });
 
 document.addEventListener('mousemove', (event) => {
+  if (sidebarResizeState) {
+    const deltaX = event.clientX - sidebarResizeState.startX;
+    applySidebarWidth(sidebarResizeState.startWidth + deltaX);
+  }
+
   if (!resizeState) {
+    if (!sidebarResizeState) {
+      return;
+    }
     return;
   }
 
@@ -2290,11 +2902,19 @@ document.addEventListener('mousemove', (event) => {
 });
 
 document.addEventListener('mouseup', () => {
+  sidebarResizeState = null;
   resizeState = null;
   document.body.style.userSelect = '';
 });
 
 window.addEventListener('resize', () => {
+  if (workspace.style.gridTemplateColumns) {
+    const currentLeft = parseFloat(workspace.style.gridTemplateColumns);
+    if (Number.isFinite(currentLeft)) {
+      applySidebarWidth(currentLeft);
+    }
+  }
+
   fitAddon.fit();
   if (activeTerminalId) {
     api.resizeTerminal({ termId: activeTerminalId, cols: terminal.cols, rows: terminal.rows });
@@ -2325,6 +2945,7 @@ window.addEventListener('beforeunload', (event) => {
 
 Promise.all([refreshProjectTree(), initMonacoEditor(), refreshRecentProjectsCache()])
   .then(() => {
+    applyTheme(localStorage.getItem('qwale-theme') || 'dark');
     renderMenuBar();
     return initTerminalSystem();
   })

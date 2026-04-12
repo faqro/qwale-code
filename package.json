@@ -1,6 +1,6 @@
 {
   "name": "qwalecode",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "QwaleCode - Lightweight Electron IDE",
   "main": "src/main.js",
   "scripts": {
@@ -18,7 +18,8 @@
     "@xterm/xterm": "^5.5.0",
     "ignore": "^7.0.5",
     "monaco-editor": "^0.52.2",
-    "node-pty": "^1.0.0"
+    "node-pty": "^1.0.0",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "electron": "^31.7.7"

@@ -5,6 +5,7 @@ const fsp = require('fs/promises');
 const pty = require('node-pty');
 const ignore = require('ignore');
 const { spawnSync } = require('child_process');
+const { execFile } = require('child_process');
 
 let mainWindow = null;
 const terminals = new Map();
@@ -183,6 +184,11 @@ function createAppMenu() {
         { role: 'reload' },
         { role: 'forceReload' },
         { role: 'toggleDevTools' },
+        {
+          label: 'Toggle Light Mode',
+          accelerator: 'CmdOrCtrl+Alt+L',
+          click: () => sendMenuAction('view:toggleTheme')
+        },
         { type: 'separator' },
         { role: 'resetZoom' },
         { role: 'zoomIn' },
@@ -210,6 +216,7 @@ function createWindow(initialProjectPath = null) {
     height: 860,
     minWidth: 980,
     minHeight: 620,
+    icon: path.join(__dirname, 'renderer/assets/app-logo.png'),
     autoHideMenuBar: isWindows,
     backgroundColor: '#101822',
     ...(isWindows
@@ -317,7 +324,7 @@ function decodeBufferWithEncoding(buffer) {
   };
 }
 
-async function buildTree(dirPath) {
+async function buildTree(dirPath, projectPath, matcher, inheritedIgnored = false) {
   const dirents = await fsp.readdir(dirPath, { withFileTypes: true });
   const folders = [];
   const files = [];
@@ -325,17 +332,21 @@ async function buildTree(dirPath) {
   for (const dirent of dirents) {
     const fullPath = path.join(dirPath, dirent.name);
     if (dirent.isDirectory()) {
+      const ignored = inheritedIgnored || isIgnoredPath(matcher, projectPath, fullPath, true);
       folders.push({
         name: dirent.name,
         path: fullPath,
         type: 'folder',
-        children: await buildTree(fullPath)
+        ignored,
+        children: await buildTree(fullPath, projectPath, matcher, ignored)
       });
     } else {
+      const ignored = inheritedIgnored || isIgnoredPath(matcher, projectPath, fullPath, false);
       files.push({
         name: dirent.name,
         path: fullPath,
-        type: 'file'
+        type: 'file',
+        ignored
       });
     }
   }
@@ -423,7 +434,7 @@ ipcMain.handle('project:open', async (event) => {
 
   windowProjectState.set(event.sender.id, selectedProjectPath);
   const matcher = await createGitignoreMatcher(selectedProjectPath);
-  const tree = await buildTree(selectedProjectPath);
+  const tree = await buildTree(selectedProjectPath, selectedProjectPath, matcher, false);
   const searchableFiles = await buildSearchableFiles(selectedProjectPath, selectedProjectPath, matcher);
 
   return {
@@ -457,7 +468,7 @@ ipcMain.handle('project:openPath', async (event, folderPath) => {
 
   windowProjectState.set(event.sender.id, resolved);
   const matcher = await createGitignoreMatcher(resolved);
-  const tree = await buildTree(resolved);
+  const tree = await buildTree(resolved, resolved, matcher, false);
   const searchableFiles = await buildSearchableFiles(resolved, resolved, matcher);
 
   return {
@@ -492,7 +503,7 @@ ipcMain.handle('project:refresh', async (event) => {
   }
 
   const matcher = await createGitignoreMatcher(currentProjectPath);
-  const tree = await buildTree(currentProjectPath);
+  const tree = await buildTree(currentProjectPath, currentProjectPath, matcher, false);
   const searchableFiles = await buildSearchableFiles(currentProjectPath, currentProjectPath, matcher);
   return {
     rootPath: currentProjectPath,
@@ -728,6 +739,278 @@ ipcMain.handle('app:getInfo', () => {
   };
 });
 
+function runGit(projectPath, args) {
+  return new Promise((resolve, reject) => {
+    execFile('git', ['-C', projectPath, ...args], { windowsHide: true }, (error, stdout, stderr) => {
+      if (error) {
+        const message = (stderr || error.message || 'Git command failed.').trim();
+        reject(new Error(message));
+        return;
+      }
+
+      resolve({
+        stdout: (stdout || '').trimEnd(),
+        stderr: (stderr || '').trimEnd()
+      });
+    });
+  });
+}
+
+async function ensureGitRepository(projectPath) {
+  if (!projectPath) {
+    throw new Error('Open a project first.');
+  }
+
+  try {
+    await runGit(projectPath, ['rev-parse', '--is-inside-work-tree']);
+  } catch {
+    throw new Error('Current folder is not a Git repository.');
+  }
+}
+
+async function isGitRepository(projectPath) {
+  if (!projectPath) {
+    return false;
+  }
+
+  try {
+    await runGit(projectPath, ['rev-parse', '--is-inside-work-tree']);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseGitStatusPorcelain(stdout) {
+  const lines = stdout.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const branchLine = lines[0] || '';
+  const files = [];
+
+  for (const line of lines.slice(1)) {
+    if (line.length < 3) {
+      continue;
+    }
+
+    const code = line.slice(0, 2);
+    const filePath = line.slice(3).trim();
+    const x = code[0];
+    const y = code[1];
+
+    files.push({
+      path: filePath,
+      code,
+      staged: x !== ' ' && x !== '?',
+      unstaged: y !== ' ' && y !== '?',
+      untracked: code === '??'
+    });
+  }
+
+  return {
+    branchLine,
+    files
+  };
+}
+
+function parseGitGraphCommits(stdout) {
+  const records = stdout.split('\x1e').map((entry) => entry.trim()).filter(Boolean);
+
+  return records.map((record) => {
+    const [hash, parentsRaw, refsRaw, subjectRaw] = record.split('\x1f');
+    const parents = (parentsRaw || '').trim() ? parentsRaw.trim().split(/\s+/) : [];
+    return {
+      hash: (hash || '').trim(),
+      shortHash: (hash || '').trim().slice(0, 7),
+      parents,
+      refs: (refsRaw || '').trim(),
+      subject: (subjectRaw || '').trim()
+    };
+  }).filter((entry) => entry.hash);
+}
+
+ipcMain.handle('git:getOverview', async (event) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  if (!projectPath) {
+    return {
+      state: 'no-project'
+    };
+  }
+
+  const hasRepo = await isGitRepository(projectPath);
+  if (!hasRepo) {
+    return {
+      state: 'no-repo'
+    };
+  }
+
+  const statusOutput = await runGit(projectPath, ['status', '--porcelain=v1', '-b']);
+  const status = parseGitStatusPorcelain(statusOutput.stdout);
+
+  let branchesOutput = { stdout: '' };
+  try {
+    branchesOutput = await runGit(projectPath, ['branch', '--all', '--no-color']);
+  } catch {
+    branchesOutput = { stdout: '' };
+  }
+
+  const branches = branchesOutput.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => ({
+      name: line.replace(/^\*\s*/, '').trim(),
+      current: line.startsWith('*')
+    }));
+
+  let graphOutput = { stdout: '' };
+  try {
+    graphOutput = await runGit(projectPath, [
+      'log',
+      '--all',
+      '--date-order',
+      '--pretty=format:%H%x1f%P%x1f%D%x1f%s%x1e',
+      '-n',
+      '120'
+    ]);
+  } catch {
+    graphOutput = { stdout: '' };
+  }
+
+  const graphCommits = parseGitGraphCommits(graphOutput.stdout);
+
+  return {
+    state: 'ready',
+    branchLine: status.branchLine,
+    files: status.files,
+    branches,
+    graphCommits
+  };
+});
+
+ipcMain.handle('git:initRepo', async (event) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  if (!projectPath) {
+    throw new Error('Open a project first.');
+  }
+
+  const hasRepo = await isGitRepository(projectPath);
+  if (!hasRepo) {
+    await runGit(projectPath, ['init']);
+  }
+
+  return { ok: true, alreadyExists: hasRepo };
+});
+
+ipcMain.handle('git:publish', async (event, { remoteUrl, branchName }) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  if (!projectPath) {
+    throw new Error('Open a project first.');
+  }
+
+  const remote = String(remoteUrl || '').trim();
+  if (!remote) {
+    throw new Error('Remote URL is required to publish.');
+  }
+
+  const hasRepo = await isGitRepository(projectPath);
+  if (!hasRepo) {
+    await runGit(projectPath, ['init']);
+  }
+
+  let hasOrigin = true;
+  try {
+    await runGit(projectPath, ['remote', 'get-url', 'origin']);
+  } catch {
+    hasOrigin = false;
+  }
+
+  if (hasOrigin) {
+    await runGit(projectPath, ['remote', 'set-url', 'origin', remote]);
+  } else {
+    await runGit(projectPath, ['remote', 'add', 'origin', remote]);
+  }
+
+  let targetBranch = String(branchName || '').trim();
+  if (!targetBranch) {
+    const currentBranch = await runGit(projectPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    targetBranch = (currentBranch.stdout || '').trim();
+  }
+
+  if (!targetBranch || targetBranch === 'HEAD') {
+    targetBranch = 'main';
+  }
+
+  const pushResult = await runGit(projectPath, ['push', '--set-upstream', 'origin', targetBranch]);
+  return {
+    ok: true,
+    output: pushResult.stdout || pushResult.stderr || 'Published.'
+  };
+});
+
+ipcMain.handle('git:commit', async (event, { message }) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  await ensureGitRepository(projectPath);
+
+  if (!message || !String(message).trim()) {
+    throw new Error('Commit message is required.');
+  }
+
+  await runGit(projectPath, ['add', '-A']);
+  const result = await runGit(projectPath, ['commit', '-m', String(message).trim()]);
+  return { ok: true, output: result.stdout || result.stderr || 'Committed.' };
+});
+
+ipcMain.handle('git:push', async (event) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  await ensureGitRepository(projectPath);
+  const result = await runGit(projectPath, ['push']);
+  return { ok: true, output: result.stdout || result.stderr || 'Push complete.' };
+});
+
+ipcMain.handle('git:fetch', async (event) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  await ensureGitRepository(projectPath);
+  const result = await runGit(projectPath, ['fetch']);
+  return { ok: true, output: result.stdout || result.stderr || 'Fetch complete.' };
+});
+
+ipcMain.handle('git:pull', async (event) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  await ensureGitRepository(projectPath);
+  const result = await runGit(projectPath, ['pull']);
+  return { ok: true, output: result.stdout || result.stderr || 'Pull complete.' };
+});
+
+ipcMain.handle('git:createBranch', async (event, { name }) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  await ensureGitRepository(projectPath);
+
+  const branchName = String(name || '').trim();
+  if (!branchName) {
+    throw new Error('Branch name is required.');
+  }
+
+  await runGit(projectPath, ['branch', branchName]);
+  return { ok: true };
+});
+
+ipcMain.handle('git:switchBranch', async (event, { name }) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  await ensureGitRepository(projectPath);
+
+  const branchName = String(name || '').trim();
+  if (!branchName) {
+    throw new Error('Branch name is required.');
+  }
+
+  try {
+    await runGit(projectPath, ['switch', branchName]);
+  } catch {
+    await runGit(projectPath, ['checkout', branchName]);
+  }
+
+  return { ok: true };
+});
+
 function isWslAvailable() {
   if (process.platform !== 'win32') {
     return false;
@@ -779,6 +1062,32 @@ ipcMain.handle('terminal:getProfiles', () => {
   return {
     profiles: getAvailableTerminalProfiles()
   };
+});
+
+ipcMain.handle('app:openExternal', async (_event, url) => {
+  const targetUrl = String(url || '').trim();
+  if (!targetUrl) {
+    throw new Error('Invalid URL.');
+  }
+
+  await shell.openExternal(targetUrl);
+  return { ok: true };
+});
+
+ipcMain.handle('app:setTheme', (event, mode) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed() || process.platform !== 'win32' || typeof win.setTitleBarOverlay !== 'function') {
+    return { ok: false };
+  }
+
+  const isLight = mode === 'light';
+  win.setTitleBarOverlay({
+    color: isLight ? '#f5f8ff' : '#101822',
+    symbolColor: isLight ? '#1f2a3a' : '#eef6ff',
+    height: 34
+  });
+
+  return { ok: true };
 });
 
 ipcMain.handle('terminal:create', (event, { cwd, shellType }) => {
