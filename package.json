@@ -1,0 +1,26 @@
+{
+  "name": "qwalecode",
+  "version": "1.0.0",
+  "description": "QwaleCode - Lightweight Electron IDE",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [
+    "electron",
+    "editor",
+    "ide"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "ignore": "^7.0.5",
+    "monaco-editor": "^0.52.2",
+    "node-pty": "^1.0.0"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7"
+  }
+}

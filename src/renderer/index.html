@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QwaleCode</title>
+  <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header id="appMenubar" class="app-menubar"></header>
+
+  <main class="workspace">
+    <section class="explorer">
+      <div class="panel-title panel-title-split">
+        <span>Explorer</span>
+        <span id="projectInfo" class="project-info">No folder opened</span>
+      </div>
+      <div id="treeRoot" class="tree"></div>
+    </section>
+
+    <section class="editor-area">
+      <div id="editorTabs" class="editor-tabs"></div>
+      <div id="editor"></div>
+      <div id="editorStatusBar" class="editor-status-bar">
+        <span id="statusPosition">Ln -, Col -</span>
+        <span id="statusEncoding">UTF-8</span>
+      </div>
+    </section>
+  </main>
+
+  <section id="terminalPanel" class="terminal-panel">
+    <div id="terminalResizeHandle" class="terminal-resize-handle"></div>
+    <div class="terminal-header">
+      <div class="terminal-header-title">Terminal</div>
+      <div id="terminalTabs" class="terminal-tabs" aria-label="Terminal sessions"></div>
+      <div id="terminalActions" class="terminal-actions">
+        <button id="newTerminalBtn" class="terminal-btn" type="button" title="New terminal">+</button>
+        <button id="newTerminalTypeBtn" class="terminal-btn terminal-btn-dropdown" type="button" title="Choose terminal type">
+          <span class="terminal-chevron" aria-hidden="true"></span>
+        </button>
+        <div id="terminalTypeMenu" class="terminal-type-menu hidden"></div>
+      </div>
+    </div>
+    <div id="terminalContainer" class="terminal-container"></div>
+  </section>
+
+  <script src="../../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="../../node_modules/monaco-editor/min/vs/loader.js"></script>
+  <script src="./renderer.js"></script>
+</body>
+</html>

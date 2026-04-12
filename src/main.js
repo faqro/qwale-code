@@ -1,0 +1,873 @@
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const pty = require('node-pty');
+const ignore = require('ignore');
+const { spawnSync } = require('child_process');
+
+let mainWindow = null;
+const terminals = new Map();
+let recentProjects = [];
+const windowProjectState = new Map();
+
+function getRecentProjectsFilePath() {
+  return path.join(app.getPath('userData'), 'recent-projects.json');
+}
+
+async function loadRecentProjects() {
+  try {
+    const filePath = getRecentProjectsFilePath();
+    const raw = await fsp.readFile(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    recentProjects = Array.isArray(parsed) ? parsed.filter((p) => typeof p === 'string') : [];
+  } catch {
+    recentProjects = [];
+  }
+}
+
+async function persistRecentProjects() {
+  const filePath = getRecentProjectsFilePath();
+  await fsp.writeFile(filePath, JSON.stringify(recentProjects, null, 2), 'utf8');
+}
+
+async function rememberRecentProject(projectPath) {
+  const normalized = path.resolve(projectPath);
+  recentProjects = [normalized, ...recentProjects.filter((entry) => entry !== normalized)].slice(0, 10);
+  await persistRecentProjects();
+  createAppMenu();
+}
+
+function getTargetWindow() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused && !focused.isDestroyed()) {
+    return focused;
+  }
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return mainWindow;
+  }
+
+  return null;
+}
+
+function sendMenuAction(action, payload = {}) {
+  const targetWindow = getTargetWindow();
+  if (!targetWindow) {
+    return;
+  }
+
+  targetWindow.webContents.send('menu:action', { action, payload });
+}
+
+function createAppMenu() {
+  const isMac = process.platform === 'darwin';
+
+  const template = [
+    ...(isMac
+      ? [
+          {
+            label: app.name,
+            submenu: [
+              { role: 'about' },
+              { type: 'separator' },
+              { role: 'services' },
+              { type: 'separator' },
+              { role: 'hide' },
+              { role: 'hideOthers' },
+              { role: 'unhide' },
+              { type: 'separator' },
+              { role: 'quit' }
+            ]
+          }
+        ]
+      : []),
+    {
+      label: 'File',
+      submenu: [
+        {
+          label: 'Open Folder',
+          accelerator: 'CmdOrCtrl+O',
+          click: () => sendMenuAction('project:open')
+        },
+        {
+          label: 'Open Recent',
+          enabled: recentProjects.length > 0,
+          submenu: recentProjects.length
+            ? [
+                ...recentProjects.map((projectPath) => ({
+                  label: projectPath,
+                  click: () => sendMenuAction('project:openRecent', { path: projectPath })
+                })),
+                { type: 'separator' },
+                {
+                  label: 'Clear Recents',
+                  click: () => {
+                    recentProjects = [];
+                    persistRecentProjects().then(() => createAppMenu()).catch(() => {});
+                    sendMenuAction('project:recentCleared');
+                  }
+                }
+              ]
+            : []
+        },
+        {
+          label: 'Close Folder',
+          accelerator: 'CmdOrCtrl+Shift+W',
+          click: () => sendMenuAction('project:closeFolder')
+        },
+        { type: 'separator' },
+        {
+          label: 'New File',
+          accelerator: 'CmdOrCtrl+N',
+          click: () => sendMenuAction('project:newFile')
+        },
+        {
+          label: 'New Folder',
+          accelerator: 'CmdOrCtrl+Shift+N',
+          click: () => sendMenuAction('project:newFolder')
+        },
+        { type: 'separator' },
+        {
+          label: 'Save File',
+          accelerator: 'CmdOrCtrl+S',
+          click: () => sendMenuAction('file:save')
+        },
+        {
+          label: 'Save File As',
+          accelerator: 'CmdOrCtrl+Shift+S',
+          click: () => sendMenuAction('file:saveAs')
+        },
+        {
+          label: 'Save All Files',
+          accelerator: 'CmdOrCtrl+Alt+S',
+          click: () => sendMenuAction('file:saveAll')
+        },
+        { type: 'separator' },
+        isMac ? { role: 'close' } : { role: 'quit' }
+      ]
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { type: 'separator' },
+        {
+          label: 'Find',
+          accelerator: 'CmdOrCtrl+F',
+          click: () => sendMenuAction('edit:find')
+        },
+        {
+          label: 'Find & Replace',
+          accelerator: 'CmdOrCtrl+H',
+          click: () => sendMenuAction('edit:replace')
+        },
+        { type: 'separator' },
+        ...(isMac
+          ? [
+              { role: 'pasteAndMatchStyle' },
+              { role: 'delete' },
+              { role: 'selectAll' }
+            ]
+          : [{ role: 'delete' }, { type: 'separator' }, { role: 'selectAll' }])
+      ]
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' }
+      ]
+    },
+    {
+      label: 'Window',
+      role: 'window',
+      submenu: [{ role: 'minimize' }, { role: 'zoom' }, ...(isMac ? [{ type: 'separator' }, { role: 'front' }] : [{ role: 'close' }])]
+    }
+  ];
+
+  const menu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(menu);
+}
+
+function createWindow(initialProjectPath = null) {
+  const isWindows = process.platform === 'win32';
+
+  const createdWindow = new BrowserWindow({
+    width: 1360,
+    height: 860,
+    minWidth: 980,
+    minHeight: 620,
+    autoHideMenuBar: isWindows,
+    backgroundColor: '#101822',
+    ...(isWindows
+      ? {
+          titleBarStyle: 'hidden',
+          titleBarOverlay: {
+            color: '#101822',
+            symbolColor: '#eef6ff',
+            height: 34
+          }
+        }
+      : {}),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+
+  const createdWebContentsId = createdWindow.webContents.id;
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    mainWindow = createdWindow;
+  }
+
+  windowProjectState.set(createdWebContentsId, initialProjectPath ? path.resolve(initialProjectPath) : null);
+
+  createdWindow.loadFile(path.join(__dirname, 'renderer/index.html'));
+  createdWindow.setMenuBarVisibility(!isWindows);
+
+  createdWindow.on('closed', () => {
+    if (mainWindow === createdWindow) {
+      mainWindow = null;
+    }
+
+    windowProjectState.delete(createdWebContentsId);
+
+    for (const [id, term] of terminals.entries()) {
+      if (term.webContentsId === createdWebContentsId) {
+        term.ptyProcess.kill();
+        terminals.delete(id);
+      }
+    }
+  });
+
+  return createdWindow;
+}
+
+function getProjectPathForSender(sender) {
+  return windowProjectState.get(sender.id) || null;
+}
+
+function isWithinProject(candidatePath, projectPath) {
+  if (!projectPath) {
+    return false;
+  }
+
+  const absoluteProject = path.resolve(projectPath);
+  const absoluteCandidate = path.resolve(candidatePath);
+
+  return (
+    absoluteCandidate === absoluteProject ||
+    absoluteCandidate.startsWith(absoluteProject + path.sep)
+  );
+}
+
+async function removePathRecursive(targetPath) {
+  const stat = await fsp.stat(targetPath);
+  if (stat.isDirectory()) {
+    await fsp.rm(targetPath, { recursive: true, force: false });
+  } else {
+    await fsp.unlink(targetPath);
+  }
+}
+
+function decodeBufferWithEncoding(buffer) {
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return {
+      content: buffer.slice(2).toString('utf16le'),
+      encoding: 'UTF-16 LE'
+    };
+  }
+
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    const swapped = Buffer.from(buffer.slice(2));
+    swapped.swap16();
+    return {
+      content: swapped.toString('utf16le'),
+      encoding: 'UTF-16 BE'
+    };
+  }
+
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return {
+      content: buffer.slice(3).toString('utf8'),
+      encoding: 'UTF-8'
+    };
+  }
+
+  const isAscii = buffer.every((byte) => byte <= 0x7f);
+  return {
+    content: buffer.toString('utf8'),
+    encoding: isAscii ? 'ASCII' : 'UTF-8'
+  };
+}
+
+async function buildTree(dirPath) {
+  const dirents = await fsp.readdir(dirPath, { withFileTypes: true });
+  const folders = [];
+  const files = [];
+
+  for (const dirent of dirents) {
+    const fullPath = path.join(dirPath, dirent.name);
+    if (dirent.isDirectory()) {
+      folders.push({
+        name: dirent.name,
+        path: fullPath,
+        type: 'folder',
+        children: await buildTree(fullPath)
+      });
+    } else {
+      files.push({
+        name: dirent.name,
+        path: fullPath,
+        type: 'file'
+      });
+    }
+  }
+
+  folders.sort((a, b) => a.name.localeCompare(b.name));
+  files.sort((a, b) => a.name.localeCompare(b.name));
+
+  return [...folders, ...files];
+}
+
+async function createGitignoreMatcher(projectPath) {
+  const matcher = ignore();
+  matcher.add('.git/');
+
+  const gitignorePath = path.join(projectPath, '.gitignore');
+  try {
+    const content = await fsp.readFile(gitignorePath, 'utf8');
+    matcher.add(content);
+  } catch {
+    // .gitignore is optional.
+  }
+
+  return matcher;
+}
+
+function toRelativePosixPath(projectPath, targetPath) {
+  const rel = path.relative(projectPath, targetPath).split(path.sep).join('/');
+  return rel;
+}
+
+function isIgnoredPath(matcher, projectPath, targetPath, isDirectory) {
+  const relativePath = toRelativePosixPath(projectPath, targetPath);
+  if (!relativePath || relativePath.startsWith('..')) {
+    return false;
+  }
+
+  return matcher.ignores(isDirectory ? `${relativePath}/` : relativePath);
+}
+
+async function buildSearchableFiles(dirPath, projectPath, matcher) {
+  const dirents = await fsp.readdir(dirPath, { withFileTypes: true });
+  const files = [];
+
+  for (const dirent of dirents) {
+    const fullPath = path.join(dirPath, dirent.name);
+
+    if (dirent.isDirectory()) {
+      if (isIgnoredPath(matcher, projectPath, fullPath, true)) {
+        continue;
+      }
+      files.push(...await buildSearchableFiles(fullPath, projectPath, matcher));
+      continue;
+    }
+
+    if (isIgnoredPath(matcher, projectPath, fullPath, false)) {
+      continue;
+    }
+
+    files.push(fullPath);
+  }
+
+  files.sort((a, b) => a.localeCompare(b));
+  return files;
+}
+
+ipcMain.handle('project:open', async (event) => {
+  const senderWindow = BrowserWindow.fromWebContents(event.sender);
+  const existingProjectPath = getProjectPathForSender(event.sender);
+
+  const result = await dialog.showOpenDialog(senderWindow || undefined, {
+    properties: ['openDirectory']
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { canceled: true };
+  }
+
+  const selectedProjectPath = path.resolve(result.filePaths[0]);
+  await rememberRecentProject(selectedProjectPath);
+
+  if (existingProjectPath) {
+    createWindow(selectedProjectPath);
+    return { canceled: false, openedInNewWindow: true };
+  }
+
+  windowProjectState.set(event.sender.id, selectedProjectPath);
+  const matcher = await createGitignoreMatcher(selectedProjectPath);
+  const tree = await buildTree(selectedProjectPath);
+  const searchableFiles = await buildSearchableFiles(selectedProjectPath, selectedProjectPath, matcher);
+
+  return {
+    canceled: false,
+    rootPath: selectedProjectPath,
+    rootName: path.basename(selectedProjectPath),
+    tree,
+    searchableFiles
+  };
+});
+
+ipcMain.handle('project:openPath', async (event, folderPath) => {
+  const existingProjectPath = getProjectPathForSender(event.sender);
+
+  if (!folderPath) {
+    throw new Error('Invalid folder path.');
+  }
+
+  const resolved = path.resolve(folderPath);
+  const stats = await fsp.stat(resolved);
+  if (!stats.isDirectory()) {
+    throw new Error('Recent path is not a folder.');
+  }
+
+  await rememberRecentProject(resolved);
+
+  if (existingProjectPath) {
+    createWindow(resolved);
+    return { canceled: false, openedInNewWindow: true };
+  }
+
+  windowProjectState.set(event.sender.id, resolved);
+  const matcher = await createGitignoreMatcher(resolved);
+  const tree = await buildTree(resolved);
+  const searchableFiles = await buildSearchableFiles(resolved, resolved, matcher);
+
+  return {
+    canceled: false,
+    rootPath: resolved,
+    rootName: path.basename(resolved),
+    tree,
+    searchableFiles
+  };
+});
+
+ipcMain.handle('project:getRecent', async () => {
+  return recentProjects;
+});
+
+ipcMain.handle('project:close', async (event) => {
+  windowProjectState.set(event.sender.id, null);
+  return { ok: true };
+});
+
+ipcMain.handle('project:clearRecent', async () => {
+  recentProjects = [];
+  await persistRecentProjects();
+  createAppMenu();
+  return { ok: true };
+});
+
+ipcMain.handle('project:refresh', async (event) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!currentProjectPath) {
+    return { rootPath: null, rootName: '', tree: [], searchableFiles: [] };
+  }
+
+  const matcher = await createGitignoreMatcher(currentProjectPath);
+  const tree = await buildTree(currentProjectPath);
+  const searchableFiles = await buildSearchableFiles(currentProjectPath, currentProjectPath, matcher);
+  return {
+    rootPath: currentProjectPath,
+    rootName: path.basename(currentProjectPath),
+    tree,
+    searchableFiles
+  };
+});
+
+ipcMain.handle('file:read', async (event, filePath) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!isWithinProject(filePath, currentProjectPath)) {
+    throw new Error('File is outside the opened project.');
+  }
+
+  const buffer = await fsp.readFile(filePath);
+  return decodeBufferWithEncoding(buffer);
+});
+
+ipcMain.handle('file:write', async (event, { filePath, content }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!isWithinProject(filePath, currentProjectPath)) {
+    throw new Error('File is outside the opened project.');
+  }
+
+  await fsp.writeFile(filePath, content, 'utf8');
+  return { ok: true };
+});
+
+ipcMain.handle('file:saveAs', async (event, { currentPath, content }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  const senderWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!currentProjectPath) {
+    throw new Error('Open a project first.');
+  }
+
+  const defaultPath = currentPath && isWithinProject(currentPath, currentProjectPath)
+    ? currentPath
+    : path.join(currentProjectPath, 'untitled.txt');
+
+  const result = await dialog.showSaveDialog(senderWindow || mainWindow, {
+    defaultPath,
+    buttonLabel: 'Save File As'
+  });
+
+  if (result.canceled || !result.filePath) {
+    return { canceled: true };
+  }
+
+  if (!isWithinProject(result.filePath, currentProjectPath)) {
+    throw new Error('Save File As is limited to the opened project folder.');
+  }
+
+  await fsp.writeFile(result.filePath, content, 'utf8');
+  return { canceled: false, filePath: result.filePath };
+});
+
+ipcMain.handle('fs:createFile', async (event, { parentPath, name }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!parentPath || !name) {
+    throw new Error('Invalid file input.');
+  }
+
+  if (name.includes('/') || name.includes('\\')) {
+    throw new Error('File name cannot contain path separators.');
+  }
+
+  const targetPath = path.join(parentPath, name);
+  if (!isWithinProject(targetPath, currentProjectPath)) {
+    throw new Error('Target path is outside the opened project.');
+  }
+
+  await fsp.writeFile(targetPath, '', { flag: 'wx' });
+  return { ok: true, path: targetPath };
+});
+
+ipcMain.handle('fs:createFolder', async (event, { parentPath, name }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!parentPath || !name) {
+    throw new Error('Invalid folder input.');
+  }
+
+  if (name.includes('/') || name.includes('\\')) {
+    throw new Error('Folder name cannot contain path separators.');
+  }
+
+  const targetPath = path.join(parentPath, name);
+  if (!isWithinProject(targetPath, currentProjectPath)) {
+    throw new Error('Target path is outside the opened project.');
+  }
+
+  await fsp.mkdir(targetPath, { recursive: false });
+  return { ok: true, path: targetPath };
+});
+
+ipcMain.handle('fs:rename', async (event, { targetPath, newName }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!targetPath || !newName) {
+    throw new Error('Invalid rename input.');
+  }
+
+  if (newName.includes('/') || newName.includes('\\')) {
+    throw new Error('Name cannot contain path separators.');
+  }
+
+  if (!isWithinProject(targetPath, currentProjectPath)) {
+    throw new Error('Target path is outside the opened project.');
+  }
+
+  const destinationPath = path.join(path.dirname(targetPath), newName);
+  if (!isWithinProject(destinationPath, currentProjectPath)) {
+    throw new Error('Destination path is outside the opened project.');
+  }
+
+  await fsp.rename(targetPath, destinationPath);
+  return { ok: true, path: destinationPath };
+});
+
+ipcMain.handle('fs:delete', async (event, { targetPath }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!targetPath) {
+    throw new Error('Invalid delete target.');
+  }
+
+  if (!isWithinProject(targetPath, currentProjectPath)) {
+    throw new Error('Target path is outside the opened project.');
+  }
+
+  await removePathRecursive(targetPath);
+  return { ok: true };
+});
+
+ipcMain.handle('fs:copy', async (event, { sourcePath, destinationDir }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!sourcePath || !destinationDir) {
+    throw new Error('Invalid copy input.');
+  }
+
+  if (!isWithinProject(sourcePath, currentProjectPath) || !isWithinProject(destinationDir, currentProjectPath)) {
+    throw new Error('Path is outside the opened project.');
+  }
+
+  const destinationPath = path.join(destinationDir, path.basename(sourcePath));
+  if (!isWithinProject(destinationPath, currentProjectPath)) {
+    throw new Error('Destination path is outside the opened project.');
+  }
+
+  await fsp.cp(sourcePath, destinationPath, { recursive: true, errorOnExist: true, force: false });
+  return { ok: true, path: destinationPath };
+});
+
+ipcMain.handle('fs:move', async (event, { sourcePath, destinationDir }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!sourcePath || !destinationDir) {
+    throw new Error('Invalid move input.');
+  }
+
+  if (!isWithinProject(sourcePath, currentProjectPath) || !isWithinProject(destinationDir, currentProjectPath)) {
+    throw new Error('Path is outside the opened project.');
+  }
+
+  const destinationPath = path.join(destinationDir, path.basename(sourcePath));
+  if (!isWithinProject(destinationPath, currentProjectPath)) {
+    throw new Error('Destination path is outside the opened project.');
+  }
+
+  try {
+    await fsp.rename(sourcePath, destinationPath);
+  } catch (error) {
+    if (error && error.code === 'EXDEV') {
+      await fsp.cp(sourcePath, destinationPath, { recursive: true, errorOnExist: true, force: false });
+      await removePathRecursive(sourcePath);
+    } else {
+      throw error;
+    }
+  }
+
+  return { ok: true, path: destinationPath };
+});
+
+ipcMain.handle('fs:openInExplorer', async (event, { targetPath }) => {
+  const currentProjectPath = getProjectPathForSender(event.sender);
+  if (!targetPath) {
+    throw new Error('Invalid target path.');
+  }
+
+  if (!isWithinProject(targetPath, currentProjectPath)) {
+    throw new Error('Path is outside the opened project.');
+  }
+
+  shell.showItemInFolder(targetPath);
+  return { ok: true };
+});
+
+ipcMain.handle('app:command', (event, command) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed()) {
+    return { ok: false };
+  }
+
+  const currentZoom = win.webContents.getZoomFactor();
+
+  if (command === 'view:reload') {
+    win.webContents.reload();
+  } else if (command === 'view:toggleDevTools') {
+    win.webContents.toggleDevTools();
+  } else if (command === 'view:toggleFullscreen') {
+    win.setFullScreen(!win.isFullScreen());
+  } else if (command === 'view:zoomIn') {
+    win.webContents.setZoomFactor(Math.min(3, currentZoom + 0.1));
+  } else if (command === 'view:zoomOut') {
+    win.webContents.setZoomFactor(Math.max(0.25, currentZoom - 0.1));
+  } else if (command === 'view:resetZoom') {
+    win.webContents.setZoomFactor(1);
+  } else if (command === 'window:minimize') {
+    win.minimize();
+  } else if (command === 'window:close') {
+    win.close();
+  }
+
+  return { ok: true };
+});
+
+ipcMain.handle('app:getInfo', () => {
+  return {
+    name: app.getName(),
+    version: app.getVersion(),
+    description: 'QwaleCode - Lightweight Electron IDE',
+    license: 'CC BY-NC-ND 4.0',
+    electron: process.versions.electron,
+    node: process.versions.node,
+    chrome: process.versions.chrome
+  };
+});
+
+function isWslAvailable() {
+  if (process.platform !== 'win32') {
+    return false;
+  }
+
+  const result = spawnSync('wsl.exe', ['--help'], {
+    windowsHide: true,
+    stdio: 'ignore',
+    timeout: 2000
+  });
+
+  return !result.error;
+}
+
+function getAvailableTerminalProfiles() {
+  if (process.platform === 'win32') {
+    const profiles = [
+      { id: 'powershell', label: 'PowerShell' },
+      { id: 'cmd', label: 'Command Prompt' }
+    ];
+
+    if (isWslAvailable()) {
+      profiles.push({ id: 'wsl', label: 'WSL' });
+    }
+
+    return profiles;
+  }
+
+  return [{ id: 'shell', label: 'Shell' }];
+}
+
+function resolveTerminalCommand(profileId) {
+  if (process.platform === 'win32') {
+    if (profileId === 'cmd') {
+      return { shell: 'cmd.exe', args: [] };
+    }
+
+    if (profileId === 'wsl' && isWslAvailable()) {
+      return { shell: 'wsl.exe', args: [] };
+    }
+
+    return { shell: 'powershell.exe', args: [] };
+  }
+
+  return { shell: process.env.SHELL || 'bash', args: [] };
+}
+
+ipcMain.handle('terminal:getProfiles', () => {
+  return {
+    profiles: getAvailableTerminalProfiles()
+  };
+});
+
+ipcMain.handle('terminal:create', (event, { cwd, shellType }) => {
+  const senderProjectPath = getProjectPathForSender(event.sender);
+  const senderWebContentsId = event.sender.id;
+  const termId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const projectCwd = cwd && fs.existsSync(cwd) ? cwd : senderProjectPath || app.getPath('home');
+  const requestedShellType = typeof shellType === 'string' ? shellType : 'powershell';
+  const command = resolveTerminalCommand(requestedShellType);
+
+  const ptyProcess = pty.spawn(command.shell, command.args, {
+    name: 'xterm-color',
+    cols: 120,
+    rows: 30,
+    cwd: projectCwd,
+    env: process.env
+  });
+
+  terminals.set(termId, {
+    ptyProcess,
+    webContentsId: senderWebContentsId
+  });
+
+  ptyProcess.onData((data) => {
+    const targetWindow = BrowserWindow
+      .getAllWindows()
+      .find((win) => !win.isDestroyed() && win.webContents.id === senderWebContentsId);
+    if (!targetWindow || targetWindow.isDestroyed()) {
+      return;
+    }
+
+    targetWindow.webContents.send('terminal:data', { termId, data });
+  });
+
+  ptyProcess.onExit((exitEvent) => {
+    const targetWindow = BrowserWindow
+      .getAllWindows()
+      .find((win) => !win.isDestroyed() && win.webContents.id === senderWebContentsId);
+    if (!targetWindow || targetWindow.isDestroyed()) {
+      return;
+    }
+
+    terminals.delete(termId);
+    targetWindow.webContents.send('terminal:exit', { termId, exitCode: exitEvent.exitCode });
+  });
+
+  return { termId };
+});
+
+ipcMain.on('terminal:input', (_, { termId, data }) => {
+  const terminal = terminals.get(termId);
+  if (terminal) {
+    terminal.ptyProcess.write(data);
+  }
+});
+
+ipcMain.on('terminal:resize', (_, { termId, cols, rows }) => {
+  const terminal = terminals.get(termId);
+  if (!terminal) {
+    return;
+  }
+
+  const safeCols = Math.max(2, Number(cols) || 2);
+  const safeRows = Math.max(2, Number(rows) || 2);
+  terminal.ptyProcess.resize(safeCols, safeRows);
+});
+
+ipcMain.on('terminal:kill', (_, { termId }) => {
+  const terminal = terminals.get(termId);
+  if (terminal) {
+    terminal.ptyProcess.kill();
+    terminals.delete(termId);
+  }
+});
+
+app.whenReady().then(async () => {
+  await loadRecentProjects();
+  createAppMenu();
+  createWindow();
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
