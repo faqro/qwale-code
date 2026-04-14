@@ -3,8 +3,10 @@ const api = window.qwaleApi;
 const appMenubar = document.getElementById('appMenubar');
 const sidebarTabExplorer = document.getElementById('sidebarTabExplorer');
 const sidebarTabSourceControl = document.getElementById('sidebarTabSourceControl');
+const sidebarTabHttp = document.getElementById('sidebarTabHttp');
 const explorerPanelView = document.getElementById('explorerPanelView');
 const sourceControlPanelView = document.getElementById('sourceControlPanelView');
+const httpPanelView = document.getElementById('httpPanelView');
 const workspace = document.querySelector('.workspace');
 const explorerResizeHandle = document.getElementById('explorerResizeHandle');
 const aiResizeHandle = document.getElementById('aiResizeHandle');
@@ -28,6 +30,8 @@ const treeRoot = document.getElementById('treeRoot');
 const scmTabBadge = document.getElementById('scmTabBadge');
 const editorTabs = document.getElementById('editorTabs');
 const editor = document.getElementById('editor');
+const imagePreview = document.getElementById('imagePreview');
+const imagePreviewImg = document.getElementById('imagePreviewImg');
 const statusPosition = document.getElementById('statusPosition');
 const statusEncoding = document.getElementById('statusEncoding');
 const scmBranchInfo = document.getElementById('scmBranchInfo');
@@ -52,6 +56,14 @@ const scmNewBranchInput = document.getElementById('scmNewBranchInput');
 const scmCreateBranchBtn = document.getElementById('scmCreateBranchBtn');
 const scmChangedFiles = document.getElementById('scmChangedFiles');
 const scmGraph = document.getElementById('scmGraph');
+const httpMethodSelect = document.getElementById('httpMethodSelect');
+const httpUrlInput = document.getElementById('httpUrlInput');
+const httpHeadersInput = document.getElementById('httpHeadersInput');
+const httpBodyBlock = document.getElementById('httpBodyBlock');
+const httpBodyInput = document.getElementById('httpBodyInput');
+const httpSendBtn = document.getElementById('httpSendBtn');
+const httpResultStatus = document.getElementById('httpResultStatus');
+const httpResultOutput = document.getElementById('httpResultOutput');
 const terminalPanel = document.getElementById('terminalPanel');
 const terminalContainer = document.getElementById('terminalContainer');
 const terminalResizeHandle = document.getElementById('terminalResizeHandle');
@@ -801,14 +813,99 @@ function getFileName(filePath) {
 function setSidebarPanel(panelName) {
   activeSidebarPanel = panelName;
   const isExplorer = panelName === 'explorer';
+  const isSourceControl = panelName === 'source-control';
+  const isHttp = panelName === 'http';
 
   sidebarTabExplorer.classList.toggle('active', isExplorer);
-  sidebarTabSourceControl.classList.toggle('active', !isExplorer);
+  sidebarTabSourceControl.classList.toggle('active', isSourceControl);
+  sidebarTabHttp.classList.toggle('active', isHttp);
   explorerPanelView.classList.toggle('active', isExplorer);
-  sourceControlPanelView.classList.toggle('active', !isExplorer);
+  sourceControlPanelView.classList.toggle('active', isSourceControl);
+  httpPanelView.classList.toggle('active', isHttp);
 
-  if (!isExplorer) {
+  if (isSourceControl) {
     refreshSourceControlPanel();
+  }
+}
+
+function parseHttpHeaders(rawHeaders) {
+  const headers = {};
+  const lines = String(rawHeaders || '').split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf(':');
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed.slice(separatorIndex + 1).trim();
+    if (!key) {
+      continue;
+    }
+
+    headers[key] = value;
+  }
+
+  return headers;
+}
+
+function updateHttpBodyState() {
+  const method = String(httpMethodSelect.value || 'GET').toUpperCase();
+  const canHaveBody = !['GET', 'HEAD'].includes(method);
+  httpBodyBlock.classList.toggle('hidden', !canHaveBody);
+}
+
+function formatHttpResultData(data) {
+  if (data == null) {
+    return '(empty response)';
+  }
+
+  if (typeof data === 'string') {
+    return data || '(empty response)';
+  }
+
+  return JSON.stringify(data, null, 2);
+}
+
+async function sendHttpRequestFromPanel() {
+  const method = String(httpMethodSelect.value || 'GET').toUpperCase();
+  const url = httpUrlInput.value.trim();
+  if (!url) {
+    alert('Enter a request URL.');
+    return;
+  }
+
+  const headers = parseHttpHeaders(httpHeadersInput.value);
+  const body = httpBodyInput.value;
+  const canHaveBody = !['GET', 'HEAD'].includes(method);
+
+  httpSendBtn.disabled = true;
+  httpSendBtn.textContent = 'Sending...';
+  httpResultStatus.textContent = 'Request in progress...';
+
+  try {
+    const result = await api.sendHttpRequest({
+      method,
+      url,
+      headers,
+      body: canHaveBody ? body : ''
+    });
+
+    const statusLine = `${result.status}${result.statusText ? ` ${result.statusText}` : ''}`;
+    httpResultStatus.textContent = result.ok ? `Success: ${statusLine}` : `Error: ${statusLine}`;
+    httpResultOutput.textContent = formatHttpResultData(result.data);
+  } catch (error) {
+    httpResultStatus.textContent = 'Request failed';
+    httpResultOutput.textContent = error.message || String(error);
+  } finally {
+    httpSendBtn.disabled = false;
+    httpSendBtn.textContent = 'Send Request';
   }
 }
 
@@ -1691,7 +1788,7 @@ function createFileTypeIconElement(filePath, className) {
 
 function hasDirtyFiles() {
   for (const [, state] of openFiles) {
-    if (state.model.getValue() !== state.savedContent) {
+    if (state.kind === 'text' && state.model.getValue() !== state.savedContent) {
       return true;
     }
   }
@@ -1707,7 +1804,26 @@ function inferEncodingFromText(content) {
 }
 
 function updateEditorStatusBar() {
-  if (!currentFilePath || !monacoEditor || !monacoEditor.getModel()) {
+  if (!currentFilePath) {
+    statusPosition.textContent = 'Ln -, Col -';
+    statusEncoding.textContent = '-';
+    return;
+  }
+
+  const state = openFiles.get(currentFilePath);
+  if (!state) {
+    statusPosition.textContent = 'Ln -, Col -';
+    statusEncoding.textContent = '-';
+    return;
+  }
+
+  if (state.kind === 'image') {
+    statusPosition.textContent = 'Ln -, Col -';
+    statusEncoding.textContent = state.encoding || 'Image';
+    return;
+  }
+
+  if (!monacoEditor || !monacoEditor.getModel()) {
     statusPosition.textContent = 'Ln -, Col -';
     statusEncoding.textContent = '-';
     return;
@@ -1720,7 +1836,6 @@ function updateEditorStatusBar() {
     statusPosition.textContent = 'Ln -, Col -';
   }
 
-  const state = openFiles.get(currentFilePath);
   statusEncoding.textContent = state?.encoding || 'UTF-8';
 }
 
@@ -2233,7 +2348,7 @@ function showUnsavedFileDialog(filePath) {
 function getDirtyFilePaths() {
   const dirty = [];
   for (const [filePath, state] of openFiles) {
-    if (state.model.getValue() !== state.savedContent) {
+    if (state.kind === 'text' && state.model.getValue() !== state.savedContent) {
       dirty.push(filePath);
     }
   }
@@ -2242,7 +2357,7 @@ function getDirtyFilePaths() {
 
 async function saveFileByPath(filePath) {
   const fileState = openFiles.get(filePath);
-  if (!fileState) {
+  if (!fileState || fileState.kind !== 'text') {
     return;
   }
 
@@ -2366,9 +2481,41 @@ function detectMonacoLanguage(filePath) {
   return langMap[extension] || 'plaintext';
 }
 
+function isImageFile(filePath) {
+  return /\.(png|jpe?g|svg)$/i.test(filePath);
+}
+
+function toFileUrl(filePath) {
+  const normalized = filePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  return encodeURI(`file:///${normalized}`);
+}
+
+function showTextEditor() {
+  editor.classList.remove('hidden');
+  imagePreview.classList.add('hidden');
+  imagePreviewImg.removeAttribute('src');
+  imagePreviewImg.alt = '';
+}
+
+function showImagePreview(filePath) {
+  if (monacoEditor) {
+    monacoEditor.setModel(null);
+  }
+  editor.classList.add('hidden');
+  imagePreview.classList.remove('hidden');
+  imagePreviewImg.src = `${toFileUrl(filePath)}?t=${Date.now()}`;
+  imagePreviewImg.alt = getFileName(filePath);
+}
+
+function disposeOpenFileState(state) {
+  if (state && state.kind === 'text' && state.model) {
+    state.model.dispose();
+  }
+}
+
 function isDirty(filePath) {
   const state = openFiles.get(filePath);
-  if (!state) {
+  if (!state || state.kind !== 'text') {
     return false;
   }
   return state.model.getValue() !== state.savedContent;
@@ -2418,12 +2565,20 @@ function renderTabs() {
 
 function switchToFile(filePath) {
   const state = openFiles.get(filePath);
-  if (!state || !monacoEditor) {
+  if (!state) {
     return;
   }
 
   currentFilePath = filePath;
-  monacoEditor.setModel(state.model);
+  if (state.kind === 'image') {
+    showImagePreview(filePath);
+  } else {
+    showTextEditor();
+    if (!monacoEditor) {
+      return;
+    }
+    monacoEditor.setModel(state.model);
+  }
   updateEditorStatusBar();
   updateEditorTitle();
   renderTabs();
@@ -2453,12 +2608,13 @@ async function closeTab(filePath) {
 
   const keys = [...openFiles.keys()];
   const idx = keys.indexOf(filePath);
-  state.model.dispose();
+  disposeOpenFileState(state);
   openFiles.delete(filePath);
 
   if (currentFilePath === filePath) {
     if (openFiles.size === 0) {
       currentFilePath = null;
+      showTextEditor();
       if (monacoEditor) {
         monacoEditor.setModel(null);
       }
@@ -2818,7 +2974,7 @@ async function openFile(filePath, options = {}) {
 
   if (openAsPreview && previewFilePath && previewFilePath !== filePath && openFiles.has(previewFilePath)) {
     const previousPreviewState = openFiles.get(previewFilePath);
-    previousPreviewState.model.dispose();
+    disposeOpenFileState(previousPreviewState);
     openFiles.delete(previewFilePath);
 
     if (currentFilePath === previewFilePath) {
@@ -2829,20 +2985,29 @@ async function openFile(filePath, options = {}) {
     }
   }
 
-  const filePayload = await api.readFile(filePath);
-  const content = typeof filePayload === 'string' ? filePayload : filePayload.content;
-  const encoding = typeof filePayload === 'string'
-    ? inferEncodingFromText(filePayload)
-    : (filePayload.encoding || inferEncodingFromText(filePayload.content));
-  const language = detectMonacoLanguage(filePath);
-  const model = window.monaco.editor.createModel(content, language);
+  if (isImageFile(filePath)) {
+    openFiles.set(filePath, {
+      kind: 'image',
+      preview: openAsPreview,
+      encoding: 'Image'
+    });
+  } else {
+    const filePayload = await api.readFile(filePath);
+    const content = typeof filePayload === 'string' ? filePayload : filePayload.content;
+    const encoding = typeof filePayload === 'string'
+      ? inferEncodingFromText(filePayload)
+      : (filePayload.encoding || inferEncodingFromText(filePayload.content));
+    const language = detectMonacoLanguage(filePath);
+    const model = window.monaco.editor.createModel(content, language);
 
-  openFiles.set(filePath, {
-    model,
-    savedContent: content,
-    preview: openAsPreview,
-    encoding
-  });
+    openFiles.set(filePath, {
+      kind: 'text',
+      model,
+      savedContent: content,
+      preview: openAsPreview,
+      encoding
+    });
+  }
 
   previewFilePath = openAsPreview ? filePath : null;
 
@@ -2859,7 +3024,7 @@ async function saveCurrentFile() {
   }
 
   const fileState = openFiles.get(currentFilePath);
-  if (!fileState) {
+  if (!fileState || fileState.kind !== 'text') {
     return;
   }
 
@@ -2889,7 +3054,7 @@ async function saveCurrentFileAs() {
   }
 
   const fileState = openFiles.get(currentFilePath);
-  if (!fileState) {
+  if (!fileState || fileState.kind !== 'text') {
     return;
   }
 
@@ -2919,16 +3084,33 @@ async function saveCurrentFileAs() {
 
   if (openFiles.has(nextPath)) {
     const existing = openFiles.get(nextPath);
-    existing.model.setValue(content);
-    existing.savedContent = content;
-    existing.encoding = inferEncodingFromText(content);
-    existing.preview = false;
-    fileState.model.dispose();
-    openFiles.delete(oldPath);
-    if (previewFilePath === oldPath || previewFilePath === nextPath) {
-      previewFilePath = null;
+    if (existing.kind === 'text') {
+      existing.model.setValue(content);
+      existing.savedContent = content;
+      existing.encoding = inferEncodingFromText(content);
+      existing.preview = false;
+      fileState.model.dispose();
+      openFiles.delete(oldPath);
+      if (previewFilePath === oldPath || previewFilePath === nextPath) {
+        previewFilePath = null;
+      }
+      switchToFile(nextPath);
+    } else {
+      openFiles.delete(nextPath);
+      if (previewFilePath === nextPath) {
+        previewFilePath = null;
+      }
+      const language = detectMonacoLanguage(nextPath);
+      window.monaco.editor.setModelLanguage(fileState.model, language);
+      fileState.savedContent = content;
+      fileState.encoding = inferEncodingFromText(content);
+      openFiles.delete(oldPath);
+      openFiles.set(nextPath, fileState);
+      if (previewFilePath === oldPath) {
+        previewFilePath = nextPath;
+      }
+      switchToFile(nextPath);
     }
-    switchToFile(nextPath);
   } else {
     const language = detectMonacoLanguage(nextPath);
     window.monaco.editor.setModelLanguage(fileState.model, language);
@@ -2952,6 +3134,10 @@ async function saveAllFiles() {
 
   let savedCount = 0;
   for (const [filePath, fileState] of openFiles) {
+    if (fileState.kind !== 'text') {
+      continue;
+    }
+
     const content = fileState.model.getValue();
     if (content === fileState.savedContent) {
       continue;
@@ -3038,11 +3224,15 @@ async function applyOpenedProject(opened) {
   }
 
   for (const [, state] of openFiles) {
-    state.model.dispose();
+    disposeOpenFileState(state);
   }
   openFiles.clear();
   previewFilePath = null;
   currentFilePath = null;
+  showTextEditor();
+  if (monacoEditor) {
+    monacoEditor.setModel(null);
+  }
   updateEditorStatusBar();
   updateEditorTitle();
   renderTabs();
@@ -3081,12 +3271,16 @@ async function closeFolder() {
   await api.closeProject();
 
   for (const [, state] of openFiles) {
-    state.model.dispose();
+    disposeOpenFileState(state);
   }
   openFiles.clear();
   previewFilePath = null;
   currentFilePath = null;
   selectedNodePath = null;
+  showTextEditor();
+  if (monacoEditor) {
+    monacoEditor.setModel(null);
+  }
   updateEditorStatusBar();
 
   project = {
@@ -3113,6 +3307,25 @@ sidebarTabExplorer.addEventListener('click', () => {
 
 sidebarTabSourceControl.addEventListener('click', () => {
   setSidebarPanel('source-control');
+});
+
+sidebarTabHttp.addEventListener('click', () => {
+  setSidebarPanel('http');
+});
+
+httpMethodSelect.addEventListener('change', () => {
+  updateHttpBodyState();
+});
+
+httpSendBtn.addEventListener('click', async () => {
+  await sendHttpRequestFromPanel();
+});
+
+httpBodyInput.addEventListener('keydown', async (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+    event.preventDefault();
+    await sendHttpRequestFromPanel();
+  }
 });
 
 scmRefreshBtn.addEventListener('click', async () => {
@@ -3587,6 +3800,7 @@ window.addEventListener('beforeunload', (event) => {
 
 Promise.all([refreshProjectTree(), initMonacoEditor(), refreshRecentProjectsCache()])
   .then(() => {
+    updateHttpBodyState();
     applyTheme(localStorage.getItem('qwale-theme') || 'dark');
     aiPanelOpen = true;
     setAiAuthState();

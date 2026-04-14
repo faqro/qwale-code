@@ -22,6 +22,9 @@
             <span class="explorer-side-icon explorer-side-icon-branch" aria-hidden="true"></span>
             <span id="scmTabBadge" class="scm-tab-badge hidden" aria-hidden="true"></span>
           </button>
+          <button id="sidebarTabHttp" class="explorer-side-tab" type="button" title="HTTP" aria-label="HTTP">
+            <span class="explorer-side-icon explorer-side-icon-http" aria-hidden="true"></span>
+          </button>
         </aside>
 
         <div id="explorerPanelView" class="explorer-panel-view active">
@@ -95,6 +98,38 @@
             </div>
           </div>
         </div>
+
+        <div id="httpPanelView" class="explorer-panel-view">
+          <div class="panel-title">HTTP</div>
+          <div class="http-panel-body">
+            <div class="http-request-row">
+              <select id="httpMethodSelect" class="http-select">
+                <option value="GET">GET</option>
+                <option value="POST">POST</option>
+                <option value="PUT">PUT</option>
+                <option value="PATCH">PATCH</option>
+                <option value="DELETE">DELETE</option>
+                <option value="HEAD">HEAD</option>
+                <option value="OPTIONS">OPTIONS</option>
+              </select>
+              <input id="httpUrlInput" class="http-input" type="text" placeholder="https://api.example.com/items" />
+            </div>
+            <div class="http-block">
+              <label class="http-label" for="httpHeadersInput">Headers</label>
+              <textarea id="httpHeadersInput" class="http-textarea" rows="4" placeholder="Authorization: Bearer token"></textarea>
+            </div>
+            <div id="httpBodyBlock" class="http-block">
+              <label class="http-label" for="httpBodyInput">Body</label>
+              <textarea id="httpBodyInput" class="http-textarea" rows="6" placeholder='{"name": "sample"}'></textarea>
+            </div>
+            <button id="httpSendBtn" class="http-send-btn" type="button">Send Request</button>
+            <div class="http-block">
+              <div class="http-label">Result</div>
+              <div id="httpResultStatus" class="http-result-status">No request sent yet.</div>
+              <pre id="httpResultOutput" class="http-result-output">{}</pre>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -107,6 +142,9 @@
         </button>
       </div>
       <div id="editor"></div>
+      <div id="imagePreview" class="image-preview hidden">
+        <img id="imagePreviewImg" alt="" />
+      </div>
       <div id="editorStatusBar" class="editor-status-bar">
         <span id="statusPosition">Ln -, Col -</span>
         <span id="statusEncoding">UTF-8</span>

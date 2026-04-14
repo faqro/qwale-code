@@ -2,6 +2,7 @@ const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, shell } = require(
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
+const os = require('os');
 const pty = require('node-pty');
 const ignore = require('ignore');
 const { spawnSync } = require('child_process');
@@ -11,6 +12,61 @@ let mainWindow = null;
 const terminals = new Map();
 let recentProjects = [];
 const windowProjectState = new Map();
+const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
+
+function configureChromiumStoragePaths() {
+  try {
+    const localBase = process.env.LOCALAPPDATA || path.join(os.tmpdir(), 'QwaleCode');
+    const sessionDataPath = path.join(localBase, 'QwaleCode', 'session-data');
+    const diskCachePath = path.join(sessionDataPath, 'Cache');
+
+    fs.mkdirSync(sessionDataPath, { recursive: true });
+    fs.mkdirSync(diskCachePath, { recursive: true });
+
+    app.setPath('sessionData', sessionDataPath);
+    app.commandLine.appendSwitch('disk-cache-dir', diskCachePath);
+    app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
+  } catch {
+    // Fall back to Electron defaults if path setup fails.
+  }
+}
+
+configureChromiumStoragePaths();
+
+function simplifyResponseData(value, depth = 0) {
+  if (depth > 8 || value == null) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 250).map((entry) => simplifyResponseData(entry, depth + 1));
+  }
+
+  if (typeof value !== 'object') {
+    return value;
+  }
+
+  const preferredKeys = ['data', 'result', 'results', 'items', 'item', 'object', 'payload'];
+  for (const key of preferredKeys) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      return simplifyResponseData(value[key], depth + 1);
+    }
+  }
+
+  const simplified = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (metaFieldPattern.test(key)) {
+      continue;
+    }
+    simplified[key] = simplifyResponseData(entry, depth + 1);
+  }
+
+  if (Object.keys(simplified).length > 0) {
+    return simplified;
+  }
+
+  return value;
+}
 
 function getRecentProjectsFilePath() {
   return path.join(app.getPath('userData'), 'recent-projects.json');
@@ -745,6 +801,59 @@ ipcMain.handle('app:getInfo', () => {
     electron: process.versions.electron,
     node: process.versions.node,
     chrome: process.versions.chrome
+  };
+});
+
+ipcMain.handle('http:request', async (_event, payload = {}) => {
+  const method = String(payload.method || 'GET').toUpperCase();
+  const url = String(payload.url || '').trim();
+  if (!url) {
+    throw new Error('Enter a request URL.');
+  }
+
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error('URL must start with http:// or https://');
+  }
+
+  const requestHeaders = payload && typeof payload.headers === 'object' && payload.headers !== null
+    ? payload.headers
+    : {};
+
+  const requestOptions = {
+    method,
+    headers: requestHeaders,
+    signal: AbortSignal.timeout(30000)
+  };
+
+  const hasBody = !['GET', 'HEAD'].includes(method);
+  if (hasBody && typeof payload.body === 'string' && payload.body.length > 0) {
+    requestOptions.body = payload.body;
+  }
+
+  const response = await fetch(url, requestOptions);
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+
+  let responseData;
+  if (contentType.includes('application/json')) {
+    try {
+      const parsed = await response.json();
+      responseData = simplifyResponseData(parsed);
+    } catch {
+      responseData = await response.text();
+    }
+  } else {
+    responseData = await response.text();
+  }
+
+  if (typeof responseData === 'string' && responseData.length > 200000) {
+    responseData = `${responseData.slice(0, 200000)}\n...truncated...`;
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    statusText: response.statusText,
+    data: responseData
   };
 });
 
