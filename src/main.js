@@ -794,7 +794,7 @@ ipcMain.handle('app:copyToClipboard', async (_event, text) => {
 
 ipcMain.handle('app:getInfo', () => {
   return {
-    name: app.getName(),
+    name: "QwaleCode",
     version: app.getVersion(),
     description: 'QwaleCode - Lightweight Electron IDE',
     license: 'CC BY-NC-ND 4.0',

@@ -107,6 +107,8 @@ let isWindowCloseApproved = false;
 let explorerMenu = null;
 let inlineEditState = null;
 let explorerClipboard = null;
+let explorerPanelFocused = true;
+let explorerSelectionAnchorPath = null;
 let fileSearchContainer = null;
 let fileSearchInput = null;
 let fileSearchResults = null;
@@ -132,6 +134,7 @@ const openFiles = new Map();
 const terminalSessions = new Map();
 
 const expandedFolders = new Set();
+const explorerSelectedPaths = new Set();
 
 const terminal = new Terminal({
   convertEol: true,
@@ -810,6 +813,201 @@ function getFileName(filePath) {
   return filePath.split(/[/\\]/).pop();
 }
 
+function normalizeExplorerPath(value) {
+  return String(value || '').replace(/\\/g, '/');
+}
+
+function isPathWithinFolderPath(filePath, folderPath) {
+  const target = normalizeExplorerPath(filePath);
+  const folder = normalizeExplorerPath(folderPath);
+  return target === folder || target.startsWith(`${folder}/`);
+}
+
+function getExplorerVisiblePaths() {
+  if (!treeRoot) {
+    return [];
+  }
+
+  return Array.from(treeRoot.querySelectorAll('.tree-node[data-path]')).map((row) => row.dataset.path).filter(Boolean);
+}
+
+function setExplorerPanelFocus(focused) {
+  const next = Boolean(focused);
+  if (explorerPanelFocused === next) {
+    return;
+  }
+
+  explorerPanelFocused = next;
+  if (!explorerPanelFocused && explorerSelectedPaths.size > 1) {
+    explorerSelectedPaths.clear();
+    if (selectedNodePath) {
+      explorerSelectedPaths.add(selectedNodePath);
+    }
+    renderTree();
+  }
+}
+
+function setExplorerSingleSelection(targetPath) {
+  selectedNodePath = targetPath;
+  explorerSelectionAnchorPath = targetPath;
+  explorerSelectedPaths.clear();
+  if (targetPath) {
+    explorerSelectedPaths.add(targetPath);
+  }
+}
+
+function setExplorerRangeSelection(targetPath) {
+  const visiblePaths = getExplorerVisiblePaths();
+  if (!targetPath || !explorerSelectionAnchorPath || !visiblePaths.length) {
+    setExplorerSingleSelection(targetPath);
+    return;
+  }
+
+  const startIndex = visiblePaths.indexOf(explorerSelectionAnchorPath);
+  const endIndex = visiblePaths.indexOf(targetPath);
+  if (startIndex < 0 || endIndex < 0) {
+    setExplorerSingleSelection(targetPath);
+    return;
+  }
+
+  explorerSelectedPaths.clear();
+  const from = Math.min(startIndex, endIndex);
+  const to = Math.max(startIndex, endIndex);
+  for (let i = from; i <= to; i += 1) {
+    explorerSelectedPaths.add(visiblePaths[i]);
+  }
+  selectedNodePath = targetPath;
+}
+
+function toggleExplorerAdditiveSelection(targetPath) {
+  if (!targetPath) {
+    return;
+  }
+
+  if (explorerSelectedPaths.has(targetPath)) {
+    explorerSelectedPaths.delete(targetPath);
+    if (selectedNodePath === targetPath) {
+      const fallback = explorerSelectedPaths.values().next().value || null;
+      selectedNodePath = fallback;
+      explorerSelectionAnchorPath = fallback;
+    }
+  } else {
+    explorerSelectedPaths.add(targetPath);
+    selectedNodePath = targetPath;
+    explorerSelectionAnchorPath = targetPath;
+  }
+
+  if (!explorerSelectedPaths.size) {
+    selectedNodePath = null;
+    explorerSelectionAnchorPath = null;
+  }
+}
+
+function selectExplorerNode(targetPath, shiftKey = false, additiveKey = false) {
+  if (additiveKey && explorerPanelFocused) {
+    toggleExplorerAdditiveSelection(targetPath);
+    return;
+  }
+
+  if (shiftKey && explorerPanelFocused) {
+    setExplorerRangeSelection(targetPath);
+    return;
+  }
+
+  setExplorerSingleSelection(targetPath);
+}
+
+function getTreeNodeByPath(nodes, targetPath) {
+  for (const node of nodes || []) {
+    if (node.path === targetPath) {
+      return node;
+    }
+
+    if (node.type === 'folder') {
+      const child = getTreeNodeByPath(node.children || [], targetPath);
+      if (child) {
+        return child;
+      }
+    }
+  }
+
+  return null;
+}
+
+function getExplorerContextEntries(contextNode) {
+  if (!contextNode) {
+    return [];
+  }
+
+  if (explorerPanelFocused && explorerSelectedPaths.size > 1 && explorerSelectedPaths.has(contextNode.path)) {
+    return Array.from(explorerSelectedPaths).map((targetPath) => {
+      const node = getTreeNodeByPath(project.tree, targetPath);
+      return {
+        path: targetPath,
+        type: node ? node.type : 'file',
+        name: node ? node.name : getFileName(targetPath)
+      };
+    });
+  }
+
+  return [{ path: contextNode.path, type: contextNode.type, name: contextNode.name }];
+}
+
+function compactExplorerEntries(entries) {
+  const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
+  const compacted = [];
+
+  for (const entry of sorted) {
+    const covered = compacted.some((existing) => existing.type === 'folder' && isPathWithinFolderPath(entry.path, existing.path));
+    if (!covered) {
+      compacted.push(entry);
+    }
+  }
+
+  return compacted;
+}
+
+function getOpenTabsUnderEntry(entry) {
+  const matches = [];
+  for (const filePath of openFiles.keys()) {
+    if (entry.type === 'folder') {
+      if (isPathWithinFolderPath(filePath, entry.path)) {
+        matches.push(filePath);
+      }
+    } else if (filePath === entry.path) {
+      matches.push(filePath);
+    }
+  }
+  return matches;
+}
+
+async function deleteExplorerEntries(entries) {
+  if (!entries.length) {
+    return;
+  }
+
+  const compacted = compactExplorerEntries(entries);
+  const tabsToClose = new Set();
+  for (const entry of compacted) {
+    for (const filePath of getOpenTabsUnderEntry(entry)) {
+      tabsToClose.add(filePath);
+    }
+  }
+
+  for (const entry of compacted) {
+    await api.deletePath({ targetPath: entry.path });
+  }
+
+  for (const filePath of tabsToClose) {
+    if (openFiles.has(filePath)) {
+      await closeTab(filePath);
+    }
+  }
+
+  setExplorerSingleSelection(null);
+  await refreshProjectTree();
+}
+
 function setSidebarPanel(panelName) {
   activeSidebarPanel = panelName;
   const isExplorer = panelName === 'explorer';
@@ -825,6 +1023,10 @@ function setSidebarPanel(panelName) {
 
   if (isSourceControl) {
     refreshSourceControlPanel();
+  }
+
+  if (panelName !== 'explorer') {
+    setExplorerPanelFocus(false);
   }
 }
 
@@ -1571,41 +1773,54 @@ function showExplorerContextMenu(event, contextNode) {
   explorerMenu.innerHTML = '';
 
   const hasNode = Boolean(contextNode);
+  const contextEntries = hasNode ? getExplorerContextEntries(contextNode) : [];
+  const hasMultiSelection = contextEntries.length > 1;
   const isFolder = contextNode && contextNode.type === 'folder';
   const pasteTarget = getPasteTargetPath(contextNode);
   const canPaste = Boolean(explorerClipboard && pasteTarget);
 
   if (hasNode) {
-    if (contextNode.type === 'file') {
+    if (!hasMultiSelection && contextNode.type === 'file') {
       addExplorerMenuItem(explorerMenu, 'Open', async () => {
         await openFile(contextNode.path, { mode: 'permanent' });
       });
     }
 
-    addExplorerMenuItem(explorerMenu, contextNode.type === 'file' ? 'Copy File' : 'Copy Folder', async () => {
-      explorerClipboard = { mode: 'copy', sourcePath: contextNode.path, type: contextNode.type };
+    addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Copy ${contextEntries.length} Items` : (contextNode.type === 'file' ? 'Copy File' : 'Copy Folder'), async () => {
+      explorerClipboard = {
+        mode: 'copy',
+        items: contextEntries.map((entry) => ({ sourcePath: entry.path, type: entry.type }))
+      };
     });
 
-    addExplorerMenuItem(explorerMenu, contextNode.type === 'file' ? 'Cut File' : 'Cut Folder', async () => {
-      explorerClipboard = { mode: 'cut', sourcePath: contextNode.path, type: contextNode.type };
+    addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Cut ${contextEntries.length} Items` : (contextNode.type === 'file' ? 'Cut File' : 'Cut Folder'), async () => {
+      explorerClipboard = {
+        mode: 'cut',
+        items: contextEntries.map((entry) => ({ sourcePath: entry.path, type: entry.type }))
+      };
     });
 
-    addExplorerMenuItem(explorerMenu, 'Copy Path', async () => {
-      await copyTextToClipboard(contextNode.path);
-    });
+    if (!hasMultiSelection) {
+      addExplorerMenuItem(explorerMenu, 'Copy Path', async () => {
+        await copyTextToClipboard(contextNode.path);
+      });
 
-    addExplorerMenuItem(explorerMenu, 'Copy Relative Path', async () => {
-      await copyTextToClipboard(getRelativeProjectPath(contextNode.path));
-    });
+      addExplorerMenuItem(explorerMenu, 'Copy Relative Path', async () => {
+        await copyTextToClipboard(getRelativeProjectPath(contextNode.path));
+      });
 
-    addExplorerMenuItem(explorerMenu, 'Rename', async () => {
-      startInlineRename(contextNode.path, contextNode.type);
-    });
+      addExplorerMenuItem(explorerMenu, 'Rename', async () => {
+        startInlineRename(contextNode.path, contextNode.type);
+      });
+    }
 
-    addExplorerMenuItem(explorerMenu, 'Delete', async () => {
+    addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Delete ${contextEntries.length} Items` : 'Delete', async () => {
+      const message = hasMultiSelection
+        ? `Delete ${contextEntries.length} selected items? This cannot be undone.`
+        : `Delete ${contextNode.name}? This cannot be undone.`;
       const shouldDelete = await showConfirmDialog({
         title: 'Delete',
-        message: `Delete ${contextNode.name}? This cannot be undone.`,
+        message,
         confirmLabel: 'Delete',
         confirmStyle: 'danger'
       });
@@ -1613,18 +1828,16 @@ function showExplorerContextMenu(event, contextNode) {
         return;
       }
 
-      await api.deletePath({ targetPath: contextNode.path });
-      if (openFiles.has(contextNode.path)) {
-        await closeTab(contextNode.path);
-      }
-      await refreshProjectTree();
+      await deleteExplorerEntries(contextEntries);
     });
 
-    addExplorerMenuItem(explorerMenu, 'Open in File Explorer', async () => {
-      await api.openInExplorer({ targetPath: contextNode.path });
-    });
+    if (!hasMultiSelection) {
+      addExplorerMenuItem(explorerMenu, 'Open in File Explorer', async () => {
+        await api.openInExplorer({ targetPath: contextNode.path });
+      });
+    }
 
-    if (isFolder) {
+    if (!hasMultiSelection && isFolder) {
       addExplorerMenuDivider(explorerMenu);
       addExplorerMenuItem(explorerMenu, 'New File', async () => {
         startInlineCreate('file', contextNode.path);
@@ -1733,12 +1946,24 @@ async function pasteIntoPath(destinationPath) {
     return;
   }
 
-  const { mode, sourcePath } = explorerClipboard;
+  const { mode } = explorerClipboard;
+  const items = Array.isArray(explorerClipboard.items)
+    ? explorerClipboard.items
+    : [{ sourcePath: explorerClipboard.sourcePath, type: explorerClipboard.type }];
 
-  if (mode === 'copy') {
-    await api.copyPath({ sourcePath, destinationDir: destinationPath });
-  } else {
-    await api.movePath({ sourcePath, destinationDir: destinationPath });
+  for (const item of items) {
+    if (!item || !item.sourcePath) {
+      continue;
+    }
+
+    if (mode === 'copy') {
+      await api.copyPath({ sourcePath: item.sourcePath, destinationDir: destinationPath });
+    } else {
+      await api.movePath({ sourcePath: item.sourcePath, destinationDir: destinationPath });
+    }
+  }
+
+  if (mode === 'cut') {
     explorerClipboard = null;
   }
 
@@ -2691,6 +2916,10 @@ function buildTreeNode(node) {
     row.classList.add('selected');
   }
 
+  if (explorerSelectedPaths.has(node.path)) {
+    row.classList.add('multi-selected');
+  }
+
   const icon = document.createElement('span');
   icon.className = 'node-icon';
 
@@ -2701,7 +2930,10 @@ function buildTreeNode(node) {
   row.addEventListener('contextmenu', (event) => {
     event.preventDefault();
     event.stopPropagation();
-    selectedNodePath = node.path;
+    setExplorerPanelFocus(true);
+    if (!(explorerSelectedPaths.size > 1 && explorerSelectedPaths.has(node.path))) {
+      selectExplorerNode(node.path, false);
+    }
     renderTree();
     showExplorerContextMenu(event, node);
   });
@@ -2759,7 +2991,13 @@ function buildTreeNode(node) {
 
     row.addEventListener('click', (event) => {
       event.stopPropagation();
-      selectedNodePath = node.path;
+      setExplorerPanelFocus(true);
+      const additiveKey = event.ctrlKey || event.metaKey;
+      selectExplorerNode(node.path, event.shiftKey, additiveKey);
+      if (additiveKey) {
+        renderTree();
+        return;
+      }
       if (isExpanded) {
         expandedFolders.delete(node.path);
       } else {
@@ -2839,7 +3077,13 @@ function buildTreeNode(node) {
 
     singleClickTimer = setTimeout(async () => {
       singleClickTimer = null;
-      selectedNodePath = node.path;
+      setExplorerPanelFocus(true);
+      const additiveKey = event.ctrlKey || event.metaKey;
+      selectExplorerNode(node.path, event.shiftKey, additiveKey);
+      if (additiveKey) {
+        renderTree();
+        return;
+      }
       await openFile(node.path, { mode: 'preview' });
       renderTree();
     }, 220);
@@ -2852,7 +3096,13 @@ function buildTreeNode(node) {
       singleClickTimer = null;
     }
 
-    selectedNodePath = node.path;
+    setExplorerPanelFocus(true);
+    const additiveKey = event.ctrlKey || event.metaKey;
+    selectExplorerNode(node.path, event.shiftKey, additiveKey);
+    if (additiveKey) {
+      renderTree();
+      return;
+    }
     await openFile(node.path, { mode: 'permanent' });
     renderTree();
   });
@@ -2875,7 +3125,8 @@ function renderTree() {
   treeRoot.oncontextmenu = (event) => {
     event.preventDefault();
     if (!event.target.closest('.tree-node')) {
-      selectedNodePath = null;
+      setExplorerPanelFocus(true);
+      setExplorerSingleSelection(null);
       renderTree();
       showExplorerContextMenu(event, null);
     }
@@ -3311,6 +3562,12 @@ sidebarTabSourceControl.addEventListener('click', () => {
 
 sidebarTabHttp.addEventListener('click', () => {
   setSidebarPanel('http');
+});
+
+document.addEventListener('pointerdown', (event) => {
+  const target = event.target;
+  const withinExplorerFocusZone = Boolean(target.closest('#explorerPanelView') || target.closest('.explorer-context-menu'));
+  setExplorerPanelFocus(withinExplorerFocusZone);
 });
 
 httpMethodSelect.addEventListener('change', () => {

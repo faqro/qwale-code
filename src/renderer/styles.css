@@ -1422,6 +1422,10 @@ body {
   background: rgba(69, 212, 131, 0.2);
 }
 
+.tree-node.multi-selected {
+  background: rgba(111, 103, 255, 0.26);
+}
+
 .tree-node.ignored {
   opacity: 0.5;
 }
@@ -2278,6 +2282,11 @@ body.light-theme .tree-node:hover {
 
 body.light-theme .tree-node.selected {
   background: rgba(111, 103, 255, 0.2);
+  color: #223047;
+}
+
+body.light-theme .tree-node.multi-selected {
+  background: rgba(111, 103, 255, 0.3);
   color: #223047;
 }
 
