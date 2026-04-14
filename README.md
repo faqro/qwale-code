@@ -27,6 +27,7 @@ It also includes a bottom terminal panel with multiple terminal sessions, file s
 - Light and dark themes
 - Recent project history
 - Search files by name
+- More coming soon
 
 ## Requirements
 
