@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -724,6 +724,15 @@ ipcMain.handle('app:command', (event, command) => {
     win.close();
   }
 
+  return { ok: true };
+});
+
+ipcMain.handle('app:copyToClipboard', async (_event, text) => {
+  if (typeof text !== 'string') {
+    throw new Error('Clipboard text must be a string.');
+  }
+
+  clipboard.writeText(text);
   return { ok: true };
 });
 

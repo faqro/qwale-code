@@ -25,6 +25,7 @@ const aiStopBtn = document.getElementById('aiStopBtn');
 const aiAuthOnlyElements = document.querySelectorAll('.ai-auth-only');
 const projectInfo = document.getElementById('projectInfo');
 const treeRoot = document.getElementById('treeRoot');
+const scmTabBadge = document.getElementById('scmTabBadge');
 const editorTabs = document.getElementById('editorTabs');
 const editor = document.getElementById('editor');
 const statusPosition = document.getElementById('statusPosition');
@@ -1045,6 +1046,21 @@ function updateScmSyncButton() {
   }
 }
 
+function updateScmBadge(count, visible) {
+  if (!scmTabBadge) {
+    return;
+  }
+
+  if (!visible || !count) {
+    scmTabBadge.textContent = '';
+    scmTabBadge.classList.add('hidden');
+    return;
+  }
+
+  scmTabBadge.textContent = count > 99 ? '99+' : String(count);
+  scmTabBadge.classList.remove('hidden');
+}
+
 function getHostCreateRepoUrl(hostId) {
   if (hostId === 'gitlab') {
     return 'https://gitlab.com/projects/new';
@@ -1093,6 +1109,7 @@ function applyScmState(state) {
   resetScmDataViews();
   scmSyncMode = 'fetch';
   updateScmSyncButton();
+  updateScmBadge(0, false);
 
   if (state === 'no-repo') {
     scmBranchInfo.textContent = 'No Git repository found in this folder.';
@@ -1155,7 +1172,9 @@ async function refreshSourceControlPanel() {
     scmBranchInfo.textContent = overview.branchLine || 'Git repository';
     scmSyncMode = hasRemoteChangesToPull(overview.branchLine) ? 'pull' : 'fetch';
     updateScmSyncButton();
-    renderChangedFilesList(overview.files || []);
+    const changedFiles = Array.isArray(overview.files) ? overview.files : [];
+    renderChangedFilesList(changedFiles);
+    updateScmBadge(changedFiles.length, true);
     renderBranches(overview.branches || []);
     renderCommitGraph(overview.graphCommits || []);
   } catch (error) {
@@ -1432,6 +1451,24 @@ function getPasteTargetPath(contextNode) {
   return contextNode.path.replace(/[\\/][^\\/]+$/, '');
 }
 
+async function copyTextToClipboard(text) {
+  if (typeof text !== 'string' || !text) {
+    return;
+  }
+
+  if (typeof api.copyToClipboard === 'function') {
+    await api.copyToClipboard(text);
+    return;
+  }
+
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  throw new Error('Clipboard is unavailable.');
+}
+
 function showExplorerContextMenu(event, contextNode) {
   ensureExplorerContextMenu();
   explorerMenu.innerHTML = '';
@@ -1442,11 +1479,11 @@ function showExplorerContextMenu(event, contextNode) {
   const canPaste = Boolean(explorerClipboard && pasteTarget);
 
   if (hasNode) {
-    addExplorerMenuItem(explorerMenu, 'Open With', async () => {
-      if (contextNode.type === 'file') {
+    if (contextNode.type === 'file') {
+      addExplorerMenuItem(explorerMenu, 'Open', async () => {
         await openFile(contextNode.path, { mode: 'permanent' });
-      }
-    });
+      });
+    }
 
     addExplorerMenuItem(explorerMenu, contextNode.type === 'file' ? 'Copy File' : 'Copy Folder', async () => {
       explorerClipboard = { mode: 'copy', sourcePath: contextNode.path, type: contextNode.type };
@@ -1454,6 +1491,14 @@ function showExplorerContextMenu(event, contextNode) {
 
     addExplorerMenuItem(explorerMenu, contextNode.type === 'file' ? 'Cut File' : 'Cut Folder', async () => {
       explorerClipboard = { mode: 'cut', sourcePath: contextNode.path, type: contextNode.type };
+    });
+
+    addExplorerMenuItem(explorerMenu, 'Copy Path', async () => {
+      await copyTextToClipboard(contextNode.path);
+    });
+
+    addExplorerMenuItem(explorerMenu, 'Copy Relative Path', async () => {
+      await copyTextToClipboard(getRelativeProjectPath(contextNode.path));
     });
 
     addExplorerMenuItem(explorerMenu, 'Rename', async () => {
@@ -2750,6 +2795,7 @@ async function refreshProjectTree() {
   renderTree();
   refreshFileSearchIndex();
   syncAiChatControls();
+  await refreshSourceControlPanel();
 }
 
 async function openFile(filePath, options = {}) {
@@ -3009,9 +3055,7 @@ async function applyOpenedProject(opened) {
   renderTree();
   refreshFileSearchIndex();
   syncAiChatControls();
-  if (activeSidebarPanel === 'source-control') {
-    await refreshSourceControlPanel();
-  }
+  await refreshSourceControlPanel();
 
   killAllTerminalSessions();
   await createTerminalSession('powershell');
@@ -3507,10 +3551,10 @@ window.addEventListener('blur', () => {
 
 window.addEventListener('resize', () => {
   applySidebarWidth(leftSidebarWidth);
-  if (aiPanelOpen) {
-    const maxWidth = Math.max(280, Math.floor(workspace.getBoundingClientRect().width - leftSidebarWidth - 260));
-    aiPanelWidth = Math.min(aiPanelWidth, maxWidth);
-    updateWorkspaceColumns();
+  updateWorkspaceColumns();
+
+  if (monacoEditor) {
+    monacoEditor.layout();
   }
 
   fitAddon.fit();

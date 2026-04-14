@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   gitCreateBranch: (payload) => ipcRenderer.invoke('git:createBranch', payload),
   gitSwitchBranch: (payload) => ipcRenderer.invoke('git:switchBranch', payload),
   dispatchAppCommand: (command) => ipcRenderer.invoke('app:command', command),
+  copyToClipboard: (text) => ipcRenderer.invoke('app:copyToClipboard', text),
   setAppTheme: (mode) => ipcRenderer.invoke('app:setTheme', mode),
   getAppInfo: () => ipcRenderer.invoke('app:getInfo'),
   openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
