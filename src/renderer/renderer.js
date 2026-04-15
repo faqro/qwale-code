@@ -2,9 +2,11 @@ const api = window.qwaleApi;
 
 const appMenubar = document.getElementById('appMenubar');
 const sidebarTabExplorer = document.getElementById('sidebarTabExplorer');
+const sidebarTabRunDebug = document.getElementById('sidebarTabRunDebug');
 const sidebarTabSourceControl = document.getElementById('sidebarTabSourceControl');
 const sidebarTabHttp = document.getElementById('sidebarTabHttp');
 const explorerPanelView = document.getElementById('explorerPanelView');
+const runDebugPanelView = document.getElementById('runDebugPanelView');
 const sourceControlPanelView = document.getElementById('sourceControlPanelView');
 const httpPanelView = document.getElementById('httpPanelView');
 const workspace = document.querySelector('.workspace');
@@ -64,6 +66,21 @@ const httpBodyInput = document.getElementById('httpBodyInput');
 const httpSendBtn = document.getElementById('httpSendBtn');
 const httpResultStatus = document.getElementById('httpResultStatus');
 const httpResultOutput = document.getElementById('httpResultOutput');
+const runDebugAddBtn = document.getElementById('runDebugAddBtn');
+const runDebugCreateState = document.getElementById('runDebugCreateState');
+const runDebugCreateBtn = document.getElementById('runDebugCreateBtn');
+const runDebugListState = document.getElementById('runDebugListState');
+const runDebugStatus = document.getElementById('runDebugStatus');
+const runDebugOptionsList = document.getElementById('runDebugOptionsList');
+const runDebugEditorState = document.getElementById('runDebugEditorState');
+const runDebugOptionName = document.getElementById('runDebugOptionName');
+const runDebugOptionDescription = document.getElementById('runDebugOptionDescription');
+const runDebugAddCommandBtn = document.getElementById('runDebugAddCommandBtn');
+const runDebugAddProgramBtn = document.getElementById('runDebugAddProgramBtn');
+const runDebugAddWebsiteBtn = document.getElementById('runDebugAddWebsiteBtn');
+const runDebugActionList = document.getElementById('runDebugActionList');
+const runDebugSaveOptionBtn = document.getElementById('runDebugSaveOptionBtn');
+const runDebugCancelOptionBtn = document.getElementById('runDebugCancelOptionBtn');
 const terminalPanel = document.getElementById('terminalPanel');
 const terminalContainer = document.getElementById('terminalContainer');
 const terminalResizeHandle = document.getElementById('terminalResizeHandle');
@@ -129,9 +146,22 @@ let aiBusy = false;
 let aiAbortController = null;
 let aiConversation = [];
 let aiConversationCursor = -1;
+let launchConfigState = {
+  state: 'no-project',
+  hasQwcodeDir: false,
+  hasLaunchFile: false,
+  hasGitignore: false,
+  launchPath: null,
+  config: {
+    version: 1,
+    launchOptions: []
+  }
+};
+let launchEditorState = null;
 
 const openFiles = new Map();
 const terminalSessions = new Map();
+const launchOptionRuntime = new Map();
 
 const expandedFolders = new Set();
 const explorerSelectedPaths = new Set();
@@ -706,6 +736,20 @@ function renderTerminalTypeMenu() {
   }
 }
 
+function clearLaunchRuntimeForTermId(termId) {
+  let changed = false;
+  for (const [optionId, runtime] of launchOptionRuntime) {
+    if (runtime && runtime.termId === termId) {
+      launchOptionRuntime.delete(optionId);
+      changed = true;
+    }
+  }
+
+  if (changed && activeSidebarPanel === 'run-debug') {
+    renderRunDebugPanel();
+  }
+}
+
 function bindTerminalBridgeEvents() {
   if (terminalEventsBound) {
     return;
@@ -726,6 +770,7 @@ function bindTerminalBridgeEvents() {
   api.onTerminalExit(({ termId, exitCode }) => {
     const session = terminalSessions.get(termId);
     if (!session) {
+      clearLaunchRuntimeForTermId(termId);
       return;
     }
 
@@ -735,14 +780,16 @@ function bindTerminalBridgeEvents() {
     if (termId === activeTerminalId) {
       terminal.writeln(`\r\n[Process exited with code ${exitCode}]`);
     }
+
+    clearLaunchRuntimeForTermId(termId);
   });
 
   terminalEventsBound = true;
 }
 
-async function createTerminalSession(shellType = 'powershell') {
+async function createTerminalSession(shellType = 'powershell', cwd = project.rootPath) {
   const created = await api.createTerminal({
-    cwd: project.rootPath,
+    cwd,
     shellType
   });
 
@@ -757,6 +804,7 @@ async function createTerminalSession(shellType = 'powershell') {
 
   terminalSessions.set(created.termId, session);
   setActiveTerminal(created.termId);
+  return created.termId;
 }
 
 async function killTerminalSession(termId) {
@@ -766,6 +814,7 @@ async function killTerminalSession(termId) {
 
   api.killTerminal({ termId });
   terminalSessions.delete(termId);
+  clearLaunchRuntimeForTermId(termId);
 
   if (activeTerminalId === termId) {
     const remaining = [...terminalSessions.keys()];
@@ -784,6 +833,7 @@ async function killTerminalSession(termId) {
 function killAllTerminalSessions() {
   for (const termId of terminalSessions.keys()) {
     api.killTerminal({ termId });
+    clearLaunchRuntimeForTermId(termId);
   }
 
   terminalSessions.clear();
@@ -1011,15 +1061,22 @@ async function deleteExplorerEntries(entries) {
 function setSidebarPanel(panelName) {
   activeSidebarPanel = panelName;
   const isExplorer = panelName === 'explorer';
+  const isRunDebug = panelName === 'run-debug';
   const isSourceControl = panelName === 'source-control';
   const isHttp = panelName === 'http';
 
   sidebarTabExplorer.classList.toggle('active', isExplorer);
+  sidebarTabRunDebug.classList.toggle('active', isRunDebug);
   sidebarTabSourceControl.classList.toggle('active', isSourceControl);
   sidebarTabHttp.classList.toggle('active', isHttp);
   explorerPanelView.classList.toggle('active', isExplorer);
+  runDebugPanelView.classList.toggle('active', isRunDebug);
   sourceControlPanelView.classList.toggle('active', isSourceControl);
   httpPanelView.classList.toggle('active', isHttp);
+
+  if (isRunDebug) {
+    refreshRunDebugPanel();
+  }
 
   if (isSourceControl) {
     refreshSourceControlPanel();
@@ -1028,6 +1085,910 @@ function setSidebarPanel(panelName) {
   if (panelName !== 'explorer') {
     setExplorerPanelFocus(false);
   }
+}
+
+function getDefaultLaunchConfig() {
+  return {
+    version: 1,
+    launchOptions: []
+  };
+}
+
+function createLaunchEntityId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function getDefaultLaunchShellType() {
+  if (Array.isArray(terminalProfiles) && terminalProfiles.length > 0) {
+    if (terminalProfiles.some((profile) => profile.id === 'powershell')) {
+      return 'powershell';
+    }
+    return terminalProfiles[0].id;
+  }
+
+  return 'powershell';
+}
+
+function isWindowsLaunchHost() {
+  return Array.isArray(terminalProfiles) && terminalProfiles.some((profile) => profile.id === 'cmd');
+}
+
+function ensureLaunchRuntimeIntegrity() {
+  let changed = false;
+
+  for (const [optionId, runtime] of launchOptionRuntime) {
+    const session = runtime && runtime.termId ? terminalSessions.get(runtime.termId) : null;
+    if (!session || session.exited) {
+      launchOptionRuntime.delete(optionId);
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+function isLaunchOptionRunning(optionId) {
+  const runtime = launchOptionRuntime.get(optionId);
+  if (!runtime || !runtime.termId) {
+    return false;
+  }
+
+  const session = terminalSessions.get(runtime.termId);
+  if (!session || session.exited) {
+    launchOptionRuntime.delete(optionId);
+    return false;
+  }
+
+  return true;
+}
+
+function getLaunchOptions() {
+  const config = launchConfigState && launchConfigState.config ? launchConfigState.config : getDefaultLaunchConfig();
+  return Array.isArray(config.launchOptions) ? config.launchOptions : [];
+}
+
+function formatLaunchActionPreview(action) {
+  if (!action) {
+    return '';
+  }
+
+  if (action.type === 'website') {
+    return `Open ${action.url}`;
+  }
+
+  if (action.type === 'program') {
+    const shellLabel = String(action.shell || getDefaultLaunchShellType()).toUpperCase();
+    const argsPart = action.args ? ` ${action.args}` : '';
+    const cwdPart = action.cwd ? `  @  ${action.cwd}` : '';
+    return `[${shellLabel}] ${action.program}${argsPart}${cwdPart}`;
+  }
+
+  const shellLabel = String(action.shell || getDefaultLaunchShellType()).toUpperCase();
+  const cwdPart = action.cwd ? `  @  ${action.cwd}` : '';
+  return `[${shellLabel}] ${action.command}${cwdPart}`;
+}
+
+function setRunDebugStatusText(text) {
+  runDebugStatus.textContent = text;
+}
+
+function updateRunDebugStatusSummary() {
+  ensureLaunchRuntimeIntegrity();
+  const runningIds = Array.from(launchOptionRuntime.keys());
+  if (!runningIds.length) {
+    setRunDebugStatusText('No launch option running.');
+    return;
+  }
+
+  const optionNames = getLaunchOptions()
+    .filter((option) => runningIds.includes(option.id))
+    .map((option) => option.name)
+    .filter(Boolean);
+
+  if (optionNames.length === 1) {
+    setRunDebugStatusText(`Running: ${optionNames[0]}`);
+    return;
+  }
+
+  setRunDebugStatusText(`Running: ${optionNames.length} launch options`);
+}
+
+function createRunDebugField(labelText, inputElement, spanTwoColumns = false) {
+  const field = document.createElement('div');
+  field.className = `run-debug-field${spanTwoColumns ? ' span-2' : ''}`;
+
+  const label = document.createElement('label');
+  label.className = 'run-debug-label';
+  label.textContent = labelText;
+
+  field.appendChild(label);
+  field.appendChild(inputElement);
+  return field;
+}
+
+function renderLaunchEditorActions() {
+  runDebugActionList.innerHTML = '';
+
+  if (!launchEditorState) {
+    return;
+  }
+
+  if (!Array.isArray(launchEditorState.actions) || launchEditorState.actions.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'run-debug-action-empty';
+    empty.textContent = 'Add one or more actions to this launch option.';
+    runDebugActionList.appendChild(empty);
+    return;
+  }
+
+  const availableShells = Array.isArray(terminalProfiles) && terminalProfiles.length
+    ? terminalProfiles
+    : [{ id: 'powershell', label: 'PowerShell' }];
+
+  for (let i = 0; i < launchEditorState.actions.length; i += 1) {
+    const action = launchEditorState.actions[i];
+    const card = document.createElement('div');
+    card.className = 'run-debug-action-card';
+
+    const head = document.createElement('div');
+    head.className = 'run-debug-action-head';
+
+    const kind = document.createElement('span');
+    kind.className = 'run-debug-action-kind';
+    const actionLabel = action.type === 'website'
+      ? 'Website'
+      : action.type === 'program'
+        ? 'Program'
+        : 'Command';
+    kind.textContent = `Step ${i + 1}: ${actionLabel}`;
+
+    const headButtons = document.createElement('div');
+    headButtons.className = 'run-debug-option-buttons';
+
+    const moveUp = document.createElement('button');
+    moveUp.type = 'button';
+    moveUp.className = 'run-debug-btn';
+    moveUp.textContent = 'Up';
+    moveUp.disabled = i === 0;
+    moveUp.addEventListener('click', () => {
+      if (i === 0 || !launchEditorState) {
+        return;
+      }
+
+      const updated = [...launchEditorState.actions];
+      [updated[i - 1], updated[i]] = [updated[i], updated[i - 1]];
+      launchEditorState.actions = updated;
+      renderLaunchEditorActions();
+    });
+
+    const moveDown = document.createElement('button');
+    moveDown.type = 'button';
+    moveDown.className = 'run-debug-btn';
+    moveDown.textContent = 'Down';
+    moveDown.disabled = i === launchEditorState.actions.length - 1;
+    moveDown.addEventListener('click', () => {
+      if (!launchEditorState || i >= launchEditorState.actions.length - 1) {
+        return;
+      }
+
+      const updated = [...launchEditorState.actions];
+      [updated[i + 1], updated[i]] = [updated[i], updated[i + 1]];
+      launchEditorState.actions = updated;
+      renderLaunchEditorActions();
+    });
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'run-debug-btn';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => {
+      if (!launchEditorState) {
+        return;
+      }
+
+      launchEditorState.actions = launchEditorState.actions.filter((entry) => entry.id !== action.id);
+      renderLaunchEditorActions();
+    });
+
+    headButtons.appendChild(moveUp);
+    headButtons.appendChild(moveDown);
+    headButtons.appendChild(remove);
+
+    head.appendChild(kind);
+    head.appendChild(headButtons);
+
+    const grid = document.createElement('div');
+    grid.className = 'run-debug-action-grid';
+
+    if (action.type !== 'website') {
+      const shellSelect = document.createElement('select');
+      shellSelect.className = 'run-debug-select';
+      for (const profile of availableShells) {
+        const option = document.createElement('option');
+        option.value = profile.id;
+        option.textContent = profile.label;
+        if (profile.id === action.shell) {
+          option.selected = true;
+        }
+        shellSelect.appendChild(option);
+      }
+      shellSelect.addEventListener('change', () => {
+        action.shell = shellSelect.value;
+      });
+
+      const cwdInput = document.createElement('input');
+      cwdInput.type = 'text';
+      cwdInput.className = 'run-debug-input';
+      cwdInput.placeholder = 'Relative or absolute path (optional)';
+      cwdInput.value = action.cwd || '';
+      cwdInput.addEventListener('input', () => {
+        action.cwd = cwdInput.value;
+      });
+
+      grid.appendChild(createRunDebugField('Shell', shellSelect));
+      grid.appendChild(createRunDebugField('Run In Path', cwdInput));
+    }
+
+    if (action.type === 'command') {
+      const commandInput = document.createElement('input');
+      commandInput.type = 'text';
+      commandInput.className = 'run-debug-input';
+      commandInput.placeholder = 'npm run dev';
+      commandInput.value = action.command || '';
+      commandInput.addEventListener('input', () => {
+        action.command = commandInput.value;
+      });
+      grid.appendChild(createRunDebugField('Command', commandInput, true));
+    } else if (action.type === 'program') {
+      const programInput = document.createElement('input');
+      programInput.type = 'text';
+      programInput.className = 'run-debug-input';
+      programInput.placeholder = 'C:\\Program Files\\App\\app.exe';
+      programInput.value = action.program || '';
+      programInput.addEventListener('input', () => {
+        action.program = programInput.value;
+      });
+
+      const argsInput = document.createElement('input');
+      argsInput.type = 'text';
+      argsInput.className = 'run-debug-input';
+      argsInput.placeholder = '--port 3000';
+      argsInput.value = action.args || '';
+      argsInput.addEventListener('input', () => {
+        action.args = argsInput.value;
+      });
+
+      grid.appendChild(createRunDebugField('Program Path', programInput, true));
+      grid.appendChild(createRunDebugField('Arguments', argsInput, true));
+    } else {
+      const urlInput = document.createElement('input');
+      urlInput.type = 'text';
+      urlInput.className = 'run-debug-input';
+      urlInput.placeholder = 'https://localhost:3000';
+      urlInput.value = action.url || '';
+      urlInput.addEventListener('input', () => {
+        action.url = urlInput.value;
+      });
+
+      grid.appendChild(createRunDebugField('Website URL', urlInput, true));
+    }
+
+    card.appendChild(head);
+    card.appendChild(grid);
+    runDebugActionList.appendChild(card);
+  }
+}
+
+function createLaunchActionTemplate(type) {
+  const actionType = String(type || '').trim().toLowerCase();
+  const base = {
+    id: createLaunchEntityId(),
+    type: actionType
+  };
+
+  if (actionType === 'website') {
+    return {
+      ...base,
+      url: ''
+    };
+  }
+
+  if (actionType === 'program') {
+    return {
+      ...base,
+      shell: getDefaultLaunchShellType(),
+      program: '',
+      args: '',
+      cwd: ''
+    };
+  }
+
+  return {
+    ...base,
+    shell: getDefaultLaunchShellType(),
+    command: '',
+    cwd: ''
+  };
+}
+
+function openLaunchOptionEditor(option = null) {
+  if (!project.rootPath) {
+    return;
+  }
+
+  if (option) {
+    launchEditorState = {
+      optionId: option.id,
+      name: option.name || '',
+      description: option.description || '',
+      actions: Array.isArray(option.actions)
+        ? option.actions.map((action) => ({ ...action }))
+        : []
+    };
+  } else {
+    launchEditorState = {
+      optionId: null,
+      name: '',
+      description: '',
+      actions: [createLaunchActionTemplate('command')]
+    };
+  }
+
+  runDebugOptionName.value = launchEditorState.name;
+  runDebugOptionDescription.value = launchEditorState.description;
+  runDebugEditorState.classList.remove('hidden');
+  renderLaunchEditorActions();
+  requestAnimationFrame(() => {
+    runDebugOptionName.focus();
+  });
+}
+
+function closeLaunchOptionEditor() {
+  launchEditorState = null;
+  runDebugEditorState.classList.add('hidden');
+  runDebugOptionName.value = '';
+  runDebugOptionDescription.value = '';
+  runDebugActionList.innerHTML = '';
+}
+
+function collectLaunchOptionFromEditor() {
+  if (!launchEditorState) {
+    return null;
+  }
+
+  const name = String(runDebugOptionName.value || '').trim();
+  if (!name) {
+    alert('Enter a launch option name.');
+    return null;
+  }
+
+  const normalizedActions = [];
+  for (const action of launchEditorState.actions || []) {
+    if (action.type === 'website') {
+      const url = String(action.url || '').trim();
+      if (!url) {
+        alert('Each website step must include a URL.');
+        return null;
+      }
+
+      normalizedActions.push({
+        id: action.id || createLaunchEntityId(),
+        type: 'website',
+        url
+      });
+      continue;
+    }
+
+    if (action.type === 'program') {
+      const program = String(action.program || '').trim();
+      if (!program) {
+        alert('Each program step must include a program path.');
+        return null;
+      }
+
+      normalizedActions.push({
+        id: action.id || createLaunchEntityId(),
+        type: 'program',
+        shell: String(action.shell || getDefaultLaunchShellType()),
+        program,
+        args: String(action.args || '').trim(),
+        cwd: String(action.cwd || '').trim()
+      });
+      continue;
+    }
+
+    const command = String(action.command || '').trim();
+    if (!command) {
+      alert('Each command step must include a command line.');
+      return null;
+    }
+
+    normalizedActions.push({
+      id: action.id || createLaunchEntityId(),
+      type: 'command',
+      shell: String(action.shell || getDefaultLaunchShellType()),
+      command,
+      cwd: String(action.cwd || '').trim()
+    });
+  }
+
+  if (!normalizedActions.length) {
+    alert('Add at least one action to this launch option.');
+    return null;
+  }
+
+  return {
+    id: launchEditorState.optionId || createLaunchEntityId(),
+    name,
+    description: String(runDebugOptionDescription.value || '').trim(),
+    actions: normalizedActions
+  };
+}
+
+async function saveLaunchOptionFromEditor() {
+  const option = collectLaunchOptionFromEditor();
+  if (!option) {
+    return;
+  }
+
+  const existingOptions = getLaunchOptions();
+  const nextOptions = [...existingOptions];
+  const existingIndex = nextOptions.findIndex((entry) => entry.id === option.id);
+
+  if (existingIndex >= 0) {
+    nextOptions[existingIndex] = option;
+  } else {
+    nextOptions.push(option);
+  }
+
+  const nextConfig = {
+    version: 1,
+    launchOptions: nextOptions
+  };
+
+  const result = await api.saveLaunchConfig({ config: nextConfig });
+  launchConfigState = {
+    ...launchConfigState,
+    state: 'ready',
+    hasQwcodeDir: true,
+    hasLaunchFile: true,
+    config: result && result.config ? result.config : nextConfig
+  };
+
+  closeLaunchOptionEditor();
+  renderRunDebugPanel();
+}
+
+async function deleteLaunchOption(optionId) {
+  const target = getLaunchOptions().find((option) => option.id === optionId);
+  if (!target) {
+    return;
+  }
+
+  const shouldDelete = await showConfirmDialog({
+    title: 'Delete Launch Option',
+    message: `Delete ${target.name}? This cannot be undone.`,
+    confirmLabel: 'Delete',
+    confirmStyle: 'danger'
+  });
+
+  if (!shouldDelete) {
+    return;
+  }
+
+  const nextOptions = getLaunchOptions().filter((option) => option.id !== optionId);
+  const nextConfig = {
+    version: 1,
+    launchOptions: nextOptions
+  };
+
+  const result = await api.saveLaunchConfig({ config: nextConfig });
+  launchConfigState = {
+    ...launchConfigState,
+    config: result && result.config ? result.config : nextConfig
+  };
+
+  if (launchOptionRuntime.has(optionId)) {
+    await stopLaunchOption(optionId);
+  }
+
+  renderRunDebugPanel();
+}
+
+function isAbsoluteLaunchPath(inputPath) {
+  return /^[A-Za-z]:[\\/]/.test(inputPath) || inputPath.startsWith('\\\\') || inputPath.startsWith('/');
+}
+
+function resolveLaunchWorkingDirectory(rawCwd) {
+  const cwd = String(rawCwd || '').trim();
+  if (!cwd) {
+    return project.rootPath;
+  }
+
+  if (isAbsoluteLaunchPath(cwd) || !project.rootPath) {
+    return cwd;
+  }
+
+  const normalized = cwd.replace(/^[/\\]+/, '');
+  const separator = /[\\/]$/.test(project.rootPath) ? '' : '\\';
+  return `${project.rootPath}${separator}${normalized}`;
+}
+
+function escapePowerShellQuoted(value) {
+  return String(value || '').replace(/`/g, '``').replace(/"/g, '`"');
+}
+
+function escapeCmdQuoted(value) {
+  return String(value || '').replace(/"/g, '""');
+}
+
+function escapeShellSingleQuotes(value) {
+  return String(value || '').replace(/'/g, `'"'"'`);
+}
+
+function toWslPath(inputPath) {
+  const raw = String(inputPath || '');
+  if (/^[A-Za-z]:[\\/]/.test(raw)) {
+    const drive = raw.charAt(0).toLowerCase();
+    const tail = raw.slice(2).replace(/\\/g, '/');
+    return `/mnt/${drive}${tail.startsWith('/') ? '' : '/'}${tail}`;
+  }
+
+  return raw.replace(/\\/g, '/');
+}
+
+function buildProgramCommand(action, shellType) {
+  const programPath = String(action.program || '').trim();
+  const args = String(action.args || '').trim();
+  if (!programPath) {
+    return '';
+  }
+
+  if (shellType === 'cmd') {
+    const executable = `\"\"${escapeCmdQuoted(programPath)}\"\"`;
+    return args ? `${executable} ${args}` : executable;
+  }
+
+  if (shellType === 'wsl') {
+    const executable = `'${escapeShellSingleQuotes(programPath)}'`;
+    return args ? `${executable} ${args}` : executable;
+  }
+
+  if (shellType === 'shell') {
+    const executable = `'${escapeShellSingleQuotes(programPath)}'`;
+    return args ? `${executable} ${args}` : executable;
+  }
+
+  const executable = `\"${escapePowerShellQuoted(programPath)}\"`;
+  return args ? `& ${executable} ${args}` : `& ${executable}`;
+}
+
+function buildLaunchTerminalLine(action) {
+  const shellType = String(action.shell || getDefaultLaunchShellType());
+  const baseCommand = action.type === 'program'
+    ? buildProgramCommand(action, shellType)
+    : String(action.command || '').trim();
+  if (!baseCommand) {
+    return '';
+  }
+
+  const cwd = resolveLaunchWorkingDirectory(action.cwd);
+  const isWindows = isWindowsLaunchHost();
+
+  if (!isWindows) {
+    if (!cwd) {
+      return baseCommand;
+    }
+
+    const escapedCwd = escapeShellSingleQuotes(cwd);
+    return `cd '${escapedCwd}' && ${baseCommand}`;
+  }
+
+  if (shellType === 'cmd') {
+    const cwdPrefix = cwd ? `cd /d \"\"${escapeCmdQuoted(cwd)}\"\" && ` : '';
+    return `cmd /d /c \"${cwdPrefix}${baseCommand}\"`;
+  }
+
+  if (shellType === 'wsl') {
+    const cwdPrefix = cwd ? `cd '${escapeShellSingleQuotes(toWslPath(cwd))}' && ` : '';
+    const script = `${cwdPrefix}${baseCommand}`;
+    return `wsl.exe -e sh -lc '${escapeShellSingleQuotes(script)}'`;
+  }
+
+  if (cwd) {
+    return `Set-Location -LiteralPath \"${escapePowerShellQuoted(cwd)}\"; ${baseCommand}`;
+  }
+
+  return baseCommand;
+}
+
+function getLaunchHostShell() {
+  const profiles = Array.isArray(terminalProfiles) ? terminalProfiles : [];
+  if (profiles.some((profile) => profile.id === 'powershell')) {
+    return 'powershell';
+  }
+  if (profiles.length) {
+    return profiles[0].id;
+  }
+  return 'powershell';
+}
+
+async function runLaunchOption(optionId) {
+  const option = getLaunchOptions().find((entry) => entry.id === optionId);
+  if (!option) {
+    return;
+  }
+
+  if (!project.rootPath) {
+    alert('Open a project folder first.');
+    return;
+  }
+
+  if (isLaunchOptionRunning(optionId)) {
+    await stopLaunchOption(optionId);
+    return;
+  }
+
+  const terminalActions = (option.actions || []).filter((action) => action.type === 'command' || action.type === 'program');
+  if (!terminalActions.length) {
+    for (const action of option.actions || []) {
+      if (action.type === 'website') {
+        await api.openExternal(action.url);
+      }
+    }
+    setRunDebugStatusText(`Completed: ${option.name}`);
+    renderRunDebugPanel();
+    return;
+  }
+
+  const startShell = getLaunchHostShell();
+  const initialCwd = resolveLaunchWorkingDirectory(terminalActions[0].cwd) || project.rootPath;
+
+  try {
+    const termId = await createTerminalSession(startShell, initialCwd);
+    launchOptionRuntime.set(optionId, { termId });
+    renderRunDebugPanel();
+
+    api.sendTerminalInput({ termId, data: `echo [Run and Debug] ${option.name}\r` });
+
+    for (const action of option.actions || []) {
+      if (!launchOptionRuntime.has(optionId)) {
+        break;
+      }
+
+      if (action.type === 'website') {
+        await api.openExternal(action.url);
+        continue;
+      }
+
+      const line = buildLaunchTerminalLine(action);
+      if (!line) {
+        continue;
+      }
+
+      api.sendTerminalInput({ termId, data: `${line}\r` });
+    }
+
+    updateRunDebugStatusSummary();
+  } catch (error) {
+    launchOptionRuntime.delete(optionId);
+    renderRunDebugPanel();
+    alert(error.message || String(error));
+  }
+}
+
+async function stopLaunchOption(optionId) {
+  const runtime = launchOptionRuntime.get(optionId);
+  if (!runtime || !runtime.termId) {
+    launchOptionRuntime.delete(optionId);
+    renderRunDebugPanel();
+    return;
+  }
+
+  if (typeof api.interruptTerminal === 'function') {
+    api.interruptTerminal({ termId: runtime.termId });
+  } else {
+    api.killTerminal({ termId: runtime.termId });
+  }
+
+  launchOptionRuntime.delete(optionId);
+  renderRunDebugPanel();
+}
+
+function renderRunDebugOptions() {
+  runDebugOptionsList.innerHTML = '';
+
+  const options = getLaunchOptions();
+  if (!options.length) {
+    const empty = document.createElement('div');
+    empty.className = 'run-debug-empty-text';
+    empty.textContent = 'No launch options yet. Click New Option to create one.';
+    runDebugOptionsList.appendChild(empty);
+    return;
+  }
+
+  for (const option of options) {
+    const running = isLaunchOptionRunning(option.id);
+    const card = document.createElement('div');
+    card.className = 'run-debug-option-card';
+
+    const header = document.createElement('div');
+    header.className = 'run-debug-option-header';
+
+    const infoWrap = document.createElement('div');
+
+    const title = document.createElement('h4');
+    title.className = 'run-debug-option-title';
+    title.textContent = option.name;
+
+    infoWrap.appendChild(title);
+
+    if (option.description) {
+      const description = document.createElement('p');
+      description.className = 'run-debug-option-description';
+      description.textContent = option.description;
+      infoWrap.appendChild(description);
+    }
+
+    const buttons = document.createElement('div');
+    buttons.className = 'run-debug-option-buttons';
+
+    const runBtn = document.createElement('button');
+    runBtn.type = 'button';
+    runBtn.className = `run-debug-btn run-debug-run-btn${running ? ' running' : ''}`;
+
+    const runIcon = document.createElement('span');
+    runIcon.className = 'run-debug-run-icon';
+    runBtn.appendChild(runIcon);
+    runBtn.appendChild(document.createTextNode(running ? 'Stop' : 'Run'));
+    runBtn.addEventListener('click', async () => {
+      if (running) {
+        await stopLaunchOption(option.id);
+      } else {
+        await runLaunchOption(option.id);
+      }
+    });
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'run-debug-btn';
+    editBtn.textContent = 'Edit';
+    editBtn.addEventListener('click', () => {
+      openLaunchOptionEditor(option);
+    });
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'run-debug-btn';
+    deleteBtn.textContent = 'Delete';
+    deleteBtn.addEventListener('click', async () => {
+      await deleteLaunchOption(option.id);
+    });
+
+    buttons.appendChild(runBtn);
+    buttons.appendChild(editBtn);
+    buttons.appendChild(deleteBtn);
+
+    header.appendChild(infoWrap);
+    header.appendChild(buttons);
+
+    const actionPreview = document.createElement('div');
+    actionPreview.className = 'run-debug-actions-preview';
+
+    for (const action of option.actions || []) {
+      const pill = document.createElement('div');
+      pill.className = 'run-debug-action-pill';
+      pill.title = formatLaunchActionPreview(action);
+      pill.textContent = formatLaunchActionPreview(action);
+      actionPreview.appendChild(pill);
+    }
+
+    card.appendChild(header);
+    card.appendChild(actionPreview);
+    runDebugOptionsList.appendChild(card);
+  }
+}
+
+function renderRunDebugPanel() {
+  ensureLaunchRuntimeIntegrity();
+
+  const createTitle = runDebugCreateState.querySelector('.run-debug-empty-title');
+  const createText = runDebugCreateState.querySelector('.run-debug-empty-text');
+
+  if (!project.rootPath || launchConfigState.state === 'no-project') {
+    runDebugAddBtn.classList.add('hidden');
+    runDebugListState.classList.add('hidden');
+    runDebugCreateState.classList.remove('hidden');
+    runDebugCreateBtn.disabled = true;
+    closeLaunchOptionEditor();
+
+    if (createTitle) {
+      createTitle.textContent = 'No folder opened.';
+    }
+    if (createText) {
+      createText.textContent = 'Open a folder to create and run launch options.';
+    }
+
+    return;
+  }
+
+  if (launchConfigState.state !== 'ready') {
+    runDebugAddBtn.classList.add('hidden');
+    runDebugListState.classList.add('hidden');
+    runDebugCreateState.classList.remove('hidden');
+    runDebugCreateBtn.disabled = false;
+    closeLaunchOptionEditor();
+
+    if (createTitle) {
+      createTitle.textContent = 'Launch options are not set up yet.';
+    }
+    if (createText) {
+      createText.textContent = 'Create .qwcode/launch.json to define reusable launch options for commands, programs, and websites.';
+    }
+
+    return;
+  }
+
+  runDebugCreateState.classList.add('hidden');
+  runDebugListState.classList.remove('hidden');
+  runDebugAddBtn.classList.remove('hidden');
+  renderRunDebugOptions();
+  updateRunDebugStatusSummary();
+}
+
+async function refreshRunDebugPanel() {
+  if (!project.rootPath) {
+    launchConfigState = {
+      state: 'no-project',
+      hasQwcodeDir: false,
+      hasLaunchFile: false,
+      hasGitignore: false,
+      launchPath: null,
+      config: getDefaultLaunchConfig()
+    };
+    launchOptionRuntime.clear();
+    renderRunDebugPanel();
+    return;
+  }
+
+  try {
+    const state = await api.getLaunchState();
+    launchConfigState = {
+      state: state && state.state ? state.state : 'missing',
+      hasQwcodeDir: Boolean(state && state.hasQwcodeDir),
+      hasLaunchFile: Boolean(state && state.hasLaunchFile),
+      hasGitignore: Boolean(state && state.hasGitignore),
+      launchPath: state && state.launchPath ? state.launchPath : null,
+      config: state && state.config ? state.config : getDefaultLaunchConfig()
+    };
+  } catch (error) {
+    launchConfigState = {
+      state: 'missing',
+      hasQwcodeDir: false,
+      hasLaunchFile: false,
+      hasGitignore: false,
+      launchPath: null,
+      config: getDefaultLaunchConfig()
+    };
+    setRunDebugStatusText(error.message || 'Unable to load launch options.');
+  }
+
+  renderRunDebugPanel();
+}
+
+async function createLaunchOptionsFile() {
+  if (!project.rootPath) {
+    alert('Open a project folder first.');
+    return;
+  }
+
+  let addToGitignore = false;
+  if (launchConfigState.hasGitignore && !launchConfigState.hasQwcodeDir) {
+    addToGitignore = window.confirm('A .gitignore file exists. Add ".qwcode/" to it while creating launch options?');
+  }
+
+  await api.createLaunchConfig({ addToGitignore });
+  await refreshRunDebugPanel();
 }
 
 function parseHttpHeaders(rawHeaders) {
@@ -3203,6 +4164,7 @@ async function refreshProjectTree() {
   refreshFileSearchIndex();
   syncAiChatControls();
   await refreshSourceControlPanel();
+  await refreshRunDebugPanel();
 }
 
 async function openFile(filePath, options = {}) {
@@ -3497,6 +4459,7 @@ async function applyOpenedProject(opened) {
   refreshFileSearchIndex();
   syncAiChatControls();
   await refreshSourceControlPanel();
+  await refreshRunDebugPanel();
 
   killAllTerminalSessions();
   await createTerminalSession('powershell');
@@ -3544,6 +4507,7 @@ async function closeFolder() {
   renderTree();
   refreshFileSearchIndex();
   applyScmState('no-project');
+  await refreshRunDebugPanel();
   clearAiConversationHistory();
   updateEditorTitle();
   renderTabs();
@@ -3556,12 +4520,81 @@ sidebarTabExplorer.addEventListener('click', () => {
   setSidebarPanel('explorer');
 });
 
+sidebarTabRunDebug.addEventListener('click', () => {
+  setSidebarPanel('run-debug');
+});
+
 sidebarTabSourceControl.addEventListener('click', () => {
   setSidebarPanel('source-control');
 });
 
 sidebarTabHttp.addEventListener('click', () => {
   setSidebarPanel('http');
+});
+
+runDebugCreateBtn.addEventListener('click', async () => {
+  try {
+    await createLaunchOptionsFile();
+    if (launchConfigState.state === 'ready') {
+      openLaunchOptionEditor();
+    }
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+runDebugAddBtn.addEventListener('click', () => {
+  openLaunchOptionEditor();
+});
+
+runDebugCancelOptionBtn.addEventListener('click', () => {
+  closeLaunchOptionEditor();
+});
+
+runDebugSaveOptionBtn.addEventListener('click', async () => {
+  try {
+    await saveLaunchOptionFromEditor();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+runDebugAddCommandBtn.addEventListener('click', () => {
+  if (!launchEditorState) {
+    return;
+  }
+  launchEditorState.actions.push(createLaunchActionTemplate('command'));
+  renderLaunchEditorActions();
+});
+
+runDebugAddProgramBtn.addEventListener('click', () => {
+  if (!launchEditorState) {
+    return;
+  }
+  launchEditorState.actions.push(createLaunchActionTemplate('program'));
+  renderLaunchEditorActions();
+});
+
+runDebugAddWebsiteBtn.addEventListener('click', () => {
+  if (!launchEditorState) {
+    return;
+  }
+  launchEditorState.actions.push(createLaunchActionTemplate('website'));
+  renderLaunchEditorActions();
+});
+
+runDebugOptionName.addEventListener('input', () => {
+  if (!launchEditorState) {
+    return;
+  }
+  launchEditorState.name = runDebugOptionName.value;
+});
+
+runDebugOptionDescription.addEventListener('input', () => {
+  if (!launchEditorState) {
+    return;
+  }
+  launchEditorState.description = runDebugOptionDescription.value;
 });
 
 document.addEventListener('pointerdown', (event) => {

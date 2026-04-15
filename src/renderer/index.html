@@ -18,6 +18,9 @@
           <button id="sidebarTabExplorer" class="explorer-side-tab active" type="button" title="Explorer">
             <span class="explorer-side-icon explorer-side-icon-files" aria-hidden="true"></span>
           </button>
+          <button id="sidebarTabRunDebug" class="explorer-side-tab" type="button" title="Run and Debug" aria-label="Run and Debug">
+            <span class="explorer-side-icon explorer-side-icon-run-debug" aria-hidden="true"></span>
+          </button>
           <button id="sidebarTabSourceControl" class="explorer-side-tab" type="button" title="Version Control" aria-label="Version Control">
             <span class="explorer-side-icon explorer-side-icon-branch" aria-hidden="true"></span>
             <span id="scmTabBadge" class="scm-tab-badge hidden" aria-hidden="true"></span>
@@ -33,6 +36,53 @@
             <span id="projectInfo" class="project-info">No folder opened</span>
           </div>
           <div id="treeRoot" class="tree"></div>
+        </div>
+
+        <div id="runDebugPanelView" class="explorer-panel-view">
+          <div class="panel-title panel-title-split">
+            <span>Run and Debug</span>
+            <button id="runDebugAddBtn" class="run-debug-btn hidden" type="button">New Option</button>
+          </div>
+          <div class="run-debug-panel-body">
+            <div id="runDebugCreateState" class="run-debug-empty-state">
+              <p class="run-debug-empty-title">Launch options are not set up yet.</p>
+              <p class="run-debug-empty-text">Create .qwcode/launch.json to define reusable launch options for commands, programs, and websites.</p>
+              <button id="runDebugCreateBtn" class="run-debug-btn run-debug-btn-primary" type="button">Create Launch Options</button>
+            </div>
+
+            <div id="runDebugListState" class="run-debug-list-state hidden">
+              <div id="runDebugStatus" class="run-debug-status">No launch option running.</div>
+              <div id="runDebugOptionsList" class="run-debug-options-list"></div>
+            </div>
+
+            <div id="runDebugEditorState" class="run-debug-editor hidden">
+              <div class="run-debug-field">
+                <label class="run-debug-label" for="runDebugOptionName">Name</label>
+                <input id="runDebugOptionName" class="run-debug-input" type="text" placeholder="API and App" />
+              </div>
+
+              <div class="run-debug-field">
+                <label class="run-debug-label" for="runDebugOptionDescription">Description</label>
+                <input id="runDebugOptionDescription" class="run-debug-input" type="text" placeholder="Optional description" />
+              </div>
+
+              <div class="run-debug-editor-actions-header">
+                <span class="run-debug-label">Actions</span>
+                <div class="run-debug-action-add-row">
+                  <button id="runDebugAddCommandBtn" class="run-debug-btn" type="button">Add Command</button>
+                  <button id="runDebugAddProgramBtn" class="run-debug-btn" type="button">Add Program</button>
+                  <button id="runDebugAddWebsiteBtn" class="run-debug-btn" type="button">Add Website</button>
+                </div>
+              </div>
+
+              <div id="runDebugActionList" class="run-debug-action-list"></div>
+
+              <div class="run-debug-editor-footer">
+                <button id="runDebugSaveOptionBtn" class="run-debug-btn run-debug-btn-primary" type="button">Save Launch Option</button>
+                <button id="runDebugCancelOptionBtn" class="run-debug-btn" type="button">Cancel</button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div id="sourceControlPanelView" class="explorer-panel-view">

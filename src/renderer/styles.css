@@ -611,6 +611,11 @@ body {
   -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5a3 3 0 1 1 2 2.83V10a4 4 0 0 0 4 4h2.17a3 3 0 1 1 0 2H14a6 6 0 0 1-6-6V7.83A3 3 0 0 1 8 5zm0 14a3 3 0 1 1 2 2.83V12.5h2V10h-2V7.83A3 3 0 1 0 6 5a3 3 0 0 0 2 2.83v11.34A3 3 0 1 0 10 19z'/%3E%3C/svg%3E");
 }
 
+.explorer-side-icon-run-debug {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M5.5 3.5v17L16.5 12z'/%3E%3Cpath d='M17.2 13.8a2.3 2.3 0 0 0-2.3 2.3v.5h-.7a.7.7 0 1 0 0 1.4h.7v.7a.7.7 0 1 0 1.4 0V18h1.9v.7a.7.7 0 1 0 1.4 0V18h.7a.7.7 0 0 0 0-1.4h-.7v-.5a2.3 2.3 0 0 0-2.3-2.3zm0 1.4c.5 0 .9.4.9.9v.5h-1.8v-.5c0-.5.4-.9.9-.9zM16.2 12.5a.7.7 0 0 1-.6-1l.6-1.1a.7.7 0 1 1 1.2.7l-.6 1.1a.7.7 0 0 1-.6.3zm2 0a.7.7 0 0 1-.6-.3l-.6-1.1a.7.7 0 1 1 1.2-.7l.6 1.1a.7.7 0 0 1-.6 1z'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M5.5 3.5v17L16.5 12z'/%3E%3Cpath d='M17.2 13.8a2.3 2.3 0 0 0-2.3 2.3v.5h-.7a.7.7 0 1 0 0 1.4h.7v.7a.7.7 0 1 0 1.4 0V18h1.9v.7a.7.7 0 1 0 1.4 0V18h.7a.7.7 0 0 0 0-1.4h-.7v-.5a2.3 2.3 0 0 0-2.3-2.3zm0 1.4c.5 0 .9.4.9.9v.5h-1.8v-.5c0-.5.4-.9.9-.9zM16.2 12.5a.7.7 0 0 1-.6-1l.6-1.1a.7.7 0 1 1 1.2.7l-.6 1.1a.7.7 0 0 1-.6.3zm2 0a.7.7 0 0 1-.6-.3l-.6-1.1a.7.7 0 1 1 1.2-.7l.6 1.1a.7.7 0 0 1-.6 1z'/%3E%3C/svg%3E");
+}
+
 .explorer-side-icon-http {
   mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 18a4 4 0 0 1-.7-7.94A6.5 6.5 0 0 1 18 8.5a4.5 4.5 0 0 1 0 9H6z'/%3E%3C/svg%3E");
   -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 18a4 4 0 0 1-.7-7.94A6.5 6.5 0 0 1 18 8.5a4.5 4.5 0 0 1 0 9H6z'/%3E%3C/svg%3E");
@@ -1271,6 +1276,281 @@ body {
   line-height: 1.5;
 }
 
+.run-debug-panel-body {
+  height: calc(100% - 38px);
+  overflow: auto;
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.run-debug-empty-state,
+.run-debug-list-state,
+.run-debug-editor {
+  border: 1px solid #2f4561;
+  background: #102137;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.run-debug-empty-state {
+  display: grid;
+  gap: 8px;
+}
+
+.run-debug-empty-title {
+  margin: 0;
+  color: #d9e9fa;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.run-debug-empty-text {
+  margin: 0;
+  color: #98b2ce;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.run-debug-btn {
+  border: 1px solid #3d5d83;
+  border-radius: 6px;
+  background: #17304b;
+  color: #eaf3ff;
+  min-height: 30px;
+  font-size: 12px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.run-debug-btn:hover {
+  filter: brightness(1.08);
+}
+
+.run-debug-btn:disabled {
+  opacity: 0.66;
+  cursor: not-allowed;
+}
+
+.run-debug-btn-primary {
+  border-color: #766ff0;
+  background: #5a52c4;
+  color: #ffffff;
+}
+
+.run-debug-list-state {
+  display: grid;
+  gap: 8px;
+}
+
+.run-debug-status {
+  border: 1px solid #334f70;
+  background: #0f1d2d;
+  border-radius: 6px;
+  padding: 7px 8px;
+  color: #cfe0f2;
+  font-size: 12px;
+}
+
+.run-debug-options-list {
+  display: grid;
+  gap: 8px;
+}
+
+.run-debug-option-card {
+  border: 1px solid #2f4561;
+  border-radius: 8px;
+  background: #0f1d2d;
+  padding: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.run-debug-option-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.run-debug-option-title {
+  margin: 0;
+  color: #e6f1fd;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.run-debug-option-description {
+  margin: 2px 0 0;
+  color: #9fb8d2;
+  font-size: 11px;
+}
+
+.run-debug-option-buttons {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.run-debug-run-btn {
+  min-width: 66px;
+}
+
+.run-debug-run-btn.running {
+  border-color: #d96f63;
+  background: #8f3e36;
+}
+
+.run-debug-run-icon {
+  width: 10px;
+  height: 10px;
+  display: inline-block;
+  margin-right: 6px;
+  vertical-align: -1px;
+  background: currentColor;
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2 1.5v9l8-4.5z'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2 1.5v9l8-4.5z'/%3E%3C/svg%3E");
+}
+
+.run-debug-run-btn.running .run-debug-run-icon {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2 2h8v8H2z'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2 2h8v8H2z'/%3E%3C/svg%3E");
+}
+
+.run-debug-actions-preview {
+  display: grid;
+  gap: 6px;
+}
+
+.run-debug-action-pill {
+  border: 1px solid #35557a;
+  background: #13263b;
+  border-radius: 999px;
+  color: #9ec0e3;
+  font-size: 11px;
+  padding: 3px 8px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.run-debug-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.run-debug-field {
+  display: grid;
+  gap: 6px;
+}
+
+.run-debug-label {
+  color: #98b2ce;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.run-debug-input,
+.run-debug-select {
+  width: 100%;
+  border: 1px solid #3a5f86;
+  border-radius: 6px;
+  background: #0f2032;
+  color: #eaf3ff;
+  padding: 6px 8px;
+  font-size: 12px;
+  outline: none;
+}
+
+.run-debug-input:focus,
+.run-debug-select:focus {
+  border-color: #45d483;
+  box-shadow: 0 0 0 1px rgba(69, 212, 131, 0.28);
+}
+
+.run-debug-editor-actions-header {
+  display: grid;
+  gap: 6px;
+}
+
+.run-debug-action-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.run-debug-action-list {
+  display: grid;
+  gap: 8px;
+}
+
+.run-debug-action-empty {
+  border: 1px dashed #3a5f86;
+  border-radius: 6px;
+  padding: 8px;
+  color: #9fb8d2;
+  font-size: 12px;
+}
+
+.run-debug-action-card {
+  border: 1px solid #2f4561;
+  background: #0f1d2d;
+  border-radius: 8px;
+  padding: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.run-debug-action-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.run-debug-action-kind {
+  color: #d9e9fa;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.run-debug-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.run-debug-action-grid .run-debug-field.span-2 {
+  grid-column: span 2;
+}
+
+.run-debug-editor-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 880px) {
+  .run-debug-action-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .run-debug-action-grid .run-debug-field.span-2 {
+    grid-column: span 1;
+  }
+}
+
 .scm-graph-row {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -1341,6 +1621,7 @@ body {
 .tree,
 .scm-panel-body,
 .scm-graph,
+.run-debug-panel-body,
 .ai-messages,
 .terminal-container .xterm-viewport {
   scrollbar-width: thin;
@@ -1350,6 +1631,7 @@ body {
 .tree::-webkit-scrollbar,
 .scm-panel-body::-webkit-scrollbar,
 .scm-graph::-webkit-scrollbar,
+.run-debug-panel-body::-webkit-scrollbar,
 .ai-messages::-webkit-scrollbar,
 .terminal-container .xterm-viewport::-webkit-scrollbar {
   width: 12px;
@@ -1359,6 +1641,7 @@ body {
 .tree::-webkit-scrollbar-track,
 .scm-panel-body::-webkit-scrollbar-track,
 .scm-graph::-webkit-scrollbar-track,
+.run-debug-panel-body::-webkit-scrollbar-track,
 .ai-messages::-webkit-scrollbar-track,
 .terminal-container .xterm-viewport::-webkit-scrollbar-track {
   background: #0f2032;
@@ -1367,6 +1650,7 @@ body {
 .tree::-webkit-scrollbar-thumb,
 .scm-panel-body::-webkit-scrollbar-thumb,
 .scm-graph::-webkit-scrollbar-thumb,
+.run-debug-panel-body::-webkit-scrollbar-thumb,
 .ai-messages::-webkit-scrollbar-thumb,
 .terminal-container .xterm-viewport::-webkit-scrollbar-thumb {
   background: #3a5f86;
@@ -1377,6 +1661,7 @@ body {
 .tree::-webkit-scrollbar-thumb:hover,
 .scm-panel-body::-webkit-scrollbar-thumb:hover,
 .scm-graph::-webkit-scrollbar-thumb:hover,
+.run-debug-panel-body::-webkit-scrollbar-thumb:hover,
 .ai-messages::-webkit-scrollbar-thumb:hover,
 .terminal-container .xterm-viewport::-webkit-scrollbar-thumb:hover {
   background: #45d483;
@@ -2041,6 +2326,13 @@ body.light-theme .scm-graph,
 body.light-theme .http-block,
 body.light-theme .http-result-status,
 body.light-theme .http-result-output,
+body.light-theme .run-debug-empty-state,
+body.light-theme .run-debug-list-state,
+body.light-theme .run-debug-editor,
+body.light-theme .run-debug-option-card,
+body.light-theme .run-debug-action-card,
+body.light-theme .run-debug-status,
+body.light-theme .run-debug-action-pill,
 body.light-theme .file-search-results,
 body.light-theme .file-search-input,
 body.light-theme .tree-inline-input,
@@ -2049,7 +2341,9 @@ body.light-theme .scm-input,
 body.light-theme .scm-select,
 body.light-theme .http-select,
 body.light-theme .http-input,
-body.light-theme .http-textarea {
+body.light-theme .http-textarea,
+body.light-theme .run-debug-input,
+body.light-theme .run-debug-select {
   background: #ffffff;
   border-color: #cfd8ec;
   color: #1f2a3a;
@@ -2122,11 +2416,14 @@ body.light-theme .scm-label,
 body.light-theme .ai-key-text,
 body.light-theme .file-search-result-path,
 body.light-theme .scm-empty,
+body.light-theme .run-debug-label,
+body.light-theme .run-debug-empty-text,
 body.light-theme .status-text {
   color: #53627c;
 }
 
-body.light-theme .http-label {
+body.light-theme .http-label,
+body.light-theme .run-debug-label {
   color: #5a6c86;
 }
 
@@ -2148,6 +2445,7 @@ body.light-theme .help-license {
 body.light-theme .explorer-side-tab.active,
 body.light-theme .tab.active,
 body.light-theme .scm-btn-primary,
+body.light-theme .run-debug-btn-primary,
 body.light-theme .confirm-btn.primary,
 body.light-theme .scm-graph-hash,
 body.light-theme .tree-node.selected,
@@ -2167,7 +2465,19 @@ body.light-theme .scm-btn {
   color: #ffffff;
 }
 
+body.light-theme .run-debug-btn {
+  background: #4b5f82;
+  border-color: #445575;
+  color: #ffffff;
+}
+
 body.light-theme .scm-btn:hover {
+  background: #405272;
+  color: #ffffff;
+  filter: none;
+}
+
+body.light-theme .run-debug-btn:hover {
   background: #405272;
   color: #ffffff;
   filter: none;
@@ -2191,6 +2501,22 @@ body.light-theme .scm-btn-primary {
 body.light-theme .scm-btn-primary:hover {
   background: #5f57ef;
   color: #ffffff;
+}
+
+body.light-theme .run-debug-btn-primary:hover {
+  background: #5f57ef;
+  color: #ffffff;
+}
+
+body.light-theme .run-debug-run-btn.running {
+  background: #c54a3d;
+  border-color: #b53f33;
+}
+
+body.light-theme .run-debug-empty-title,
+body.light-theme .run-debug-option-title,
+body.light-theme .run-debug-action-kind {
+  color: #223047;
 }
 
 body.light-theme .scm-sync-menu-btn {
@@ -2329,6 +2655,7 @@ body.light-theme .xterm.focus .xterm-selection div {
 body.light-theme .tree,
 body.light-theme .scm-panel-body,
 body.light-theme .scm-graph,
+body.light-theme .run-debug-panel-body,
 body.light-theme .ai-messages,
 body.light-theme .terminal-container .xterm-viewport {
   scrollbar-color: #8b83ff #edf1ff;
@@ -2337,6 +2664,7 @@ body.light-theme .terminal-container .xterm-viewport {
 body.light-theme .tree::-webkit-scrollbar-track,
 body.light-theme .scm-panel-body::-webkit-scrollbar-track,
 body.light-theme .scm-graph::-webkit-scrollbar-track,
+body.light-theme .run-debug-panel-body::-webkit-scrollbar-track,
 body.light-theme .ai-messages::-webkit-scrollbar-track,
 body.light-theme .terminal-container .xterm-viewport::-webkit-scrollbar-track {
   background: #edf1ff;
@@ -2345,6 +2673,7 @@ body.light-theme .terminal-container .xterm-viewport::-webkit-scrollbar-track {
 body.light-theme .tree::-webkit-scrollbar-thumb,
 body.light-theme .scm-panel-body::-webkit-scrollbar-thumb,
 body.light-theme .scm-graph::-webkit-scrollbar-thumb,
+body.light-theme .run-debug-panel-body::-webkit-scrollbar-thumb,
 body.light-theme .ai-messages::-webkit-scrollbar-thumb,
 body.light-theme .terminal-container .xterm-viewport::-webkit-scrollbar-thumb {
   background: #8b83ff;
@@ -2354,6 +2683,7 @@ body.light-theme .terminal-container .xterm-viewport::-webkit-scrollbar-thumb {
 body.light-theme .tree::-webkit-scrollbar-thumb:hover,
 body.light-theme .scm-panel-body::-webkit-scrollbar-thumb:hover,
 body.light-theme .scm-graph::-webkit-scrollbar-thumb:hover,
+body.light-theme .run-debug-panel-body::-webkit-scrollbar-thumb:hover,
 body.light-theme .ai-messages::-webkit-scrollbar-thumb:hover,
 body.light-theme .terminal-container .xterm-viewport::-webkit-scrollbar-thumb:hover {
   background: #6f67ff;
