@@ -142,6 +142,7 @@ let fileSearchQuery = '';
 let fileSearchDocumentClickBound = false;
 let fileSearchIndex = [];
 let activeSidebarPanel = 'explorer';
+let externalProjectRefreshTimer = null;
 let launchConfigExists = false;
 let launchConfigState = { version: 1, launchOptions: [] };
 let launchConfigLoadError = '';
@@ -528,6 +529,98 @@ function getAiTools() {
         properties: { command: { type: 'string' } },
         required: ['command']
       }
+    },
+    {
+      type: 'function',
+      name: 'open_website',
+      description: 'Open a website URL in the default browser.',
+      parameters: {
+        type: 'object',
+        properties: { url: { type: 'string' } },
+        required: ['url']
+      }
+    },
+    {
+      type: 'function',
+      name: 'get_launch_options',
+      description: 'Get launch options from .qwcode/launch.json. Returns default empty config when file does not exist.',
+      parameters: {
+        type: 'object',
+        properties: {}
+      }
+    },
+    {
+      type: 'function',
+      name: 'create_launch_option',
+      description: 'Create a new launch option in .qwcode/launch.json. Automatically creates .qwcode/launch.json when missing.',
+      parameters: {
+        type: 'object',
+        properties: {
+          option: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              description: { type: 'string' },
+              default: { type: 'boolean' },
+              actions: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: { type: 'string', enum: ['command', 'program', 'url'] },
+                    shell: { type: 'string', enum: ['powershell', 'cmd', 'wsl', 'shell'] },
+                    command: { type: 'string' },
+                    program: { type: 'string' },
+                    args: { type: 'string' },
+                    cwd: { type: 'string' },
+                    url: { type: 'string' },
+                    skipCompletion: { type: 'boolean' }
+                  }
+                }
+              }
+            },
+            required: ['name', 'actions']
+          }
+        },
+        required: ['option']
+      }
+    },
+    {
+      type: 'function',
+      name: 'update_launch_option',
+      description: 'Modify an existing launch option by id. Automatically creates .qwcode/launch.json when missing.',
+      parameters: {
+        type: 'object',
+        properties: {
+          optionId: { type: 'string' },
+          option: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              description: { type: 'string' },
+              default: { type: 'boolean' },
+              actions: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: { type: 'string', enum: ['command', 'program', 'url'] },
+                    shell: { type: 'string', enum: ['powershell', 'cmd', 'wsl', 'shell'] },
+                    command: { type: 'string' },
+                    program: { type: 'string' },
+                    args: { type: 'string' },
+                    cwd: { type: 'string' },
+                    url: { type: 'string' },
+                    skipCompletion: { type: 'boolean' }
+                  }
+                }
+              }
+            },
+            required: ['name', 'actions']
+          }
+        },
+        required: ['optionId', 'option']
+      }
     }
   ];
 }
@@ -603,6 +696,87 @@ async function runAiTool(name, args, signal) {
     const exitCode = result && typeof result.exitCode !== 'undefined' ? result.exitCode : 'unknown';
     addAiActivity(`Command finished (exit ${exitCode}): ${command}`);
     return JSON.stringify(result);
+  }
+
+  if (name === 'open_website') {
+    const url = String(args.url || '').trim();
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error('URL must start with http:// or https://');
+    }
+
+    addAiActivity(`Opening website: ${url}`);
+    await api.openExternal(url);
+    return 'ok';
+  }
+
+  if (name === 'get_launch_options') {
+    addAiActivity('Loading launch options...');
+    await loadLaunchConfigFromDisk();
+    return JSON.stringify({
+      exists: launchConfigExists,
+      config: launchConfigState
+    });
+  }
+
+  if (name === 'create_launch_option') {
+    addAiActivity('Creating launch option...');
+    await ensureLaunchConfigReadyForAiTools();
+
+    const sourceOption = args && typeof args.option === 'object' ? args.option : null;
+    if (!sourceOption) {
+      throw new Error('option is required.');
+    }
+
+    const nextOption = normalizeLaunchOption(sourceOption, launchConfigState.launchOptions.length);
+    validateAiLaunchOption(nextOption, launchConfigState.launchOptions.length + 1);
+    launchConfigState.launchOptions.push(nextOption);
+
+    if (nextOption.default) {
+      for (const option of launchConfigState.launchOptions) {
+        if (option.id !== nextOption.id) {
+          option.default = false;
+        }
+      }
+    }
+
+    await saveLaunchConfigToDisk();
+    renderRunDebugPanel();
+    return JSON.stringify(nextOption);
+  }
+
+  if (name === 'update_launch_option') {
+    addAiActivity('Updating launch option...');
+    await ensureLaunchConfigReadyForAiTools();
+
+    const optionId = String(args.optionId || '').trim();
+    const sourceOption = args && typeof args.option === 'object' ? args.option : null;
+    if (!optionId) {
+      throw new Error('optionId is required.');
+    }
+    if (!sourceOption) {
+      throw new Error('option is required.');
+    }
+
+    const index = launchConfigState.launchOptions.findIndex((entry) => entry.id === optionId);
+    if (index < 0) {
+      throw new Error(`Launch option not found: ${optionId}`);
+    }
+
+    const nextOption = normalizeLaunchOption({ ...sourceOption, id: optionId }, index);
+    validateAiLaunchOption(nextOption, index + 1);
+    launchConfigState.launchOptions[index] = nextOption;
+
+    if (nextOption.default) {
+      for (const option of launchConfigState.launchOptions) {
+        if (option.id !== nextOption.id) {
+          option.default = false;
+        }
+      }
+    }
+
+    await saveLaunchConfigToDisk();
+    renderRunDebugPanel();
+    return JSON.stringify(nextOption);
   }
 
   throw new Error(`Unknown tool: ${name}`);
@@ -2490,6 +2664,75 @@ async function loadLaunchConfigFromDisk() {
   }
 
   renderRunDebugPanel();
+}
+
+function validateAiLaunchOption(option, indexLabel = 1) {
+  const optionName = String(option && option.name ? option.name : '').trim();
+  if (!optionName) {
+    throw new Error('Launch option name is required.');
+  }
+
+  const actions = Array.isArray(option && option.actions) ? option.actions : [];
+  if (!actions.length) {
+    throw new Error(`Launch option ${indexLabel} must include at least one action.`);
+  }
+
+  for (let i = 0; i < actions.length; i += 1) {
+    const action = actions[i] || {};
+    const actionLabel = i + 1;
+
+    if (action.type === 'url') {
+      const url = String(action.url || '').trim();
+      if (!url || !/^https?:\/\//i.test(url)) {
+        throw new Error(`Launch option ${indexLabel}, action ${actionLabel} must use a valid http(s) URL.`);
+      }
+      continue;
+    }
+
+    if (action.type === 'program') {
+      if (!String(action.program || '').trim()) {
+        throw new Error(`Launch option ${indexLabel}, action ${actionLabel} is missing a program path.`);
+      }
+      continue;
+    }
+
+    if (!String(action.command || '').trim()) {
+      throw new Error(`Launch option ${indexLabel}, action ${actionLabel} is missing a command.`);
+    }
+  }
+}
+
+async function ensureLaunchConfigReadyForAiTools() {
+  if (!project.rootPath) {
+    throw new Error('Open a project folder first.');
+  }
+
+  const launchConfigPath = getLaunchConfigPath();
+  if (!launchConfigPath) {
+    throw new Error('Could not resolve launch configuration path.');
+  }
+
+  const payload = await api.readFile({ filePath: launchConfigPath, allowMissing: true });
+  if (payload) {
+    try {
+      const raw = typeof payload === 'string' ? payload : payload.content;
+      launchConfigState = normalizeLaunchConfig(JSON.parse(raw));
+      launchConfigExists = true;
+      launchConfigLoadError = '';
+      return;
+    } catch {
+      throw new Error('launch.json exists but is invalid JSON. Fix it before AI modifies launch options.');
+    }
+  }
+
+  const launchFolderPath = getLaunchStorageFolderPath();
+  if (!launchFolderPath) {
+    throw new Error('Could not resolve launch folder path.');
+  }
+
+  await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+  launchConfigState = createDefaultLaunchConfig();
+  await saveLaunchConfigToDisk();
 }
 
 async function saveLaunchEditorDraft() {
@@ -6293,6 +6536,27 @@ if (api.onMenuAction) {
     } catch (error) {
       alert(error.message);
     }
+  });
+}
+
+if (api.onProjectChanged) {
+  api.onProjectChanged(() => {
+    if (!project.rootPath) {
+      return;
+    }
+
+    if (externalProjectRefreshTimer) {
+      clearTimeout(externalProjectRefreshTimer);
+    }
+
+    externalProjectRefreshTimer = setTimeout(async () => {
+      externalProjectRefreshTimer = null;
+      try {
+        await refreshProjectTree();
+      } catch {
+        // Keep UI responsive if a transient refresh error occurs.
+      }
+    }, 300);
   });
 }
 

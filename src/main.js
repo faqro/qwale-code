@@ -12,6 +12,7 @@ let mainWindow = null;
 const terminals = new Map();
 let recentProjects = [];
 const windowProjectState = new Map();
+const projectWatchers = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
 
 function killTerminalSession(termId) {
@@ -40,6 +41,89 @@ function killTerminalsForWebContents(webContentsId) {
 function killAllTerminals() {
   for (const termId of terminals.keys()) {
     killTerminalSession(termId);
+  }
+}
+
+function stopProjectWatcherForWebContents(webContentsId) {
+  const watcherEntry = projectWatchers.get(webContentsId);
+  if (!watcherEntry) {
+    return;
+  }
+
+  if (watcherEntry.timer) {
+    clearTimeout(watcherEntry.timer);
+  }
+
+  try {
+    watcherEntry.watcher.close();
+  } catch {
+    // Ignore watcher close errors during teardown.
+  }
+
+  projectWatchers.delete(webContentsId);
+}
+
+function stopAllProjectWatchers() {
+  for (const webContentsId of projectWatchers.keys()) {
+    stopProjectWatcherForWebContents(webContentsId);
+  }
+}
+
+function notifyProjectChanged(webContentsId, expectedProjectPath) {
+  const currentProjectPath = windowProjectState.get(webContentsId);
+  if (!currentProjectPath || path.resolve(currentProjectPath) !== path.resolve(expectedProjectPath)) {
+    return;
+  }
+
+  const targetWindow = BrowserWindow
+    .getAllWindows()
+    .find((win) => !win.isDestroyed() && win.webContents.id === webContentsId);
+  if (!targetWindow || targetWindow.isDestroyed()) {
+    return;
+  }
+
+  targetWindow.webContents.send('project:changed', {
+    rootPath: currentProjectPath
+  });
+}
+
+function scheduleProjectChangedNotification(webContentsId, expectedProjectPath) {
+  const watcherEntry = projectWatchers.get(webContentsId);
+  if (!watcherEntry) {
+    return;
+  }
+
+  if (watcherEntry.timer) {
+    clearTimeout(watcherEntry.timer);
+  }
+
+  watcherEntry.timer = setTimeout(() => {
+    watcherEntry.timer = null;
+    notifyProjectChanged(webContentsId, expectedProjectPath);
+  }, 250);
+}
+
+function startProjectWatcherForWebContents(webContentsId, projectPath) {
+  stopProjectWatcherForWebContents(webContentsId);
+
+  if (!projectPath) {
+    return;
+  }
+
+  const normalizedProjectPath = path.resolve(projectPath);
+
+  try {
+    const watcher = fs.watch(normalizedProjectPath, { recursive: true }, () => {
+      scheduleProjectChangedNotification(webContentsId, normalizedProjectPath);
+    });
+
+    projectWatchers.set(webContentsId, {
+      watcher,
+      rootPath: normalizedProjectPath,
+      timer: null
+    });
+  } catch {
+    // If watcher setup fails, project refresh remains manual.
   }
 }
 
@@ -329,6 +413,7 @@ function createWindow(initialProjectPath = null) {
   }
 
   windowProjectState.set(createdWebContentsId, initialProjectPath ? path.resolve(initialProjectPath) : null);
+  startProjectWatcherForWebContents(createdWebContentsId, windowProjectState.get(createdWebContentsId));
 
   createdWindow.loadFile(path.join(__dirname, 'renderer/index.html'));
   createdWindow.setMenuBarVisibility(!isWindows);
@@ -339,6 +424,7 @@ function createWindow(initialProjectPath = null) {
     }
 
     windowProjectState.delete(createdWebContentsId);
+    stopProjectWatcherForWebContents(createdWebContentsId);
     killTerminalsForWebContents(createdWebContentsId);
   });
 
@@ -533,6 +619,7 @@ ipcMain.handle('project:open', async (event) => {
   }
 
   windowProjectState.set(event.sender.id, selectedProjectPath);
+  startProjectWatcherForWebContents(event.sender.id, selectedProjectPath);
   const matcher = await createGitignoreMatcher(selectedProjectPath);
   const [tree, searchableFiles] = await Promise.all([
     buildTree(selectedProjectPath, selectedProjectPath, matcher, false),
@@ -569,6 +656,7 @@ ipcMain.handle('project:openPath', async (event, folderPath) => {
   }
 
   windowProjectState.set(event.sender.id, resolved);
+  startProjectWatcherForWebContents(event.sender.id, resolved);
   const matcher = await createGitignoreMatcher(resolved);
   const [tree, searchableFiles] = await Promise.all([
     buildTree(resolved, resolved, matcher, false),
@@ -590,6 +678,7 @@ ipcMain.handle('project:getRecent', async () => {
 
 ipcMain.handle('project:close', async (event) => {
   windowProjectState.set(event.sender.id, null);
+  stopProjectWatcherForWebContents(event.sender.id);
   return { ok: true };
 });
 
@@ -1408,10 +1497,12 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', () => {
+  stopAllProjectWatchers();
   killAllTerminals();
 });
 
 app.on('window-all-closed', () => {
+  stopAllProjectWatchers();
   killAllTerminals();
   if (process.platform !== 'darwin') {
     app.quit();

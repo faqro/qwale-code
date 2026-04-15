@@ -52,5 +52,10 @@ contextBridge.exposeInMainWorld('qwaleApi', {
     const listener = (_, payload) => callback(payload);
     ipcRenderer.on('menu:action', listener);
     return () => ipcRenderer.removeListener('menu:action', listener);
+  },
+  onProjectChanged: (callback) => {
+    const listener = (_, payload) => callback(payload);
+    ipcRenderer.on('project:changed', listener);
+    return () => ipcRenderer.removeListener('project:changed', listener);
   }
 });
