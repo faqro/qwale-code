@@ -32,6 +32,9 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   setAppTheme: (mode) => ipcRenderer.invoke('app:setTheme', mode),
   getAppInfo: () => ipcRenderer.invoke('app:getInfo'),
   openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
+  startCollabServer: (payload) => ipcRenderer.invoke('collab:startServer', payload),
+  stopCollabServer: () => ipcRenderer.invoke('collab:stopServer'),
+  getCollabServerInfo: () => ipcRenderer.invoke('collab:getServerInfo'),
   runAiCommand: (payload) => ipcRenderer.invoke('ai:runCommand', payload),
   getTerminalProfiles: () => ipcRenderer.invoke('terminal:getProfiles'),
   createTerminal: (payload) => ipcRenderer.invoke('terminal:create', payload),
@@ -57,5 +60,10 @@ contextBridge.exposeInMainWorld('qwaleApi', {
     const listener = (_, payload) => callback(payload);
     ipcRenderer.on('project:changed', listener);
     return () => ipcRenderer.removeListener('project:changed', listener);
+  },
+  onCollabEvent: (callback) => {
+    const listener = (_, payload) => callback(payload);
+    ipcRenderer.on('collab:event', listener);
+    return () => ipcRenderer.removeListener('collab:event', listener);
   }
 });

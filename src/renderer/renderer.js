@@ -4,10 +4,12 @@ const appMenubar = document.getElementById('appMenubar');
 const sidebarTabExplorer = document.getElementById('sidebarTabExplorer');
 const sidebarTabRunDebug = document.getElementById('sidebarTabRunDebug');
 const sidebarTabSourceControl = document.getElementById('sidebarTabSourceControl');
+const sidebarTabCollaborate = document.getElementById('sidebarTabCollaborate');
 const sidebarTabHttp = document.getElementById('sidebarTabHttp');
 const explorerPanelView = document.getElementById('explorerPanelView');
 const runDebugPanelView = document.getElementById('runDebugPanelView');
 const sourceControlPanelView = document.getElementById('sourceControlPanelView');
+const collaboratePanelView = document.getElementById('collaboratePanelView');
 const httpPanelView = document.getElementById('httpPanelView');
 const workspace = document.querySelector('.workspace');
 const explorerResizeHandle = document.getElementById('explorerResizeHandle');
@@ -28,6 +30,15 @@ const aiSendBtn = document.getElementById('aiSendBtn');
 const aiStopBtn = document.getElementById('aiStopBtn');
 const aiAuthOnlyElements = document.querySelectorAll('.ai-auth-only');
 const projectInfo = document.getElementById('projectInfo');
+const collabStartBtn = document.getElementById('collabStartBtn');
+const collabStopBtn = document.getElementById('collabStopBtn');
+const collabJoinBtn = document.getElementById('collabJoinBtn');
+const collabServerUrlInput = document.getElementById('collabServerUrlInput');
+const collabCodeInput = document.getElementById('collabCodeInput');
+const collabNameInput = document.getElementById('collabNameInput');
+const collabInfo = document.getElementById('collabInfo');
+const collabPresenceList = document.getElementById('collabPresenceList');
+const collabActivityList = document.getElementById('collabActivityList');
 const treeRoot = document.getElementById('treeRoot');
 const scmTabBadge = document.getElementById('scmTabBadge');
 const editorTabs = document.getElementById('editorTabs');
@@ -166,6 +177,23 @@ let aiBusy = false;
 let aiAbortController = null;
 let aiConversation = [];
 let aiConversationCursor = -1;
+let collabSocket = null;
+let collabConnected = false;
+let collabClientId = null;
+let collabIsSessionHost = false;
+let collabParticipantName = `User-${Math.floor(Math.random() * 900 + 100)}`;
+let collabSessionCode = '';
+let collabMode = 'offline';
+let collabSuppressBroadcast = false;
+let collabRequestSeq = 1;
+let collabCursorBroadcastTimer = null;
+
+const collabPresenceById = new Map();
+const collabFileVersions = new Map();
+const collabRemoteCursorDecorations = new Map();
+const collabRemoteCursorNames = new Map();
+const collabPendingRequests = new Map();
+const collabAssignedColors = new Map();
 
 const openFiles = new Map();
 const terminalSessions = new Map();
@@ -1594,6 +1622,11 @@ async function moveExplorerEntries(entries, destinationPath) {
     return;
   }
 
+  if (collabConnected && collabMode === 'remote') {
+    alert('Move is not available yet in remote collaboration mode.');
+    return;
+  }
+
   for (const entry of compacted) {
     await api.movePath({ sourcePath: entry.path, destinationDir: destinationPath });
   }
@@ -1630,7 +1663,24 @@ async function deleteExplorerEntries(entries) {
   }
 
   for (const entry of compacted) {
-    await api.deletePath({ targetPath: entry.path });
+    if (collabConnected && collabMode === 'remote') {
+      await sendCollabRequest('file:operation', {
+        operation: {
+          type: 'delete',
+          targetPath: projectPathToCollabPath(entry.path)
+        }
+      });
+    } else {
+      await api.deletePath({ targetPath: entry.path });
+      if (collabConnected) {
+        sendCollabPacket('file:operation', {
+          operation: {
+            type: 'delete',
+            targetPath: projectPathToCollabPath(entry.path)
+          }
+        });
+      }
+    }
   }
 
   for (const filePath of tabsToClose) {
@@ -1648,15 +1698,18 @@ function setSidebarPanel(panelName) {
   const isExplorer = panelName === 'explorer';
   const isRunDebug = panelName === 'run-debug';
   const isSourceControl = panelName === 'source-control';
+  const isCollaborate = panelName === 'collaborate';
   const isHttp = panelName === 'http';
 
   sidebarTabExplorer.classList.toggle('active', isExplorer);
   sidebarTabRunDebug.classList.toggle('active', isRunDebug);
   sidebarTabSourceControl.classList.toggle('active', isSourceControl);
+  sidebarTabCollaborate.classList.toggle('active', isCollaborate);
   sidebarTabHttp.classList.toggle('active', isHttp);
   explorerPanelView.classList.toggle('active', isExplorer);
   runDebugPanelView.classList.toggle('active', isRunDebug);
   sourceControlPanelView.classList.toggle('active', isSourceControl);
+  collaboratePanelView.classList.toggle('active', isCollaborate);
   httpPanelView.classList.toggle('active', isHttp);
 
   if (isRunDebug) {
@@ -4390,8 +4443,32 @@ async function commitInlineEdit(name) {
   }
 
   if (state.mode === 'rename') {
-    const result = await api.renamePath({ targetPath: state.targetPath, newName: trimmed });
-    const renamedPath = result && result.path ? result.path : null;
+    let renamedPath = null;
+    if (collabConnected && collabMode === 'remote') {
+      await sendCollabRequest('file:operation', {
+        operation: {
+          type: 'rename',
+          targetPath: projectPathToCollabPath(state.targetPath),
+          newName: trimmed
+        }
+      });
+
+      const parent = state.targetPath.replace(/[\\/][^\\/]+$/, '');
+      renamedPath = `${parent}/${trimmed}`.replace(/\\/g, '/');
+    } else {
+      const result = await api.renamePath({ targetPath: state.targetPath, newName: trimmed });
+      renamedPath = result && result.path ? result.path : null;
+      if (collabConnected) {
+        sendCollabPacket('file:operation', {
+          operation: {
+            type: 'rename',
+            targetPath: projectPathToCollabPath(state.targetPath),
+            newName: trimmed
+          }
+        });
+      }
+    }
+
     if (renamedPath && openFiles.has(state.targetPath)) {
       const fileState = openFiles.get(state.targetPath);
       openFiles.delete(state.targetPath);
@@ -4408,9 +4485,47 @@ async function commitInlineEdit(name) {
     }
   } else if (state.mode === 'create') {
     if (state.targetType === 'folder') {
-      await api.createFolder({ parentPath: state.parentPath, name: trimmed });
+      if (collabConnected && collabMode === 'remote') {
+        await sendCollabRequest('file:operation', {
+          operation: {
+            type: 'create-folder',
+            parentPath: projectPathToCollabPath(state.parentPath),
+            name: trimmed
+          }
+        });
+      } else {
+        await api.createFolder({ parentPath: state.parentPath, name: trimmed });
+        if (collabConnected) {
+          sendCollabPacket('file:operation', {
+            operation: {
+              type: 'create-folder',
+              parentPath: projectPathToCollabPath(state.parentPath),
+              name: trimmed
+            }
+          });
+        }
+      }
     } else {
-      await api.createFile({ parentPath: state.parentPath, name: trimmed });
+      if (collabConnected && collabMode === 'remote') {
+        await sendCollabRequest('file:operation', {
+          operation: {
+            type: 'create-file',
+            parentPath: projectPathToCollabPath(state.parentPath),
+            name: trimmed
+          }
+        });
+      } else {
+        await api.createFile({ parentPath: state.parentPath, name: trimmed });
+        if (collabConnected) {
+          sendCollabPacket('file:operation', {
+            operation: {
+              type: 'create-file',
+              parentPath: projectPathToCollabPath(state.parentPath),
+              name: trimmed
+            }
+          });
+        }
+      }
     }
   }
 
@@ -4487,7 +4602,15 @@ function createFileTypeIconElement(filePath, className) {
   return icon;
 }
 
+function isCollabAutosaveMode() {
+  return collabConnected && (collabMode === 'remote' || collabMode === 'host');
+}
+
 function hasDirtyFiles() {
+  if (isCollabAutosaveMode()) {
+    return false;
+  }
+
   for (const [, state] of openFiles) {
     if (state.kind === 'text' && state.model.getValue() !== state.savedContent) {
       return true;
@@ -5047,6 +5170,10 @@ function showUnsavedFileDialog(filePath) {
 }
 
 function getDirtyFilePaths() {
+  if (isCollabAutosaveMode()) {
+    return [];
+  }
+
   const dirty = [];
   for (const [filePath, state] of openFiles) {
     if (state.kind === 'text' && state.model.getValue() !== state.savedContent) {
@@ -5059,6 +5186,11 @@ function getDirtyFilePaths() {
 async function saveFileByPath(filePath) {
   const fileState = openFiles.get(filePath);
   if (!fileState || fileState.kind !== 'text') {
+    return;
+  }
+
+  if (isCollabAutosaveMode()) {
+    fileState.savedContent = fileState.model.getValue();
     return;
   }
 
@@ -5215,6 +5347,10 @@ function disposeOpenFileState(state) {
 }
 
 function isDirty(filePath) {
+  if (isCollabAutosaveMode()) {
+    return false;
+  }
+
   const state = openFiles.get(filePath);
   if (!state || state.kind !== 'text') {
     return false;
@@ -5270,6 +5406,10 @@ function switchToFile(filePath) {
     return;
   }
 
+  if (currentFilePath && currentFilePath !== filePath) {
+    clearAllRemoteDecorations();
+  }
+
   currentFilePath = filePath;
   if (state.kind === 'image') {
     showImagePreview(filePath);
@@ -5280,6 +5420,17 @@ function switchToFile(filePath) {
     }
     monacoEditor.setModel(state.model);
   }
+
+  if (collabConnected && currentFilePath) {
+    sendCollabPacket('presence:file', {
+      filePath: projectPathToCollabPath(currentFilePath)
+    });
+
+    if (state.kind === 'text') {
+      scheduleCursorBroadcast();
+    }
+  }
+
   updateEditorStatusBar();
   updateEditorTitle();
   renderTabs();
@@ -5314,6 +5465,7 @@ async function closeTab(filePath) {
 
   if (currentFilePath === filePath) {
     if (openFiles.size === 0) {
+      clearAllRemoteDecorations();
       currentFilePath = null;
       showTextEditor();
       if (monacoEditor) {
@@ -5357,11 +5509,42 @@ function initMonacoEditor() {
         wordWrap: 'off'
       });
 
-      monacoEditor.onDidChangeModelContent(() => {
+      monacoEditor.onDidChangeModelContent((event) => {
         const state = currentFilePath ? openFiles.get(currentFilePath) : null;
         if (state) {
           state.encoding = inferEncodingFromText(state.model.getValue());
+
+          if (collabConnected && collabMode === 'remote') {
+            state.savedContent = state.model.getValue();
+          }
         }
+
+        if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && currentFilePath) {
+          const collabPath = projectPathToCollabPath(currentFilePath);
+          const baseVersion = Math.max(0, Number(collabFileVersions.get(collabPath)) || 0);
+          const ops = Array.isArray(event && event.changes)
+            ? event.changes.map((change) => ({
+                offset: Math.max(0, Number(change.rangeOffset) || 0),
+                deleteCount: Math.max(0, Number(change.rangeLength) || 0),
+                insertText: String(change.text || '')
+              }))
+            : [];
+
+          if (ops.length) {
+            sendCollabRequest('file:ops', {
+              filePath: collabPath,
+              baseVersion,
+              ops
+            }).then((ack) => {
+              if (ack && typeof ack.version !== 'undefined') {
+                collabFileVersions.set(collabPath, Math.max(0, Number(ack.version) || 0));
+              }
+            }).catch(() => {
+              // Remote sync fallback is handled by file:sync messages.
+            });
+          }
+        }
+
         updateEditorStatusBar();
         updateEditorTitle();
         renderTabs();
@@ -5370,6 +5553,11 @@ function initMonacoEditor() {
 
       monacoEditor.onDidChangeCursorPosition(() => {
         updateEditorStatusBar();
+        scheduleCursorBroadcast();
+      });
+
+      monacoEditor.onDidChangeCursorSelection(() => {
+        scheduleCursorBroadcast();
       });
 
       resolve();
@@ -5790,6 +5978,15 @@ function renderTree() {
 }
 
 async function refreshProjectTree() {
+  if (collabConnected && collabMode === 'remote') {
+    projectInfo.textContent = `${project.rootName}  |  shared`;
+    renderTree();
+    refreshFileSearchIndex();
+    syncAiChatControls();
+    applyScmState('no-project');
+    return;
+  }
+
   const previousRootPath = project.rootPath;
   const hadProject = Boolean(previousRootPath);
   project = await api.refreshProject();
@@ -5815,6 +6012,729 @@ async function refreshProjectTree() {
   }
 
   await refreshSourceControlPanel();
+}
+
+function collabFilePathToProjectPath(collabPath) {
+  if (!collabPath) {
+    return '';
+  }
+
+  if (collabMode === 'remote') {
+    return String(collabPath || '').replace(/\\/g, '/');
+  }
+
+  if (!project.rootPath) {
+    return String(collabPath || '');
+  }
+
+  const normalizedRoot = String(project.rootPath || '').replace(/[\\/]+$/, '');
+  const normalizedPath = String(collabPath || '').replace(/\\/g, '/').replace(/^\//, '');
+  return `${normalizedRoot}\\${normalizedPath.replace(/\//g, '\\')}`;
+}
+
+function projectPathToCollabPath(projectPath) {
+  const fullPath = String(projectPath || '');
+  if (!fullPath) {
+    return '';
+  }
+
+  if (collabMode === 'remote' || !project.rootPath) {
+    return fullPath.replace(/\\/g, '/').replace(/^\//, '');
+  }
+
+  const rootPath = String(project.rootPath || '');
+  const normalizedRoot = rootPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  const normalizedPath = fullPath.replace(/\\/g, '/');
+  if (normalizedPath.toLowerCase().startsWith(`${normalizedRoot.toLowerCase()}/`)) {
+    return normalizedPath.slice(normalizedRoot.length + 1);
+  }
+  if (normalizedPath.toLowerCase() === normalizedRoot.toLowerCase()) {
+    return '';
+  }
+
+  return normalizedPath;
+}
+
+function addCollabActivity(message) {
+  const item = document.createElement('div');
+  item.className = 'collab-activity-item';
+  item.textContent = message;
+  collabActivityList.prepend(item);
+  while (collabActivityList.childElementCount > 40) {
+    collabActivityList.removeChild(collabActivityList.lastElementChild);
+  }
+}
+
+function getCollabColorById(clientId) {
+  const palette = ['#45d483', '#31baf2', '#f3b04f', '#ea6f6f', '#8f79ff', '#57d3bf', '#ff7a59', '#73d13d', '#36cfc9', '#597ef7'];
+  const normalizedId = String(clientId || '').trim();
+  if (!normalizedId) {
+    return palette[0];
+  }
+
+  if (collabAssignedColors.has(normalizedId)) {
+    return collabAssignedColors.get(normalizedId);
+  }
+
+  const usedColors = new Set(collabAssignedColors.values());
+  const availableColor = palette.find((color) => !usedColors.has(color));
+  if (availableColor) {
+    collabAssignedColors.set(normalizedId, availableColor);
+    return availableColor;
+  }
+
+  let hash = 0;
+  for (let i = 0; i < normalizedId.length; i += 1) {
+    hash = ((hash << 5) - hash) + normalizedId.charCodeAt(i);
+    hash |= 0;
+  }
+
+  const fallback = palette[Math.abs(hash) % palette.length];
+  collabAssignedColors.set(normalizedId, fallback);
+  return fallback;
+}
+
+function collabColorWithAlpha(hexColor, alpha) {
+  const fallbackAlpha = Math.max(0, Math.min(1, Number(alpha) || 0));
+  const normalized = String(hexColor || '').replace('#', '');
+  if (!/^[0-9a-fA-F]{6}$/.test(normalized)) {
+    return `rgba(69, 212, 131, ${fallbackAlpha})`;
+  }
+
+  const red = parseInt(normalized.slice(0, 2), 16);
+  const green = parseInt(normalized.slice(2, 4), 16);
+  const blue = parseInt(normalized.slice(4, 6), 16);
+  return `rgba(${red}, ${green}, ${blue}, ${fallbackAlpha})`;
+}
+
+function getNormalizedSelectionRange(model, selection) {
+  if (!model || !selection) {
+    return null;
+  }
+
+  const startLineNumber = Number(selection.startLineNumber);
+  const startColumn = Number(selection.startColumn);
+  const endLineNumber = Number(selection.endLineNumber);
+  const endColumn = Number(selection.endColumn);
+  if (!Number.isFinite(startLineNumber) || !Number.isFinite(startColumn) || !Number.isFinite(endLineNumber) || !Number.isFinite(endColumn)) {
+    return null;
+  }
+
+  const modelLineCount = Math.max(1, model.getLineCount());
+  const safeStartLine = Math.max(1, Math.min(modelLineCount, Math.floor(startLineNumber)));
+  const safeEndLine = Math.max(1, Math.min(modelLineCount, Math.floor(endLineNumber)));
+  const safeStartColumn = Math.max(1, Math.floor(startColumn));
+  const safeEndColumn = Math.max(1, Math.floor(endColumn));
+
+  let rangeStartLine = safeStartLine;
+  let rangeStartColumn = safeStartColumn;
+  let rangeEndLine = safeEndLine;
+  let rangeEndColumn = safeEndColumn;
+
+  const startsAfterEnd = rangeStartLine > rangeEndLine || (rangeStartLine === rangeEndLine && rangeStartColumn > rangeEndColumn);
+  if (startsAfterEnd) {
+    rangeStartLine = safeEndLine;
+    rangeStartColumn = safeEndColumn;
+    rangeEndLine = safeStartLine;
+    rangeEndColumn = safeStartColumn;
+  }
+
+  rangeStartColumn = Math.min(rangeStartColumn, model.getLineMaxColumn(rangeStartLine));
+  rangeEndColumn = Math.min(rangeEndColumn, model.getLineMaxColumn(rangeEndLine));
+
+  if (rangeStartLine === rangeEndLine && rangeStartColumn === rangeEndColumn) {
+    return null;
+  }
+
+  return new window.monaco.Range(rangeStartLine, rangeStartColumn, rangeEndLine, rangeEndColumn);
+}
+
+function clearRemoteDecorationsForClient(clientId) {
+  const decorationIds = collabRemoteCursorDecorations.get(clientId) || [];
+  if (decorationIds.length && monacoEditor && monacoEditor.getModel()) {
+    monacoEditor.deltaDecorations(decorationIds, []);
+  }
+
+  collabRemoteCursorDecorations.delete(clientId);
+  collabRemoteCursorNames.delete(clientId);
+
+  const classSuffix = `remote-cursor-${String(clientId).replace(/[^a-z0-9_-]/gi, '').slice(0, 24)}`;
+  const styleTag = document.getElementById(`style-${classSuffix}`);
+  if (styleTag) {
+    styleTag.remove();
+  }
+}
+
+function clearAllRemoteDecorations() {
+  for (const clientId of [...collabRemoteCursorDecorations.keys()]) {
+    clearRemoteDecorationsForClient(clientId);
+  }
+}
+
+function renderCollabPresence() {
+  collabPresenceList.innerHTML = '';
+
+  const entries = [...collabPresenceById.values()];
+  entries.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+  for (const entry of entries) {
+    const item = document.createElement('div');
+    item.className = 'collab-presence-item';
+
+    const canKick = collabIsSessionHost && collabConnected && entry.clientId !== collabClientId;
+    if (canKick) {
+      const kickBtn = document.createElement('button');
+      kickBtn.type = 'button';
+      kickBtn.className = 'collab-presence-kick-btn';
+      kickBtn.title = `Remove ${entry.name || 'collaborator'}`;
+      kickBtn.setAttribute('aria-label', `Remove ${entry.name || 'collaborator'}`);
+      kickBtn.textContent = 'x';
+      kickBtn.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        try {
+          await sendCollabRequest('client:kick', { targetClientId: entry.clientId });
+        } catch (error) {
+          alert(error.message || String(error));
+        }
+      });
+      item.appendChild(kickBtn);
+    }
+
+    const dot = document.createElement('span');
+    dot.className = 'collab-presence-dot';
+    dot.style.background = getCollabColorById(entry.clientId);
+
+    const label = document.createElement('span');
+    label.className = 'collab-presence-name';
+    const suffix = entry.currentFile ? ` - ${entry.currentFile}` : '';
+    label.textContent = `${entry.name}${entry.clientId === collabClientId ? ' (you)' : ''}${suffix}`;
+
+    item.appendChild(dot);
+    item.appendChild(label);
+    collabPresenceList.appendChild(item);
+  }
+}
+
+function setCollabInfo(text) {
+  collabInfo.textContent = text;
+}
+
+function updateCollabButtons() {
+  collabStartBtn.classList.toggle('hidden', collabConnected || !project.rootPath);
+  collabStopBtn.classList.toggle('hidden', !collabConnected);
+  collabJoinBtn.disabled = collabConnected;
+  collabServerUrlInput.disabled = collabConnected;
+  collabCodeInput.disabled = collabConnected;
+  collabNameInput.disabled = collabConnected;
+}
+
+function getRequestedCollabName() {
+  const inputName = String(collabNameInput.value || '').trim();
+  return inputName || collabParticipantName;
+}
+
+function sendCollabPacket(type, payload = {}) {
+  if (!collabSocket || collabSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  collabSocket.send(JSON.stringify({ type, ...payload }));
+}
+
+function sendCollabRequest(type, payload = {}) {
+  return new Promise((resolve, reject) => {
+    if (!collabSocket || collabSocket.readyState !== WebSocket.OPEN) {
+      reject(new Error('Collaboration socket is not connected.'));
+      return;
+    }
+
+    const requestId = `${Date.now()}-${collabRequestSeq++}`;
+    collabPendingRequests.set(requestId, { resolve, reject });
+    sendCollabPacket(type, { ...payload, requestId });
+    setTimeout(() => {
+      if (!collabPendingRequests.has(requestId)) {
+        return;
+      }
+      collabPendingRequests.delete(requestId);
+      reject(new Error(`Request timeout: ${type}`));
+    }, 8000);
+  });
+}
+
+function clearCollabSessionState() {
+  collabClientId = null;
+  collabIsSessionHost = false;
+  collabConnected = false;
+  collabSessionCode = '';
+  collabMode = 'offline';
+  collabPresenceById.clear();
+  collabFileVersions.clear();
+  collabAssignedColors.clear();
+
+  clearAllRemoteDecorations();
+  updateCollabButtons();
+}
+
+function maybeResolveCollabRequest(packet) {
+  const requestId = packet && packet.requestId ? String(packet.requestId) : '';
+  if (!requestId) {
+    return false;
+  }
+
+  const pending = collabPendingRequests.get(requestId);
+  if (!pending) {
+    return false;
+  }
+
+  collabPendingRequests.delete(requestId);
+  if (packet.type && packet.type.endsWith(':error')) {
+    pending.reject(new Error(packet.message || 'Collaboration request failed.'));
+  } else {
+    pending.resolve(packet);
+  }
+
+  return true;
+}
+
+function toMonacoPositionFromOffset(model, offset) {
+  const safeOffset = Math.max(0, Math.min(Number(offset) || 0, model.getValueLength()));
+  return model.getPositionAt(safeOffset);
+}
+
+function applyRemoteOperationBatchToModel(filePath, ops, nextVersion) {
+  const state = openFiles.get(filePath);
+  if (!state || state.kind !== 'text' || !state.model) {
+    return;
+  }
+
+  const model = state.model;
+  const sourceOps = Array.isArray(ops) ? ops : [];
+  let delta = 0;
+  const edits = [];
+
+  for (const rawOp of sourceOps) {
+    const baseOffset = Math.max(0, Number(rawOp.offset) || 0);
+    const deleteCount = Math.max(0, Number(rawOp.deleteCount) || 0);
+    const insertText = String(rawOp.insertText || '');
+    const adjustedOffset = baseOffset + delta;
+    const startPos = toMonacoPositionFromOffset(model, adjustedOffset);
+    const endPos = toMonacoPositionFromOffset(model, adjustedOffset + deleteCount);
+
+    edits.push({
+      range: new window.monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column),
+      text: insertText,
+      forceMoveMarkers: true
+    });
+
+    delta += insertText.length - deleteCount;
+  }
+
+  if (!edits.length) {
+    return;
+  }
+
+  collabSuppressBroadcast = true;
+  model.pushEditOperations([], edits, () => null);
+  collabSuppressBroadcast = false;
+
+  state.savedContent = model.getValue();
+  state.encoding = inferEncodingFromText(state.savedContent);
+  collabFileVersions.set(projectPathToCollabPath(filePath), Math.max(0, Number(nextVersion) || 0));
+  updateEditorStatusBar();
+  updateEditorTitle();
+  renderTabs();
+  renderTree();
+}
+
+function updateRemoteCursorDecoration(clientId, name, filePath, position, selection) {
+  if (!monacoEditor || !monacoEditor.getModel() || !currentFilePath) {
+    return;
+  }
+
+  const model = monacoEditor.getModel();
+  if (currentFilePath !== filePath) {
+    clearRemoteDecorationsForClient(clientId);
+    return;
+  }
+
+  const color = getCollabColorById(clientId);
+  const classSuffix = `remote-cursor-${String(clientId).replace(/[^a-z0-9_-]/gi, '').slice(0, 24)}`;
+
+  const selectionRange = getNormalizedSelectionRange(model, selection);
+  const hasPosition = Boolean(position && Number.isFinite(Number(position.lineNumber)) && Number.isFinite(Number(position.column)));
+  if (!selectionRange && !hasPosition) {
+    clearRemoteDecorationsForClient(clientId);
+    return;
+  }
+
+  let styleTag = document.getElementById(`style-${classSuffix}`);
+  if (!styleTag) {
+    styleTag = document.createElement('style');
+    styleTag.id = `style-${classSuffix}`;
+    document.head.appendChild(styleTag);
+  }
+
+  styleTag.textContent = `
+    #editor .${classSuffix}, #editor .${classSuffix}-label { --collab-color: ${color}; }
+    #editor .${classSuffix}-label::after { content: '${String(name || 'Peer').replace(/'/g, "\\'")}'; background: ${color}; }
+    #editor .${classSuffix}-selection { background-color: ${collabColorWithAlpha(color, 0.24)}; }
+  `;
+
+  const nextDecorations = [];
+  if (selectionRange) {
+    nextDecorations.push({
+      range: selectionRange,
+      options: {
+        className: `${classSuffix}-selection remote-selection-mark`
+      }
+    });
+  }
+
+  if (hasPosition) {
+    const line = Math.max(1, Number(position.lineNumber) || 1);
+    const column = Math.max(1, Number(position.column) || 1);
+    const safeLine = Math.min(line, model.getLineCount());
+    const safeColumn = Math.min(column, model.getLineMaxColumn(safeLine));
+    const cursorClassName = selectionRange
+      ? `${classSuffix} remote-cursor-mark`
+      : `${classSuffix} remote-cursor-mark remote-cursor-blink`;
+
+    nextDecorations.push({
+      range: new window.monaco.Range(safeLine, safeColumn, safeLine, safeColumn + 1),
+      options: {
+        className: cursorClassName,
+        afterContentClassName: `${classSuffix}-label remote-cursor-label`
+      }
+    });
+  }
+
+  const oldDecorations = collabRemoteCursorDecorations.get(clientId) || [];
+  const appliedDecorations = monacoEditor.deltaDecorations(oldDecorations, nextDecorations);
+  collabRemoteCursorDecorations.set(clientId, appliedDecorations);
+  collabRemoteCursorNames.set(clientId, name || 'Peer');
+}
+
+async function openFileWithCollabSupport(filePath) {
+  if (!(collabConnected && collabMode === 'remote')) {
+    return null;
+  }
+
+  const collabPath = projectPathToCollabPath(filePath);
+  const response = await sendCollabRequest('file:get', { filePath: collabPath });
+  return {
+    content: String(response.content || ''),
+    version: Math.max(0, Number(response.version) || 0)
+  };
+}
+
+async function writeFileWithCollabSupport(filePath, content) {
+  if (!(collabConnected && collabMode === 'remote')) {
+    await api.writeFile({ filePath, content });
+    return;
+  }
+
+  const collabPath = projectPathToCollabPath(filePath);
+  await sendCollabRequest('file:get', { filePath: collabPath });
+}
+
+function handleCollabPacket(packet) {
+  if (!packet || typeof packet.type !== 'string') {
+    return;
+  }
+
+  if (maybeResolveCollabRequest(packet)) {
+    return;
+  }
+
+  if (packet.type === 'presence:joined') {
+    collabPresenceById.set(packet.clientId, {
+      clientId: packet.clientId,
+      name: packet.name || 'Collaborator',
+      currentFile: null
+    });
+    renderCollabPresence();
+    addCollabActivity(`${packet.name || 'Collaborator'} joined`);
+    return;
+  }
+
+  if (packet.type === 'presence:left') {
+    collabAssignedColors.delete(packet.clientId);
+    clearRemoteDecorationsForClient(packet.clientId);
+    collabPresenceById.delete(packet.clientId);
+    renderCollabPresence();
+    addCollabActivity(`${packet.name || 'Collaborator'} left`);
+    return;
+  }
+
+  if (packet.type === 'session:kicked') {
+    const byName = packet.byName ? String(packet.byName) : 'The host';
+    addCollabActivity(`${byName} removed you from the session`);
+    setCollabInfo('You were removed from the collaboration session');
+    if (collabSocket) {
+      try {
+        collabSocket.close();
+      } catch {
+        // Ignore close errors.
+      }
+    }
+    return;
+  }
+
+  if (packet.type === 'presence:update') {
+    const existing = collabPresenceById.get(packet.clientId) || {
+      clientId: packet.clientId,
+      name: packet.name || 'Collaborator'
+    };
+    existing.currentFile = packet.currentFile || null;
+    collabPresenceById.set(packet.clientId, existing);
+    renderCollabPresence();
+    return;
+  }
+
+  if (packet.type === 'activity:add') {
+    addCollabActivity(packet.message || 'Activity');
+    return;
+  }
+
+  if (packet.type === 'cursor:update') {
+    if (!packet.clientId || packet.clientId === collabClientId) {
+      return;
+    }
+
+    const projectPath = collabFilePathToProjectPath(packet.filePath || '');
+    updateRemoteCursorDecoration(packet.clientId, packet.name || 'Collaborator', projectPath, packet.position || null, packet.selection || null);
+    return;
+  }
+
+  if (packet.type === 'cursor:snapshot') {
+    const filePath = collabFilePathToProjectPath(packet.filePath || '');
+    if (!filePath || filePath !== currentFilePath) {
+      return;
+    }
+
+    const cursors = Array.isArray(packet.cursors) ? packet.cursors : [];
+    for (const cursor of cursors) {
+      if (!cursor || !cursor.clientId || cursor.clientId === collabClientId) {
+        continue;
+      }
+
+      updateRemoteCursorDecoration(
+        cursor.clientId,
+        cursor.name || 'Collaborator',
+        collabFilePathToProjectPath(cursor.filePath || packet.filePath || ''),
+        cursor.position || null,
+        cursor.selection || null
+      );
+    }
+
+    return;
+  }
+
+  if (packet.type === 'file:ops') {
+    const projectPath = collabFilePathToProjectPath(packet.filePath || '');
+    applyRemoteOperationBatchToModel(projectPath, packet.ops || [], packet.toVersion);
+    return;
+  }
+
+  if (packet.type === 'file:sync') {
+    const projectPath = collabFilePathToProjectPath(packet.filePath || '');
+    const state = openFiles.get(projectPath);
+    if (!state || state.kind !== 'text') {
+      return;
+    }
+
+    collabSuppressBroadcast = true;
+    state.model.setValue(String(packet.content || ''));
+    collabSuppressBroadcast = false;
+    state.savedContent = state.model.getValue();
+    collabFileVersions.set(projectPathToCollabPath(projectPath), Math.max(0, Number(packet.version) || 0));
+    renderTabs();
+    renderTree();
+    return;
+  }
+
+  if (packet.type === 'tree:update') {
+    if (!(collabConnected && collabMode === 'remote')) {
+      refreshProjectTree().catch(() => {});
+      return;
+    }
+
+    project.tree = Array.isArray(packet.tree) ? packet.tree : [];
+    project.rootName = packet.rootName || project.rootName;
+    renderTree();
+    return;
+  }
+}
+
+function connectCollabSocket(serverUrl, code, name, mode) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(serverUrl);
+    let settled = false;
+
+    socket.addEventListener('open', async () => {
+      collabSocket = socket;
+      try {
+        const joinResponse = await sendCollabRequest('join', {
+          code,
+          name,
+          mode
+        });
+
+        collabConnected = true;
+        collabClientId = joinResponse.clientId;
+        collabIsSessionHost = Boolean(joinResponse.isSessionHost);
+        collabSessionCode = joinResponse.code;
+        collabMode = mode;
+        collabParticipantName = String(joinResponse.name || collabParticipantName);
+        collabNameInput.value = collabParticipantName;
+        collabPresenceById.clear();
+
+        const participants = Array.isArray(joinResponse.presence) ? joinResponse.presence : [];
+        for (const peer of participants) {
+          collabPresenceById.set(peer.clientId, {
+            clientId: peer.clientId,
+            name: peer.name || 'Collaborator',
+            currentFile: peer.currentFile || null
+          });
+        }
+
+        if (mode === 'remote') {
+          project = {
+            rootPath: '/',
+            rootName: joinResponse.snapshot && joinResponse.snapshot.rootName ? joinResponse.snapshot.rootName : 'Shared Project',
+            tree: Array.isArray(joinResponse.snapshot && joinResponse.snapshot.tree) ? joinResponse.snapshot.tree : []
+          };
+          projectInfo.textContent = `${project.rootName}  |  shared`;
+          expandedFolders.clear();
+          expandedFolders.add('/');
+          renderTree();
+          refreshFileSearchIndex();
+          applyScmState('no-project');
+        }
+
+        renderCollabPresence();
+        updateCollabButtons();
+        setCollabInfo(`Connected - Code ${joinResponse.code}`);
+        addCollabActivity(`Joined session ${joinResponse.code}`);
+
+        settled = true;
+        resolve(joinResponse);
+      } catch (error) {
+        settled = true;
+        reject(error);
+      }
+    });
+
+    socket.addEventListener('message', (event) => {
+      const packet = (() => {
+        try {
+          return JSON.parse(String(event.data || ''));
+        } catch {
+          return null;
+        }
+      })();
+
+      handleCollabPacket(packet);
+    });
+
+    socket.addEventListener('close', () => {
+      collabSocket = null;
+      clearCollabSessionState();
+      setCollabInfo('Collaboration offline');
+      if (!settled) {
+        reject(new Error('Collaboration connection closed.'));
+      }
+    });
+
+    socket.addEventListener('error', () => {
+      if (!settled) {
+        reject(new Error('Could not connect to collaboration host.'));
+      }
+    });
+  });
+}
+
+async function startCollaborationAsHost() {
+  if (!project.rootPath) {
+    throw new Error('Open a local project first.');
+  }
+
+  const info = await api.startCollabServer({});
+  const defaultUrl = Array.isArray(info.urls) && info.urls.length > 0 ? info.urls[0] : '';
+  const shareUrl = defaultUrl || `ws://127.0.0.1:${info.port}`;
+  collabServerUrlInput.value = shareUrl;
+  collabCodeInput.value = info.code || '';
+
+  if (!collabConnected) {
+    await connectCollabSocket(shareUrl, info.code, getRequestedCollabName(), 'host');
+  }
+
+  setCollabInfo(`Sharing on ${shareUrl} - Code ${info.code}`);
+  addCollabActivity(`Sharing started. Code: ${info.code}`);
+}
+
+async function joinCollaborationAsClient() {
+  if (collabConnected) {
+    return;
+  }
+
+  const serverUrl = String(collabServerUrlInput.value || '').trim();
+  const code = String(collabCodeInput.value || '').trim().toUpperCase();
+  if (!serverUrl || !code) {
+    throw new Error('Enter both server URL and session code.');
+  }
+
+  await connectCollabSocket(serverUrl, code, getRequestedCollabName(), project.rootPath ? 'host' : 'remote');
+}
+
+async function stopCollaborationSession() {
+  if (collabSocket) {
+    try {
+      collabSocket.close();
+    } catch {
+      // Ignore close errors.
+    }
+  }
+  collabSocket = null;
+
+  if (collabMode === 'host') {
+    await api.stopCollabServer();
+  }
+
+  clearCollabSessionState();
+  setCollabInfo('Collaboration offline');
+}
+
+function scheduleCursorBroadcast() {
+  if (!collabConnected || !currentFilePath || !monacoEditor || collabSuppressBroadcast) {
+    return;
+  }
+
+  if (collabCursorBroadcastTimer) {
+    clearTimeout(collabCursorBroadcastTimer);
+  }
+
+  collabCursorBroadcastTimer = setTimeout(() => {
+    collabCursorBroadcastTimer = null;
+    const position = monacoEditor.getPosition();
+    const selection = monacoEditor.getSelection();
+    if (!position || !selection) {
+      return;
+    }
+
+    sendCollabPacket('cursor:update', {
+      filePath: projectPathToCollabPath(currentFilePath),
+      position: {
+        lineNumber: position.lineNumber,
+        column: position.column
+      },
+      selection: {
+        startLineNumber: selection.startLineNumber,
+        startColumn: selection.startColumn,
+        endLineNumber: selection.endLineNumber,
+        endColumn: selection.endColumn
+      }
+    });
+  }, 70);
 }
 
 async function openFile(filePath, options = {}) {
@@ -5855,11 +6775,22 @@ async function openFile(filePath, options = {}) {
       encoding: 'Image'
     });
   } else {
-    const filePayload = await api.readFile(filePath);
-    const content = typeof filePayload === 'string' ? filePayload : filePayload.content;
-    const encoding = typeof filePayload === 'string'
-      ? inferEncodingFromText(filePayload)
-      : (filePayload.encoding || inferEncodingFromText(filePayload.content));
+    let content = '';
+    let encoding = 'UTF-8';
+
+    if (collabConnected && collabMode === 'remote') {
+      const collabFile = await openFileWithCollabSupport(filePath);
+      content = collabFile && typeof collabFile.content === 'string' ? collabFile.content : '';
+      encoding = inferEncodingFromText(content);
+      collabFileVersions.set(projectPathToCollabPath(filePath), collabFile ? collabFile.version : 0);
+    } else {
+      const filePayload = await api.readFile(filePath);
+      content = typeof filePayload === 'string' ? filePayload : filePayload.content;
+      encoding = typeof filePayload === 'string'
+        ? inferEncodingFromText(filePayload)
+        : (filePayload.encoding || inferEncodingFromText(filePayload.content));
+    }
+
     const language = detectMonacoLanguage(filePath);
     const model = window.monaco.editor.createModel(content, language);
 
@@ -5893,10 +6824,12 @@ async function saveCurrentFile() {
 
   const content = fileState.model.getValue();
 
-  await api.writeFile({
-    filePath: currentFilePath,
-    content
-  });
+  if (!isCollabAutosaveMode()) {
+    await api.writeFile({
+      filePath: currentFilePath,
+      content
+    });
+  }
 
   fileState.savedContent = content;
   fileState.encoding = inferEncodingFromText(content);
@@ -6006,7 +6939,9 @@ async function saveAllFiles() {
       continue;
     }
 
-    await api.writeFile({ filePath, content });
+    if (!isCollabAutosaveMode()) {
+      await api.writeFile({ filePath, content });
+    }
     fileState.savedContent = content;
     fileState.encoding = inferEncodingFromText(content);
     savedCount += 1;
@@ -6086,6 +7021,8 @@ async function applyOpenedProject(opened) {
     return;
   }
 
+  clearAllRemoteDecorations();
+
   for (const [, state] of openFiles) {
     disposeOpenFileState(state);
   }
@@ -6114,11 +7051,16 @@ async function applyOpenedProject(opened) {
 
   killAllTerminalSessions();
   await createTerminalSession('powershell');
+  updateCollabButtons();
 }
 
 async function closeFolder() {
   if (!project.rootPath) {
     return;
+  }
+
+  if (collabConnected && collabMode === 'remote') {
+    await stopCollaborationSession();
   }
 
   if (hasDirtyFiles()) {
@@ -6134,6 +7076,12 @@ async function closeFolder() {
   }
 
   await api.closeProject();
+
+  clearAllRemoteDecorations();
+
+  if (collabConnected && collabMode === 'host') {
+    await stopCollaborationSession();
+  }
 
   for (const [, state] of openFiles) {
     disposeOpenFileState(state);
@@ -6165,6 +7113,7 @@ async function closeFolder() {
 
   killAllTerminalSessions();
   await createTerminalSession('powershell');
+  updateCollabButtons();
 }
 
 sidebarTabExplorer.addEventListener('click', () => {
@@ -6177,6 +7126,10 @@ sidebarTabRunDebug.addEventListener('click', () => {
 
 sidebarTabSourceControl.addEventListener('click', () => {
   setSidebarPanel('source-control');
+});
+
+sidebarTabCollaborate.addEventListener('click', () => {
+  setSidebarPanel('collaborate');
 });
 
 sidebarTabHttp.addEventListener('click', () => {
@@ -6474,6 +7427,30 @@ newTerminalTypeBtn.addEventListener('click', (event) => {
   terminalTypeMenu.classList.toggle('hidden');
 });
 
+collabStartBtn.addEventListener('click', async () => {
+  try {
+    await startCollaborationAsHost();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+collabJoinBtn.addEventListener('click', async () => {
+  try {
+    await joinCollaborationAsClient();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+collabStopBtn.addEventListener('click', async () => {
+  try {
+    await stopCollaborationSession();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
 document.addEventListener('click', (event) => {
   if (!terminalActions.contains(event.target)) {
     closeTerminalTypeMenu();
@@ -6557,6 +7534,20 @@ if (api.onProjectChanged) {
         // Keep UI responsive if a transient refresh error occurs.
       }
     }, 300);
+  });
+}
+
+if (api.onCollabEvent) {
+  api.onCollabEvent((event) => {
+    if (!event || typeof event !== 'object') {
+      return;
+    }
+
+    const packet = {
+      type: event.type,
+      ...(event.payload && typeof event.payload === 'object' ? event.payload : {})
+    };
+    handleCollabPacket(packet);
   });
 }
 
@@ -6744,6 +7735,8 @@ aiPromptInput.addEventListener('input', () => {
 });
 
 syncAiChatControls();
+updateCollabButtons();
+setCollabInfo('Collaboration offline');
 
 terminalResizeHandle.addEventListener('mousedown', (event) => {
   resizeState = {
