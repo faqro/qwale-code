@@ -178,7 +178,9 @@ const terminal = new Terminal({
   theme: {
     background: '#0d1723',
     foreground: '#d6e9ff',
-    cursor: '#45d483'
+    cursor: '#45d483',
+    selectionBackground: 'rgba(69, 212, 131, 0.36)',
+    selectionInactiveBackground: 'rgba(69, 212, 131, 0.28)'
   }
 });
 const fitAddon = new FitAddon.FitAddon();
@@ -635,7 +637,9 @@ function applyTheme(mode) {
   terminal.options.theme = {
     background: isLight ? '#ffffff' : '#0d1723',
     foreground: isLight ? '#1f2a3a' : '#d6e9ff',
-    cursor: isLight ? '#6f67ff' : '#766ff0'
+    cursor: isLight ? '#6f67ff' : '#766ff0',
+    selectionBackground: isLight ? 'rgba(111, 103, 255, 0.66)' : 'rgba(69, 212, 131, 0.36)',
+    selectionInactiveBackground: isLight ? 'rgba(111, 103, 255, 0.58)' : 'rgba(69, 212, 131, 0.28)'
   };
 
   api.setAppTheme(themeMode).catch(() => {});

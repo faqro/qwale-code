@@ -2683,6 +2683,31 @@ body.light-theme .run-debug-label {
   color: #5a6c86;
 }
 
+body.light-theme .scm-file-status {
+  color: #46688d;
+}
+
+body.light-theme .scm-file-path,
+body.light-theme .scm-graph-subject {
+  color: #223047;
+}
+
+body.light-theme .scm-graph-refs {
+  color: #587090;
+}
+
+body.light-theme .http-send-btn {
+  background: #6f67ff;
+  border-color: #6f67ff;
+  color: #ffffff;
+}
+
+body.light-theme .http-send-btn:hover {
+  background: #5f57ef;
+  color: #ffffff;
+  filter: none;
+}
+
 body.light-theme .scm-btn:hover {
   background: #405272;
   color: #ffffff;
@@ -2855,12 +2880,12 @@ body.light-theme .terminal-container .xterm-selection,
 body.light-theme .terminal-container .xterm-selection div,
 body.light-theme .xterm .xterm-selection,
 body.light-theme .xterm .xterm-selection div {
-  background: rgba(111, 103, 255, 0.34) !important;
+  background: rgba(111, 103, 255, 0.58) !important;
 }
 
 body.light-theme .terminal-container .xterm.focus .xterm-selection div,
 body.light-theme .xterm.focus .xterm-selection div {
-  background: rgba(111, 103, 255, 0.42) !important;
+  background: rgba(111, 103, 255, 0.68) !important;
 }
 
 body.light-theme .tree,
