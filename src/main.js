@@ -8,6 +8,10 @@ const ignore = require('ignore');
 const { spawnSync } = require('child_process');
 const { execFile } = require('child_process');
 
+if (require('electron-squirrel-startup')) { //prevent duplicate startups from electron squirrel setup
+  app.quit();
+}
+
 let mainWindow = null;
 const terminals = new Map();
 let recentProjects = [];
