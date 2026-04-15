@@ -2,9 +2,11 @@ const api = window.qwaleApi;
 
 const appMenubar = document.getElementById('appMenubar');
 const sidebarTabExplorer = document.getElementById('sidebarTabExplorer');
+const sidebarTabRunDebug = document.getElementById('sidebarTabRunDebug');
 const sidebarTabSourceControl = document.getElementById('sidebarTabSourceControl');
 const sidebarTabHttp = document.getElementById('sidebarTabHttp');
 const explorerPanelView = document.getElementById('explorerPanelView');
+const runDebugPanelView = document.getElementById('runDebugPanelView');
 const sourceControlPanelView = document.getElementById('sourceControlPanelView');
 const httpPanelView = document.getElementById('httpPanelView');
 const workspace = document.querySelector('.workspace');
@@ -29,6 +31,11 @@ const projectInfo = document.getElementById('projectInfo');
 const treeRoot = document.getElementById('treeRoot');
 const scmTabBadge = document.getElementById('scmTabBadge');
 const editorTabs = document.getElementById('editorTabs');
+const editorPlayMenuBtn = document.getElementById('editorPlayMenuBtn');
+const editorPlayBtn = document.getElementById('editorPlayBtn');
+const editorPlayBtnIcon = document.getElementById('editorPlayBtnIcon');
+const editorPlayBtnLabel = document.getElementById('editorPlayBtnLabel');
+const editorPlayMenu = document.getElementById('editorPlayMenu');
 const editor = document.getElementById('editor');
 const imagePreview = document.getElementById('imagePreview');
 const imagePreviewImg = document.getElementById('imagePreviewImg');
@@ -64,6 +71,22 @@ const httpBodyInput = document.getElementById('httpBodyInput');
 const httpSendBtn = document.getElementById('httpSendBtn');
 const httpResultStatus = document.getElementById('httpResultStatus');
 const httpResultOutput = document.getElementById('httpResultOutput');
+const runDebugNewOptionBtn = document.getElementById('runDebugNewOptionBtn');
+const runDebugRefreshBtn = document.getElementById('runDebugRefreshBtn');
+const runDebugEmptyState = document.getElementById('runDebugEmptyState');
+const runDebugEmptyDescription = document.getElementById('runDebugEmptyDescription');
+const runDebugCreateBtn = document.getElementById('runDebugCreateBtn');
+const runDebugContent = document.getElementById('runDebugContent');
+const runDebugOptionsList = document.getElementById('runDebugOptionsList');
+const runDebugEditor = document.getElementById('runDebugEditor');
+const runDebugEditorTitle = document.getElementById('runDebugEditorTitle');
+const runDebugSaveOptionBtn = document.getElementById('runDebugSaveOptionBtn');
+const runDebugCancelEditBtn = document.getElementById('runDebugCancelEditBtn');
+const runDebugOptionNameInput = document.getElementById('runDebugOptionNameInput');
+const runDebugOptionDescriptionInput = document.getElementById('runDebugOptionDescriptionInput');
+const runDebugOptionDefaultInput = document.getElementById('runDebugOptionDefaultInput');
+const runDebugAddActionBtn = document.getElementById('runDebugAddActionBtn');
+const runDebugActionsList = document.getElementById('runDebugActionsList');
 const terminalPanel = document.getElementById('terminalPanel');
 const terminalContainer = document.getElementById('terminalContainer');
 const terminalResizeHandle = document.getElementById('terminalResizeHandle');
@@ -109,6 +132,9 @@ let inlineEditState = null;
 let explorerClipboard = null;
 let explorerPanelFocused = true;
 let explorerSelectionAnchorPath = null;
+let explorerDragState = null;
+let explorerDropTargetPath = null;
+let explorerRootDropTarget = false;
 let fileSearchContainer = null;
 let fileSearchInput = null;
 let fileSearchResults = null;
@@ -116,6 +142,17 @@ let fileSearchQuery = '';
 let fileSearchDocumentClickBound = false;
 let fileSearchIndex = [];
 let activeSidebarPanel = 'explorer';
+let externalProjectRefreshTimer = null;
+let launchConfigExists = false;
+let launchConfigState = { version: 1, launchOptions: [] };
+let launchConfigLoadError = '';
+let launchEditorState = {
+  open: false,
+  optionId: null,
+  dragActionId: null,
+  draft: null,
+  validationErrors: {}
+};
 let scmRefreshInProgress = false;
 let scmSyncMode = 'fetch';
 let scmState = 'no-project';
@@ -132,9 +169,22 @@ let aiConversationCursor = -1;
 
 const openFiles = new Map();
 const terminalSessions = new Map();
+const runningLaunches = new Map();
+const launchTermToOption = new Map();
 
 const expandedFolders = new Set();
 const explorerSelectedPaths = new Set();
+const isMacPlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || '');
+const explorerShortcutLabel = {
+  open: 'Enter',
+  copy: isMacPlatform ? 'Cmd+C' : 'Ctrl+C',
+  cut: isMacPlatform ? 'Cmd+X' : 'Ctrl+X',
+  paste: isMacPlatform ? 'Cmd+V' : 'Ctrl+V',
+  rename: 'F2',
+  del: isMacPlatform ? 'Backspace' : 'Delete',
+  newFile: isMacPlatform ? 'Cmd+N' : 'Ctrl+N',
+  newFolder: isMacPlatform ? 'Cmd+Shift+N' : 'Ctrl+Shift+N'
+};
 
 const terminal = new Terminal({
   convertEol: true,
@@ -144,7 +194,9 @@ const terminal = new Terminal({
   theme: {
     background: '#0d1723',
     foreground: '#d6e9ff',
-    cursor: '#45d483'
+    cursor: '#45d483',
+    selectionBackground: 'rgba(69, 212, 131, 0.36)',
+    selectionInactiveBackground: 'rgba(69, 212, 131, 0.28)'
   }
 });
 const fitAddon = new FitAddon.FitAddon();
@@ -288,6 +340,101 @@ function clearAiConversationHistory() {
   syncAiChatControls();
 }
 
+function normalizeAiConversationEntries(rawConversation) {
+  if (!Array.isArray(rawConversation)) {
+    return [];
+  }
+
+  const normalized = [];
+  for (const entry of rawConversation) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const role = entry.role === 'assistant' ? 'assistant' : (entry.role === 'user' ? 'user' : null);
+    if (!role) {
+      continue;
+    }
+
+    normalized.push({
+      role,
+      content: String(entry.content || '')
+    });
+  }
+
+  return normalized;
+}
+
+function renderAiConversationFromState() {
+  aiMessages.innerHTML = '';
+  for (let i = 0; i < aiConversation.length; i += 1) {
+    const entry = aiConversation[i];
+    addAiMessage(entry.role, entry.content, { convIndex: i });
+  }
+}
+
+async function loadAiConversationFromDisk() {
+  if (!project.rootPath) {
+    clearAiConversationHistory();
+    return;
+  }
+
+  const chatConfigPath = getAiChatConfigPath();
+  if (!chatConfigPath) {
+    clearAiConversationHistory();
+    return;
+  }
+
+  try {
+    const payload = await api.readFile({ filePath: chatConfigPath, allowMissing: true });
+    if (!payload) {
+      clearAiConversationHistory();
+      return;
+    }
+
+    const raw = typeof payload === 'string' ? payload : payload.content;
+    const parsed = JSON.parse(raw);
+    const source = Array.isArray(parsed) ? parsed : parsed && parsed.conversation;
+    aiConversation = normalizeAiConversationEntries(source);
+    aiConversationCursor = aiConversation.length ? aiConversation.length - 1 : -1;
+    renderAiConversationFromState();
+    syncAiChatControls();
+  } catch {
+    clearAiConversationHistory();
+  }
+}
+
+async function saveAiConversationToDisk() {
+  if (!project.rootPath) {
+    return;
+  }
+
+  const qwcodeFolderPath = getQwcodeStorageFolderPath();
+  const chatConfigPath = getAiChatConfigPath();
+  if (!qwcodeFolderPath || !chatConfigPath) {
+    return;
+  }
+
+  let createdFolder = false;
+  try {
+    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+    createdFolder = true;
+  } catch (error) {
+    if (!isAlreadyExistsError(error)) {
+      throw error;
+    }
+  }
+
+  if (createdFolder) {
+    await maybePromptAddQwcodeToGitignore();
+  }
+
+  await api.writeFile({
+    filePath: chatConfigPath,
+    content: JSON.stringify({ version: 1, conversation: aiConversation }, null, 2)
+  });
+}
+
 function syncAiChatControls() {
   const hasProject = Boolean(project.rootPath);
   const hasKey = Boolean(localStorage.getItem('openai-api-key'));
@@ -382,6 +529,98 @@ function getAiTools() {
         properties: { command: { type: 'string' } },
         required: ['command']
       }
+    },
+    {
+      type: 'function',
+      name: 'open_website',
+      description: 'Open a website URL in the default browser.',
+      parameters: {
+        type: 'object',
+        properties: { url: { type: 'string' } },
+        required: ['url']
+      }
+    },
+    {
+      type: 'function',
+      name: 'get_launch_options',
+      description: 'Get launch options from .qwcode/launch.json. Returns default empty config when file does not exist.',
+      parameters: {
+        type: 'object',
+        properties: {}
+      }
+    },
+    {
+      type: 'function',
+      name: 'create_launch_option',
+      description: 'Create a new launch option in .qwcode/launch.json. Automatically creates .qwcode/launch.json when missing.',
+      parameters: {
+        type: 'object',
+        properties: {
+          option: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              description: { type: 'string' },
+              default: { type: 'boolean' },
+              actions: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: { type: 'string', enum: ['command', 'program', 'url'] },
+                    shell: { type: 'string', enum: ['powershell', 'cmd', 'wsl', 'shell'] },
+                    command: { type: 'string' },
+                    program: { type: 'string' },
+                    args: { type: 'string' },
+                    cwd: { type: 'string' },
+                    url: { type: 'string' },
+                    skipCompletion: { type: 'boolean' }
+                  }
+                }
+              }
+            },
+            required: ['name', 'actions']
+          }
+        },
+        required: ['option']
+      }
+    },
+    {
+      type: 'function',
+      name: 'update_launch_option',
+      description: 'Modify an existing launch option by id. Automatically creates .qwcode/launch.json when missing.',
+      parameters: {
+        type: 'object',
+        properties: {
+          optionId: { type: 'string' },
+          option: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              description: { type: 'string' },
+              default: { type: 'boolean' },
+              actions: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: { type: 'string', enum: ['command', 'program', 'url'] },
+                    shell: { type: 'string', enum: ['powershell', 'cmd', 'wsl', 'shell'] },
+                    command: { type: 'string' },
+                    program: { type: 'string' },
+                    args: { type: 'string' },
+                    cwd: { type: 'string' },
+                    url: { type: 'string' },
+                    skipCompletion: { type: 'boolean' }
+                  }
+                }
+              }
+            },
+            required: ['name', 'actions']
+          }
+        },
+        required: ['optionId', 'option']
+      }
     }
   ];
 }
@@ -457,6 +696,87 @@ async function runAiTool(name, args, signal) {
     const exitCode = result && typeof result.exitCode !== 'undefined' ? result.exitCode : 'unknown';
     addAiActivity(`Command finished (exit ${exitCode}): ${command}`);
     return JSON.stringify(result);
+  }
+
+  if (name === 'open_website') {
+    const url = String(args.url || '').trim();
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error('URL must start with http:// or https://');
+    }
+
+    addAiActivity(`Opening website: ${url}`);
+    await api.openExternal(url);
+    return 'ok';
+  }
+
+  if (name === 'get_launch_options') {
+    addAiActivity('Loading launch options...');
+    await loadLaunchConfigFromDisk();
+    return JSON.stringify({
+      exists: launchConfigExists,
+      config: launchConfigState
+    });
+  }
+
+  if (name === 'create_launch_option') {
+    addAiActivity('Creating launch option...');
+    await ensureLaunchConfigReadyForAiTools();
+
+    const sourceOption = args && typeof args.option === 'object' ? args.option : null;
+    if (!sourceOption) {
+      throw new Error('option is required.');
+    }
+
+    const nextOption = normalizeLaunchOption(sourceOption, launchConfigState.launchOptions.length);
+    validateAiLaunchOption(nextOption, launchConfigState.launchOptions.length + 1);
+    launchConfigState.launchOptions.push(nextOption);
+
+    if (nextOption.default) {
+      for (const option of launchConfigState.launchOptions) {
+        if (option.id !== nextOption.id) {
+          option.default = false;
+        }
+      }
+    }
+
+    await saveLaunchConfigToDisk();
+    renderRunDebugPanel();
+    return JSON.stringify(nextOption);
+  }
+
+  if (name === 'update_launch_option') {
+    addAiActivity('Updating launch option...');
+    await ensureLaunchConfigReadyForAiTools();
+
+    const optionId = String(args.optionId || '').trim();
+    const sourceOption = args && typeof args.option === 'object' ? args.option : null;
+    if (!optionId) {
+      throw new Error('optionId is required.');
+    }
+    if (!sourceOption) {
+      throw new Error('option is required.');
+    }
+
+    const index = launchConfigState.launchOptions.findIndex((entry) => entry.id === optionId);
+    if (index < 0) {
+      throw new Error(`Launch option not found: ${optionId}`);
+    }
+
+    const nextOption = normalizeLaunchOption({ ...sourceOption, id: optionId }, index);
+    validateAiLaunchOption(nextOption, index + 1);
+    launchConfigState.launchOptions[index] = nextOption;
+
+    if (nextOption.default) {
+      for (const option of launchConfigState.launchOptions) {
+        if (option.id !== nextOption.id) {
+          option.default = false;
+        }
+      }
+    }
+
+    await saveLaunchConfigToDisk();
+    renderRunDebugPanel();
+    return JSON.stringify(nextOption);
   }
 
   throw new Error(`Unknown tool: ${name}`);
@@ -601,7 +921,9 @@ function applyTheme(mode) {
   terminal.options.theme = {
     background: isLight ? '#ffffff' : '#0d1723',
     foreground: isLight ? '#1f2a3a' : '#d6e9ff',
-    cursor: isLight ? '#6f67ff' : '#766ff0'
+    cursor: isLight ? '#6f67ff' : '#766ff0',
+    selectionBackground: isLight ? 'rgba(111, 103, 255, 0.66)' : 'rgba(69, 212, 131, 0.36)',
+    selectionInactiveBackground: isLight ? 'rgba(111, 103, 255, 0.58)' : 'rgba(69, 212, 131, 0.28)'
   };
 
   api.setAppTheme(themeMode).catch(() => {});
@@ -621,15 +943,15 @@ terminal.onData((data) => {
 
 function getTerminalTypeLabel(profileId) {
   if (profileId === 'cmd') {
-    return 'CMD';
+    return 'cmd';
   }
   if (profileId === 'wsl') {
-    return 'WSL';
+    return 'wsl';
   }
   if (profileId === 'shell') {
-    return 'SH';
+    return 'shell';
   }
-  return 'PS';
+  return 'powershell';
 }
 
 function closeTerminalTypeMenu() {
@@ -666,7 +988,7 @@ function renderTerminalTabs() {
 
     const label = document.createElement('span');
     label.className = 'terminal-tab-label';
-    label.textContent = `${session.profileLabel} ${session.index}`;
+    label.textContent = session.profileLabel;
 
     const close = document.createElement('button');
     close.type = 'button';
@@ -718,6 +1040,7 @@ function bindTerminalBridgeEvents() {
     }
 
     session.buffer += data;
+    onLaunchTerminalData(termId);
     if (termId === activeTerminalId) {
       terminal.write(data);
     }
@@ -732,6 +1055,7 @@ function bindTerminalBridgeEvents() {
     session.exited = true;
     const message = `\r\n[Process exited with code ${exitCode}]`;
     session.buffer += message;
+    onLaunchTerminalExit(termId);
     if (termId === activeTerminalId) {
       terminal.writeln(`\r\n[Process exited with code ${exitCode}]`);
     }
@@ -757,6 +1081,7 @@ async function createTerminalSession(shellType = 'powershell') {
 
   terminalSessions.set(created.termId, session);
   setActiveTerminal(created.termId);
+  return created.termId;
 }
 
 async function killTerminalSession(termId) {
@@ -764,6 +1089,7 @@ async function killTerminalSession(termId) {
     return;
   }
 
+  clearLaunchRuntimeByTermId(termId, true);
   api.killTerminal({ termId });
   terminalSessions.delete(termId);
 
@@ -787,6 +1113,7 @@ function killAllTerminalSessions() {
   }
 
   terminalSessions.clear();
+  clearAllLaunchRuntime(false);
   activeTerminalId = null;
   terminal.clear();
   renderTerminalTabs();
@@ -953,6 +1280,218 @@ function getExplorerContextEntries(contextNode) {
   return [{ path: contextNode.path, type: contextNode.type, name: contextNode.name }];
 }
 
+function getCurrentExplorerContextEntries() {
+  if (!selectedNodePath) {
+    return [];
+  }
+
+  const node = getTreeNodeByPath(project.tree, selectedNodePath);
+  if (!node) {
+    return [];
+  }
+
+  return getExplorerContextEntries(node);
+}
+
+function getExplorerPrimaryContextNode() {
+  if (!selectedNodePath) {
+    return null;
+  }
+
+  return getTreeNodeByPath(project.tree, selectedNodePath);
+}
+
+function isKeyboardEventFromEditableTarget(event) {
+  const target = event && event.target;
+  if (!target || typeof target.closest !== 'function') {
+    return false;
+  }
+
+  return Boolean(target.closest('input, textarea, [contenteditable="true"], .monaco-editor'));
+}
+
+function hasBlockingOverlayOpen() {
+  return Boolean(document.querySelector('.help-overlay:not(.hidden)'));
+}
+
+function focusExplorerNodeRow(nodePath) {
+  if (!nodePath || !treeRoot) {
+    return;
+  }
+
+  const selector = `.tree-node[data-path="${CSS.escape(nodePath)}"]`;
+  const row = treeRoot.querySelector(selector);
+  if (row && typeof row.scrollIntoView === 'function') {
+    row.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function moveExplorerSelection(step, extendSelection) {
+  const visiblePaths = getExplorerVisiblePaths();
+  if (!visiblePaths.length) {
+    return false;
+  }
+
+  const currentIndex = selectedNodePath ? visiblePaths.indexOf(selectedNodePath) : -1;
+  const fallbackIndex = step > 0 ? -1 : visiblePaths.length;
+  const baseIndex = currentIndex >= 0 ? currentIndex : fallbackIndex;
+  const nextIndex = Math.max(0, Math.min(visiblePaths.length - 1, baseIndex + step));
+  const targetPath = visiblePaths[nextIndex];
+  if (!targetPath) {
+    return false;
+  }
+
+  if (extendSelection) {
+    setExplorerRangeSelection(targetPath);
+  } else {
+    setExplorerSingleSelection(targetPath);
+  }
+
+  renderTree();
+  focusExplorerNodeRow(targetPath);
+  return true;
+}
+
+function setExplorerClipboardFromEntries(mode, entries) {
+  if (!entries.length) {
+    return false;
+  }
+
+  explorerClipboard = {
+    mode,
+    items: entries.map((entry) => ({ sourcePath: entry.path, type: entry.type }))
+  };
+
+  return true;
+}
+
+async function handleExplorerKeyboardShortcut(event) {
+  if (activeSidebarPanel !== 'explorer' || !explorerPanelFocused || !project.rootPath) {
+    return false;
+  }
+
+  if (inlineEditState || hasBlockingOverlayOpen() || isKeyboardEventFromEditableTarget(event)) {
+    return false;
+  }
+
+  const key = String(event.key || '').toLowerCase();
+  const hasPrimaryModifier = event.ctrlKey || event.metaKey;
+
+  if (key === 'arrowdown') {
+    return moveExplorerSelection(1, event.shiftKey);
+  }
+
+  if (key === 'arrowup') {
+    return moveExplorerSelection(-1, event.shiftKey);
+  }
+
+  if (key === 'enter') {
+    const node = getExplorerPrimaryContextNode();
+    if (!node) {
+      return false;
+    }
+
+    if (node.type === 'folder') {
+      if (expandedFolders.has(node.path)) {
+        expandedFolders.delete(node.path);
+      } else {
+        expandedFolders.add(node.path);
+      }
+      renderTree();
+      return true;
+    }
+
+    await openFile(node.path, { mode: 'permanent' });
+    renderTree();
+    return true;
+  }
+
+  if (key === 'f2') {
+    const node = getExplorerPrimaryContextNode();
+    if (!node || explorerSelectedPaths.size > 1) {
+      return false;
+    }
+
+    startInlineRename(node.path, node.type);
+    return true;
+  }
+
+  if (key === 'delete' || (isMacPlatform && key === 'backspace')) {
+    const contextEntries = getCurrentExplorerContextEntries();
+    if (!contextEntries.length) {
+      return false;
+    }
+
+    const hasMultiSelection = contextEntries.length > 1;
+    const primaryNode = getExplorerPrimaryContextNode();
+    const message = hasMultiSelection
+      ? `Delete ${contextEntries.length} selected items? This cannot be undone.`
+      : `Delete ${primaryNode ? primaryNode.name : 'selected item'}? This cannot be undone.`;
+    const shouldDelete = await showConfirmDialog({
+      title: 'Delete',
+      message,
+      confirmLabel: 'Delete',
+      confirmStyle: 'danger'
+    });
+    if (!shouldDelete) {
+      return true;
+    }
+
+    await deleteExplorerEntries(contextEntries);
+    return true;
+  }
+
+  if (hasPrimaryModifier && key === 'n') {
+    if (event.shiftKey) {
+      await createNewFolder();
+    } else {
+      await createNewFile();
+    }
+    return true;
+  }
+
+  if (hasPrimaryModifier && key === 'a') {
+    const visiblePaths = getExplorerVisiblePaths();
+    if (!visiblePaths.length) {
+      return false;
+    }
+
+    explorerSelectedPaths.clear();
+    for (const visiblePath of visiblePaths) {
+      explorerSelectedPaths.add(visiblePath);
+    }
+
+    const anchor = selectedNodePath && explorerSelectedPaths.has(selectedNodePath)
+      ? selectedNodePath
+      : visiblePaths[0];
+    selectedNodePath = anchor;
+    explorerSelectionAnchorPath = anchor;
+    renderTree();
+    focusExplorerNodeRow(anchor);
+    return true;
+  }
+
+  if (hasPrimaryModifier && key === 'c') {
+    return setExplorerClipboardFromEntries('copy', getCurrentExplorerContextEntries());
+  }
+
+  if (hasPrimaryModifier && key === 'x') {
+    return setExplorerClipboardFromEntries('cut', getCurrentExplorerContextEntries());
+  }
+
+  if (hasPrimaryModifier && key === 'v') {
+    const destination = getTargetFolderPath();
+    if (!destination || !explorerClipboard) {
+      return false;
+    }
+
+    await pasteIntoPath(destination);
+    return true;
+  }
+
+  return false;
+}
+
 function compactExplorerEntries(entries) {
   const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
   const compacted = [];
@@ -965,6 +1504,102 @@ function compactExplorerEntries(entries) {
   }
 
   return compacted;
+}
+
+function setExplorerDropTargetPath(targetPath) {
+  const next = targetPath || null;
+  if (explorerDropTargetPath === next) {
+    return;
+  }
+
+  if (explorerDropTargetPath && treeRoot) {
+    const prevSelector = `.tree-node[data-path="${CSS.escape(explorerDropTargetPath)}"]`;
+    const prev = treeRoot.querySelector(prevSelector);
+    if (prev) {
+      prev.classList.remove('drag-over');
+    }
+  }
+
+  explorerDropTargetPath = next;
+
+  if (explorerDropTargetPath && treeRoot) {
+    const nextSelector = `.tree-node[data-path="${CSS.escape(explorerDropTargetPath)}"]`;
+    const nextNode = treeRoot.querySelector(nextSelector);
+    if (nextNode) {
+      nextNode.classList.add('drag-over');
+    }
+  }
+}
+
+function setExplorerRootDropTarget(active) {
+  const next = Boolean(active);
+  if (explorerRootDropTarget === next) {
+    return;
+  }
+
+  explorerRootDropTarget = next;
+  if (treeRoot) {
+    treeRoot.classList.toggle('root-drag-over', explorerRootDropTarget);
+  }
+}
+
+function clearExplorerDragVisualState() {
+  setExplorerDropTargetPath(null);
+  setExplorerRootDropTarget(false);
+}
+
+function getDragEntriesForNode(node) {
+  if (!node) {
+    return [];
+  }
+
+  const entries = explorerSelectedPaths.size > 1 && explorerSelectedPaths.has(node.path)
+    ? getExplorerContextEntries(node)
+    : [{ path: node.path, type: node.type, name: node.name }];
+
+  return compactExplorerEntries(entries);
+}
+
+function getParentFolderPath(targetPath) {
+  return String(targetPath || '').replace(/[\\/][^\\/]+$/, '');
+}
+
+function canMoveEntriesToDestination(entries, destinationPath) {
+  if (!entries.length || !destinationPath) {
+    return false;
+  }
+
+  const destinationNormalized = normalizeExplorerPath(destinationPath);
+  for (const entry of entries) {
+    const sourceNormalized = normalizeExplorerPath(entry.path);
+    if (!sourceNormalized || sourceNormalized === destinationNormalized) {
+      return false;
+    }
+
+    if (entry.type === 'folder' && isPathWithinFolderPath(destinationPath, entry.path)) {
+      return false;
+    }
+
+    if (normalizeExplorerPath(getParentFolderPath(entry.path)) === destinationNormalized) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+async function moveExplorerEntries(entries, destinationPath) {
+  const compacted = compactExplorerEntries(entries);
+  if (!canMoveEntriesToDestination(compacted, destinationPath)) {
+    return;
+  }
+
+  for (const entry of compacted) {
+    await api.movePath({ sourcePath: entry.path, destinationDir: destinationPath });
+  }
+
+  setExplorerSingleSelection(destinationPath);
+  await refreshProjectTree();
 }
 
 function getOpenTabsUnderEntry(entry) {
@@ -1011,15 +1646,27 @@ async function deleteExplorerEntries(entries) {
 function setSidebarPanel(panelName) {
   activeSidebarPanel = panelName;
   const isExplorer = panelName === 'explorer';
+  const isRunDebug = panelName === 'run-debug';
   const isSourceControl = panelName === 'source-control';
   const isHttp = panelName === 'http';
 
   sidebarTabExplorer.classList.toggle('active', isExplorer);
+  sidebarTabRunDebug.classList.toggle('active', isRunDebug);
   sidebarTabSourceControl.classList.toggle('active', isSourceControl);
   sidebarTabHttp.classList.toggle('active', isHttp);
   explorerPanelView.classList.toggle('active', isExplorer);
+  runDebugPanelView.classList.toggle('active', isRunDebug);
   sourceControlPanelView.classList.toggle('active', isSourceControl);
   httpPanelView.classList.toggle('active', isHttp);
+
+  if (isRunDebug) {
+    loadLaunchConfigFromDisk().catch((error) => {
+      launchConfigLoadError = error.message || String(error);
+      launchConfigExists = false;
+      launchConfigState = createDefaultLaunchConfig();
+      renderRunDebugPanel();
+    });
+  }
 
   if (isSourceControl) {
     refreshSourceControlPanel();
@@ -1109,6 +1756,1823 @@ async function sendHttpRequestFromPanel() {
     httpSendBtn.disabled = false;
     httpSendBtn.textContent = 'Send Request';
   }
+}
+
+function createDefaultLaunchConfig() {
+  return {
+    version: 1,
+    launchOptions: []
+  };
+}
+
+function createLaunchId(prefix = 'entry') {
+  return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}-${prefix}`;
+}
+
+function createDefaultLaunchAction(type = 'command') {
+  if (type === 'url') {
+    return {
+      id: createLaunchId('action-url'),
+      type: 'url',
+      url: ''
+    };
+  }
+
+  if (type === 'program') {
+    return {
+      id: createLaunchId('action-program'),
+      type: 'program',
+      shell: 'powershell',
+      program: '',
+      args: '',
+      cwd: ''
+    };
+  }
+
+  return {
+    id: createLaunchId('action-command'),
+    type: 'command',
+    shell: 'powershell',
+    command: '',
+    skipCompletion: false,
+    cwd: ''
+  };
+}
+
+function createDefaultLaunchOptionDraft() {
+  return {
+    id: createLaunchId('launch-option'),
+    name: 'New Launch Option',
+    description: '',
+    default: false,
+    actions: [createDefaultLaunchAction('command')]
+  };
+}
+
+function joinPathSegments(basePath, childPath) {
+  const base = String(basePath || '').replace(/[\\/]+$/, '');
+  const child = String(childPath || '').replace(/^[\\/]+/, '');
+  if (!base) {
+    return child;
+  }
+  if (!child) {
+    return base;
+  }
+  return `${base}\\${child}`;
+}
+
+function isAbsolutePathInput(inputPath) {
+  const candidate = String(inputPath || '').trim();
+  return /^[A-Za-z]:[\\/]/.test(candidate) || candidate.startsWith('\\\\') || candidate.startsWith('/');
+}
+
+function getQwcodeStorageFolderPath() {
+  if (!project.rootPath) {
+    return null;
+  }
+  return joinPathSegments(project.rootPath, '.qwcode');
+}
+
+function getLaunchStorageFolderPath() {
+  return getQwcodeStorageFolderPath();
+}
+
+function getAiChatConfigPath() {
+  const folderPath = getQwcodeStorageFolderPath();
+  if (!folderPath) {
+    return null;
+  }
+  return joinPathSegments(folderPath, 'chat.json');
+}
+
+function getLaunchConfigPath() {
+  const folderPath = getLaunchStorageFolderPath();
+  if (!folderPath) {
+    return null;
+  }
+  return joinPathSegments(folderPath, 'launch.json');
+}
+
+function normalizeLaunchShell(value) {
+  const shell = String(value || '').trim().toLowerCase();
+  if (shell === 'cmd' || shell === 'wsl' || shell === 'shell') {
+    return shell;
+  }
+  return 'powershell';
+}
+
+function normalizeLaunchAction(rawAction, index = 0) {
+  const input = rawAction && typeof rawAction === 'object' ? rawAction : {};
+  const type = input.type === 'program' || input.type === 'url' ? input.type : 'command';
+  const action = {
+    id: typeof input.id === 'string' && input.id.trim() ? input.id.trim() : createLaunchId(`action-${index + 1}`),
+    type
+  };
+
+  if (type === 'url') {
+    action.url = typeof input.url === 'string' ? input.url : '';
+    return action;
+  }
+
+  action.shell = normalizeLaunchShell(input.shell);
+  action.cwd = typeof input.cwd === 'string' ? input.cwd : '';
+
+  if (type === 'program') {
+    action.program = typeof input.program === 'string' ? input.program : '';
+    action.args = typeof input.args === 'string' ? input.args : '';
+    return action;
+  }
+
+  action.command = typeof input.command === 'string' ? input.command : '';
+  action.skipCompletion = input.skipCompletion === true
+    || input.skipCompletion === 1
+    || String(input.skipCompletion || '').trim().toLowerCase() === 'true';
+  return action;
+}
+
+function normalizeLaunchOption(rawOption, index = 0) {
+  const input = rawOption && typeof rawOption === 'object' ? rawOption : {};
+  const rawActions = Array.isArray(input.actions) ? input.actions : [];
+  const actions = rawActions.map((entry, actionIndex) => normalizeLaunchAction(entry, actionIndex));
+  const normalizedDefault = input.default === true
+    || input.default === 1
+    || String(input.default || '').trim().toLowerCase() === 'true';
+
+  return {
+    id: typeof input.id === 'string' && input.id.trim() ? input.id.trim() : createLaunchId(`option-${index + 1}`),
+    name: typeof input.name === 'string' && input.name.trim() ? input.name.trim() : `Launch ${index + 1}`,
+    description: typeof input.description === 'string' ? input.description : '',
+    default: normalizedDefault,
+    actions
+  };
+}
+
+function normalizeLaunchConfig(rawConfig) {
+  const input = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
+  const source = Array.isArray(input.launchOptions)
+    ? input.launchOptions
+    : (Array.isArray(input.options) ? input.options : []);
+
+  return {
+    version: Number.isFinite(input.version) ? Number(input.version) : 1,
+    launchOptions: source.map((entry, index) => normalizeLaunchOption(entry, index))
+  };
+}
+
+function cloneLaunchAction(action) {
+  return normalizeLaunchAction(action, 0);
+}
+
+function cloneLaunchOption(option) {
+  const normalized = normalizeLaunchOption(option, 0);
+  return {
+    ...normalized,
+    actions: normalized.actions.map((action) => cloneLaunchAction(action))
+  };
+}
+
+function getLaunchOptionById(optionId) {
+  return launchConfigState.launchOptions.find((option) => option.id === optionId) || null;
+}
+
+function getDefaultLaunchOption(options = launchConfigState.launchOptions) {
+  if (!Array.isArray(options)) {
+    return null;
+  }
+
+  return options.find((option) => option && option.default === true) || null;
+}
+
+function getLaunchActionIconClass(actionType) {
+  if (actionType === 'program') {
+    return 'run-debug-action-icon-program';
+  }
+
+  if (actionType === 'url') {
+    return 'run-debug-action-icon-url';
+  }
+
+  return 'run-debug-action-icon-command';
+}
+
+function getLaunchActionSummary(action) {
+  if (!action) {
+    return '(invalid action)';
+  }
+
+  if (action.type === 'url') {
+    return action.url ? `Open URL: ${action.url}` : 'Open URL';
+  }
+
+  if (action.type === 'program') {
+    const shellLabel = action.shell === 'cmd' ? 'CMD' : (action.shell === 'wsl' ? 'WSL' : 'PowerShell');
+    const target = `${String(action.program || '').trim()} ${String(action.args || '').trim()}`.trim() || '(program path required)';
+    const cwd = String(action.cwd || '').trim();
+    return cwd ? `${shellLabel}: ${target}  [cwd: ${cwd}]` : `${shellLabel}: ${target}`;
+  }
+
+  const shellLabel = action.shell === 'cmd' ? 'CMD' : (action.shell === 'wsl' ? 'WSL' : 'PowerShell');
+  const command = String(action.command || '').trim() || '(command required)';
+  const cwd = String(action.cwd || '').trim();
+  const skipTag = action.skipCompletion ? '  [skip completion]' : '';
+  return cwd ? `${shellLabel}: ${command}  [cwd: ${cwd}]${skipTag}` : `${shellLabel}: ${command}${skipTag}`;
+}
+
+function syncRunDebugToolbarVisibility(showToolbar) {
+  runDebugNewOptionBtn.classList.toggle('hidden', !showToolbar);
+  runDebugRefreshBtn.classList.toggle('hidden', !Boolean(project.rootPath));
+}
+
+function renderRunDebugOptionsList() {
+  runDebugOptionsList.innerHTML = '';
+
+  if (!launchConfigExists) {
+    return;
+  }
+
+  const options = Array.isArray(launchConfigState.launchOptions) ? launchConfigState.launchOptions : [];
+  if (!options.length) {
+    const emptyCard = document.createElement('div');
+    emptyCard.className = 'run-debug-option-card';
+
+    const hint = document.createElement('div');
+    hint.className = 'run-debug-option-desc';
+    hint.textContent = 'No launch options yet. Use the + button to create one.';
+
+    emptyCard.appendChild(hint);
+    runDebugOptionsList.appendChild(emptyCard);
+    return;
+  }
+
+  for (const option of options) {
+    const card = document.createElement('div');
+    card.className = 'run-debug-option-card';
+
+    const header = document.createElement('div');
+    header.className = 'run-debug-option-header';
+
+    const runBtn = document.createElement('button');
+    runBtn.type = 'button';
+    const isRunning = isLaunchOptionRunning(option.id);
+    runBtn.className = `run-debug-icon-btn${isRunning ? ' running' : ''}`;
+    runBtn.title = isRunning ? 'Stop launch option' : 'Run launch option';
+    runBtn.setAttribute('aria-label', runBtn.title);
+
+    const runIcon = document.createElement('span');
+    runIcon.className = `run-debug-icon ${isRunning ? 'run-debug-icon-stop' : 'run-debug-icon-play'}`;
+    runIcon.setAttribute('aria-hidden', 'true');
+    runBtn.appendChild(runIcon);
+
+    runBtn.addEventListener('click', async () => {
+      try {
+        if (isLaunchOptionRunning(option.id)) {
+          await stopLaunchOption(option.id);
+        } else {
+          await startLaunchOption(option.id);
+        }
+      } catch (error) {
+        alert(error.message || String(error));
+      }
+    });
+
+    const meta = document.createElement('div');
+    meta.className = 'run-debug-option-meta';
+
+    const title = document.createElement('div');
+    title.className = 'run-debug-option-name';
+    title.textContent = option.name || 'Untitled launch option';
+
+    const desc = document.createElement('div');
+    desc.className = 'run-debug-option-desc';
+    const actionCount = Array.isArray(option.actions) ? option.actions.length : 0;
+    const description = String(option.description || '').trim();
+    const descParts = [];
+    if (option.default) {
+      descParts.push('Default');
+    }
+    descParts.push(description || `${actionCount} action${actionCount === 1 ? '' : 's'}`);
+    desc.textContent = descParts.join(' • ');
+
+    meta.appendChild(title);
+    meta.appendChild(desc);
+
+    const headerActions = document.createElement('div');
+    headerActions.className = 'run-debug-option-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'run-debug-icon-btn';
+    editBtn.title = 'Edit launch option';
+    editBtn.setAttribute('aria-label', 'Edit launch option');
+    editBtn.innerHTML = '<span class="run-debug-icon run-debug-icon-edit" aria-hidden="true"></span>';
+    editBtn.addEventListener('click', () => {
+      openLaunchEditor(option.id);
+    });
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'run-debug-icon-btn danger';
+    deleteBtn.title = 'Delete launch option';
+    deleteBtn.setAttribute('aria-label', 'Delete launch option');
+    deleteBtn.innerHTML = '<span class="run-debug-icon run-debug-icon-delete" aria-hidden="true"></span>';
+    deleteBtn.addEventListener('click', async () => {
+      await deleteLaunchOption(option.id);
+    });
+
+    headerActions.appendChild(editBtn);
+    headerActions.appendChild(deleteBtn);
+
+    header.appendChild(runBtn);
+    header.appendChild(meta);
+    header.appendChild(headerActions);
+
+    const summary = document.createElement('div');
+    summary.className = 'run-debug-option-summary';
+    const actions = Array.isArray(option.actions) ? option.actions : [];
+    const maxPreview = 4;
+
+    for (const action of actions.slice(0, maxPreview)) {
+      const line = document.createElement('div');
+      line.className = 'run-debug-option-action';
+
+      const icon = document.createElement('span');
+      icon.className = `run-debug-option-action-icon ${getLaunchActionIconClass(action.type)}`;
+
+      const text = document.createElement('span');
+      text.className = 'run-debug-option-action-text';
+      text.textContent = getLaunchActionSummary(action);
+
+      line.appendChild(icon);
+      line.appendChild(text);
+      summary.appendChild(line);
+    }
+
+    if (actions.length > maxPreview) {
+      const overflowLine = document.createElement('div');
+      overflowLine.className = 'run-debug-option-desc';
+      overflowLine.textContent = `+${actions.length - maxPreview} more action${actions.length - maxPreview === 1 ? '' : 's'}`;
+      summary.appendChild(overflowLine);
+    }
+
+    card.appendChild(header);
+    card.appendChild(summary);
+    runDebugOptionsList.appendChild(card);
+  }
+}
+
+function closeLaunchEditor() {
+  launchEditorState.open = false;
+  launchEditorState.optionId = null;
+  launchEditorState.dragActionId = null;
+  launchEditorState.draft = null;
+  launchEditorState.validationErrors = {};
+}
+
+function openLaunchEditor(optionId = null) {
+  const existing = optionId ? getLaunchOptionById(optionId) : null;
+  launchEditorState.open = true;
+  launchEditorState.optionId = existing ? existing.id : null;
+  launchEditorState.dragActionId = null;
+  launchEditorState.draft = existing ? cloneLaunchOption(existing) : createDefaultLaunchOptionDraft();
+  launchEditorState.validationErrors = {};
+
+  renderRunDebugPanel();
+  requestAnimationFrame(() => {
+    runDebugOptionNameInput.focus();
+    runDebugOptionNameInput.select();
+  });
+}
+
+function getLaunchEditorValidationError(fieldKey) {
+  if (!launchEditorState || !launchEditorState.validationErrors) {
+    return '';
+  }
+
+  return String(launchEditorState.validationErrors[fieldKey] || '');
+}
+
+function setLaunchEditorValidationErrors(nextErrors = {}) {
+  launchEditorState.validationErrors = nextErrors && typeof nextErrors === 'object' ? { ...nextErrors } : {};
+}
+
+function clearLaunchEditorValidationError(fieldKey) {
+  if (!launchEditorState || !launchEditorState.validationErrors || !launchEditorState.validationErrors[fieldKey]) {
+    return;
+  }
+
+  delete launchEditorState.validationErrors[fieldKey];
+}
+
+function createLaunchFieldErrorElement(fieldKey, message) {
+  const error = document.createElement('div');
+  error.className = 'run-debug-field-error';
+  error.dataset.fieldKey = fieldKey;
+
+  const icon = document.createElement('span');
+  icon.className = 'run-debug-field-error-icon';
+  icon.textContent = '!';
+
+  const text = document.createElement('span');
+  text.className = 'run-debug-field-error-text';
+  text.textContent = message;
+
+  error.appendChild(icon);
+  error.appendChild(text);
+  return error;
+}
+
+function removeLaunchFieldErrorByKey(fieldKey) {
+  const errors = runDebugEditor.querySelectorAll('.run-debug-field-error');
+  for (const error of errors) {
+    if (error.dataset.fieldKey === fieldKey) {
+      error.remove();
+    }
+  }
+}
+
+function attachLaunchFieldErrorAfter(inputElement, fieldKey) {
+  const message = getLaunchEditorValidationError(fieldKey);
+  if (!message || !inputElement || !inputElement.parentNode) {
+    return;
+  }
+
+  const error = createLaunchFieldErrorElement(fieldKey, message);
+  inputElement.insertAdjacentElement('afterend', error);
+}
+
+function moveLaunchDraftAction(draggedActionId, targetActionId, insertAfter) {
+  if (!launchEditorState.draft || !Array.isArray(launchEditorState.draft.actions)) {
+    return;
+  }
+
+  const actions = launchEditorState.draft.actions;
+  const fromIndex = actions.findIndex((entry) => entry.id === draggedActionId);
+  const targetIndex = actions.findIndex((entry) => entry.id === targetActionId);
+  if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) {
+    return;
+  }
+
+  const [moved] = actions.splice(fromIndex, 1);
+  let nextIndex = targetIndex;
+  if (fromIndex < targetIndex) {
+    nextIndex -= 1;
+  }
+
+  if (insertAfter) {
+    nextIndex += 1;
+  }
+
+  actions.splice(nextIndex, 0, moved);
+  renderRunDebugPanel();
+}
+
+function renderRunDebugEditor() {
+  const isOpen = Boolean(launchEditorState.open && launchEditorState.draft);
+  runDebugEditor.classList.toggle('hidden', !isOpen);
+  runDebugActionsList.innerHTML = '';
+  runDebugEditor.querySelectorAll('.run-debug-field-error').forEach((entry) => entry.remove());
+
+  if (!isOpen) {
+    runDebugOptionDefaultInput.checked = false;
+    return;
+  }
+
+  const draft = launchEditorState.draft;
+  runDebugEditorTitle.textContent = launchEditorState.optionId ? 'Edit Launch Option' : 'New Launch Option';
+  runDebugOptionNameInput.value = draft.name || '';
+  runDebugOptionDescriptionInput.value = draft.description || '';
+  runDebugOptionDefaultInput.checked = Boolean(draft.default);
+  attachLaunchFieldErrorAfter(runDebugOptionNameInput, 'option.name');
+
+  const actions = Array.isArray(draft.actions) ? draft.actions : [];
+  const actionsError = getLaunchEditorValidationError('actions');
+  if (actionsError) {
+    runDebugActionsList.appendChild(createLaunchFieldErrorElement('actions', actionsError));
+  }
+
+  for (const action of actions) {
+    const row = document.createElement('div');
+    row.className = 'run-debug-action-row';
+    row.draggable = true;
+    row.dataset.actionId = action.id;
+
+    row.addEventListener('dragstart', (event) => {
+      launchEditorState.dragActionId = action.id;
+      row.classList.add('dragging');
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', action.id);
+      }
+    });
+
+    row.addEventListener('dragend', () => {
+      row.classList.remove('dragging');
+      launchEditorState.dragActionId = null;
+      runDebugActionsList.querySelectorAll('.run-debug-action-row.drag-target').forEach((entry) => {
+        entry.classList.remove('drag-target');
+      });
+    });
+
+    row.addEventListener('dragover', (event) => {
+      if (!launchEditorState.dragActionId || launchEditorState.dragActionId === action.id) {
+        return;
+      }
+      event.preventDefault();
+      row.classList.add('drag-target');
+    });
+
+    row.addEventListener('dragleave', () => {
+      row.classList.remove('drag-target');
+    });
+
+    row.addEventListener('drop', (event) => {
+      event.preventDefault();
+      row.classList.remove('drag-target');
+
+      const draggedActionId = launchEditorState.dragActionId;
+      if (!draggedActionId || draggedActionId === action.id) {
+        return;
+      }
+
+      const rect = row.getBoundingClientRect();
+      const insertAfter = event.clientY > (rect.top + rect.height / 2);
+      moveLaunchDraftAction(draggedActionId, action.id, insertAfter);
+    });
+
+    const mainRow = document.createElement('div');
+    mainRow.className = 'run-debug-action-main';
+
+    const dragHandle = document.createElement('span');
+    dragHandle.className = 'run-debug-drag-handle';
+    dragHandle.title = 'Drag to reorder';
+    dragHandle.innerHTML = '<span class="run-debug-icon run-debug-icon-grip" aria-hidden="true"></span>';
+
+    const typeSelect = document.createElement('select');
+    typeSelect.className = 'run-debug-select';
+    const typeOptions = [
+      { value: 'command', label: 'Command' },
+      { value: 'program', label: 'Program' },
+      { value: 'url', label: 'Website URL' }
+    ];
+    for (const option of typeOptions) {
+      const element = document.createElement('option');
+      element.value = option.value;
+      element.textContent = option.label;
+      if (action.type === option.value) {
+        element.selected = true;
+      }
+      typeSelect.appendChild(element);
+    }
+    typeSelect.addEventListener('change', () => {
+      const nextType = typeSelect.value;
+      const replacement = createDefaultLaunchAction(nextType);
+      replacement.id = action.id;
+      const index = draft.actions.findIndex((entry) => entry.id === action.id);
+      if (index >= 0) {
+        draft.actions[index] = replacement;
+      }
+      renderRunDebugPanel();
+    });
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'run-debug-icon-btn danger';
+    removeBtn.title = 'Remove action';
+    removeBtn.setAttribute('aria-label', 'Remove action');
+    removeBtn.innerHTML = '<span class="run-debug-icon run-debug-icon-delete" aria-hidden="true"></span>';
+    removeBtn.addEventListener('click', () => {
+      const index = draft.actions.findIndex((entry) => entry.id === action.id);
+      if (index < 0) {
+        return;
+      }
+      draft.actions.splice(index, 1);
+      renderRunDebugPanel();
+    });
+
+    mainRow.appendChild(dragHandle);
+    mainRow.appendChild(typeSelect);
+    mainRow.appendChild(removeBtn);
+
+    const fields = document.createElement('div');
+    fields.className = 'run-debug-action-fields';
+
+    if (action.type === 'url') {
+      const urlInput = document.createElement('input');
+      urlInput.className = 'run-debug-input';
+      urlInput.type = 'text';
+      urlInput.placeholder = 'https://example.com';
+      urlInput.value = action.url || '';
+      urlInput.addEventListener('input', () => {
+        action.url = urlInput.value;
+        const fieldKey = `action.${action.id}.url`;
+        clearLaunchEditorValidationError(fieldKey);
+        removeLaunchFieldErrorByKey(fieldKey);
+      });
+      fields.appendChild(urlInput);
+      attachLaunchFieldErrorAfter(urlInput, `action.${action.id}.url`);
+    } else {
+      const shellCwdGrid = document.createElement('div');
+      shellCwdGrid.className = 'run-debug-action-grid-two';
+
+      const shellSelect = document.createElement('select');
+      shellSelect.className = 'run-debug-select';
+      const shellOptions = [
+        { value: 'powershell', label: 'PowerShell' },
+        { value: 'cmd', label: 'Command Prompt' },
+        { value: 'wsl', label: 'WSL' }
+      ];
+      for (const option of shellOptions) {
+        const item = document.createElement('option');
+        item.value = option.value;
+        item.textContent = option.label;
+        if (action.shell === option.value) {
+          item.selected = true;
+        }
+        shellSelect.appendChild(item);
+      }
+      shellSelect.addEventListener('change', () => {
+        action.shell = normalizeLaunchShell(shellSelect.value);
+      });
+
+      const cwdInput = document.createElement('input');
+      cwdInput.className = 'run-debug-input';
+      cwdInput.type = 'text';
+      cwdInput.placeholder = 'Relative or absolute working directory';
+      cwdInput.value = action.cwd || '';
+      cwdInput.addEventListener('input', () => {
+        action.cwd = cwdInput.value;
+      });
+
+      shellCwdGrid.appendChild(shellSelect);
+      shellCwdGrid.appendChild(cwdInput);
+      fields.appendChild(shellCwdGrid);
+
+      if (action.type === 'program') {
+        const programGrid = document.createElement('div');
+        programGrid.className = 'run-debug-action-grid-two';
+
+        const programInput = document.createElement('input');
+        programInput.className = 'run-debug-input';
+        programInput.type = 'text';
+        programInput.placeholder = 'Program path or executable';
+        programInput.value = action.program || '';
+        programInput.addEventListener('input', () => {
+          action.program = programInput.value;
+          const fieldKey = `action.${action.id}.program`;
+          clearLaunchEditorValidationError(fieldKey);
+          removeLaunchFieldErrorByKey(fieldKey);
+        });
+
+        const argsInput = document.createElement('input');
+        argsInput.className = 'run-debug-input';
+        argsInput.type = 'text';
+        argsInput.placeholder = 'Arguments';
+        argsInput.value = action.args || '';
+        argsInput.addEventListener('input', () => {
+          action.args = argsInput.value;
+        });
+
+        programGrid.appendChild(programInput);
+        programGrid.appendChild(argsInput);
+        fields.appendChild(programGrid);
+        attachLaunchFieldErrorAfter(programInput, `action.${action.id}.program`);
+      } else {
+        const commandInput = document.createElement('input');
+        commandInput.className = 'run-debug-input';
+        commandInput.type = 'text';
+        commandInput.placeholder = 'Command to run';
+        commandInput.value = action.command || '';
+        commandInput.addEventListener('input', () => {
+          action.command = commandInput.value;
+          const fieldKey = `action.${action.id}.command`;
+          clearLaunchEditorValidationError(fieldKey);
+          removeLaunchFieldErrorByKey(fieldKey);
+        });
+        fields.appendChild(commandInput);
+        attachLaunchFieldErrorAfter(commandInput, `action.${action.id}.command`);
+
+        const skipCompletionLabel = document.createElement('label');
+        skipCompletionLabel.className = 'run-debug-action-checkbox';
+
+        const skipCompletionInput = document.createElement('input');
+        skipCompletionInput.type = 'checkbox';
+        skipCompletionInput.checked = Boolean(action.skipCompletion);
+        skipCompletionInput.addEventListener('change', () => {
+          action.skipCompletion = Boolean(skipCompletionInput.checked);
+        });
+
+        const skipCompletionText = document.createElement('span');
+        skipCompletionText.textContent = 'Skip completion';
+
+        skipCompletionLabel.appendChild(skipCompletionInput);
+        skipCompletionLabel.appendChild(skipCompletionText);
+        fields.appendChild(skipCompletionLabel);
+      }
+    }
+
+    row.appendChild(mainRow);
+    row.appendChild(fields);
+    runDebugActionsList.appendChild(row);
+  }
+}
+
+function validateLaunchDraft(draft) {
+  const errors = {};
+
+  if (!draft) {
+    errors.actions = 'Launch option is not ready to save.';
+    return errors;
+  }
+
+  const name = String(runDebugOptionNameInput.value || '').trim();
+  if (!name) {
+    errors['option.name'] = 'You must enter a launch option name.';
+  }
+
+  if (!Array.isArray(draft.actions) || draft.actions.length === 0) {
+    errors.actions = 'You must add at least one action.';
+    return errors;
+  }
+
+  for (let i = 0; i < draft.actions.length; i += 1) {
+    const action = draft.actions[i];
+    const actionId = action && action.id ? action.id : `missing-${i}`;
+
+    if (action.type === 'url') {
+      if (!String(action.url || '').trim()) {
+        errors[`action.${actionId}.url`] = 'You must enter a valid URL.';
+      }
+      continue;
+    }
+
+    if (action.type === 'program') {
+      if (!String(action.program || '').trim()) {
+        errors[`action.${actionId}.program`] = 'You must enter a valid program path.';
+      }
+      continue;
+    }
+
+    if (!String(action.command || '').trim()) {
+      errors[`action.${actionId}.command`] = 'You must enter a valid command.';
+    }
+  }
+
+  return errors;
+}
+
+async function saveLaunchConfigToDisk() {
+  const launchConfigPath = getLaunchConfigPath();
+  if (!launchConfigPath) {
+    throw new Error('Open a project folder first.');
+  }
+
+  await api.writeFile({
+    filePath: launchConfigPath,
+    content: JSON.stringify(launchConfigState, null, 2)
+  });
+
+  launchConfigExists = true;
+  launchConfigLoadError = '';
+}
+
+function isAlreadyExistsError(error) {
+  const message = String(error && error.message ? error.message : error || '');
+  return /EEXIST|already exists/i.test(message);
+}
+
+async function maybePromptAddQwcodeToGitignore() {
+  if (!project.rootPath) {
+    return;
+  }
+
+  const gitignorePath = joinPathSegments(project.rootPath, '.gitignore');
+
+  const payload = await api.readFile({ filePath: gitignorePath, allowMissing: true });
+  if (!payload) {
+    return;
+  }
+
+  const content = typeof payload === 'string' ? payload : payload.content;
+
+  if (/(^|[\r\n])\.qwcode\/?(?=[\r\n]|$)/i.test(content)) {
+    return;
+  }
+
+  const shouldAdd = await showConfirmDialog({
+    title: 'Add .qwcode to .gitignore?',
+    message: 'A .gitignore file exists. Add .qwcode/ so launch options stay local to this machine?',
+    confirmLabel: 'Add to .gitignore',
+    confirmStyle: 'primary'
+  });
+
+  if (!shouldAdd) {
+    return;
+  }
+
+  const newline = content.includes('\r\n') ? '\r\n' : '\n';
+  const trimmed = String(content || '').replace(/[\r\n]+$/, '');
+  const nextContent = `${trimmed}${trimmed ? newline : ''}.qwcode/${newline}`;
+
+  await api.writeFile({ filePath: gitignorePath, content: nextContent });
+}
+
+async function createLaunchConfigFromPanel() {
+  if (!project.rootPath) {
+    throw new Error('Open a project folder first.');
+  }
+
+  const launchFolderPath = getLaunchStorageFolderPath();
+  const launchConfigPath = getLaunchConfigPath();
+  if (!launchFolderPath || !launchConfigPath) {
+    throw new Error('Could not resolve launch paths.');
+  }
+
+  let createdFolder = false;
+  try {
+    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+    createdFolder = true;
+  } catch (error) {
+    if (!isAlreadyExistsError(error)) {
+      throw error;
+    }
+  }
+
+  launchConfigState = createDefaultLaunchConfig();
+  await saveLaunchConfigToDisk();
+
+  if (createdFolder) {
+    await maybePromptAddQwcodeToGitignore();
+  }
+
+  renderRunDebugPanel();
+}
+
+async function loadLaunchConfigFromDisk() {
+  launchConfigLoadError = '';
+
+  if (!project.rootPath) {
+    launchConfigExists = false;
+    launchConfigState = createDefaultLaunchConfig();
+    clearAllLaunchRuntime(false);
+    closeLaunchEditor();
+    renderRunDebugPanel();
+    return;
+  }
+
+  const launchConfigPath = getLaunchConfigPath();
+  if (!launchConfigPath) {
+    launchConfigExists = false;
+    launchConfigState = createDefaultLaunchConfig();
+    closeLaunchEditor();
+    renderRunDebugPanel();
+    return;
+  }
+
+  try {
+    const payload = await api.readFile({ filePath: launchConfigPath, allowMissing: true });
+    if (!payload) {
+      launchConfigExists = false;
+      launchConfigState = createDefaultLaunchConfig();
+      closeLaunchEditor();
+      renderRunDebugPanel();
+      return;
+    }
+
+    const raw = typeof payload === 'string' ? payload : payload.content;
+    const parsed = JSON.parse(raw);
+    launchConfigState = normalizeLaunchConfig(parsed);
+    launchConfigExists = true;
+
+    const optionIds = new Set(launchConfigState.launchOptions.map((entry) => entry.id));
+    for (const optionId of [...runningLaunches.keys()]) {
+      if (!optionIds.has(optionId)) {
+        clearLaunchRuntime(optionId, false);
+      }
+    }
+
+    if (launchEditorState.optionId && !optionIds.has(launchEditorState.optionId)) {
+      closeLaunchEditor();
+    }
+  } catch (error) {
+    const message = String(error && error.message ? error.message : error || '');
+    if (!/ENOENT|no such file|cannot find|not exist/i.test(message)) {
+      launchConfigLoadError = message;
+    }
+    launchConfigExists = false;
+    launchConfigState = createDefaultLaunchConfig();
+    closeLaunchEditor();
+  }
+
+  renderRunDebugPanel();
+}
+
+function validateAiLaunchOption(option, indexLabel = 1) {
+  const optionName = String(option && option.name ? option.name : '').trim();
+  if (!optionName) {
+    throw new Error('Launch option name is required.');
+  }
+
+  const actions = Array.isArray(option && option.actions) ? option.actions : [];
+  if (!actions.length) {
+    throw new Error(`Launch option ${indexLabel} must include at least one action.`);
+  }
+
+  for (let i = 0; i < actions.length; i += 1) {
+    const action = actions[i] || {};
+    const actionLabel = i + 1;
+
+    if (action.type === 'url') {
+      const url = String(action.url || '').trim();
+      if (!url || !/^https?:\/\//i.test(url)) {
+        throw new Error(`Launch option ${indexLabel}, action ${actionLabel} must use a valid http(s) URL.`);
+      }
+      continue;
+    }
+
+    if (action.type === 'program') {
+      if (!String(action.program || '').trim()) {
+        throw new Error(`Launch option ${indexLabel}, action ${actionLabel} is missing a program path.`);
+      }
+      continue;
+    }
+
+    if (!String(action.command || '').trim()) {
+      throw new Error(`Launch option ${indexLabel}, action ${actionLabel} is missing a command.`);
+    }
+  }
+}
+
+async function ensureLaunchConfigReadyForAiTools() {
+  if (!project.rootPath) {
+    throw new Error('Open a project folder first.');
+  }
+
+  const launchConfigPath = getLaunchConfigPath();
+  if (!launchConfigPath) {
+    throw new Error('Could not resolve launch configuration path.');
+  }
+
+  const payload = await api.readFile({ filePath: launchConfigPath, allowMissing: true });
+  if (payload) {
+    try {
+      const raw = typeof payload === 'string' ? payload : payload.content;
+      launchConfigState = normalizeLaunchConfig(JSON.parse(raw));
+      launchConfigExists = true;
+      launchConfigLoadError = '';
+      return;
+    } catch {
+      throw new Error('launch.json exists but is invalid JSON. Fix it before AI modifies launch options.');
+    }
+  }
+
+  const launchFolderPath = getLaunchStorageFolderPath();
+  if (!launchFolderPath) {
+    throw new Error('Could not resolve launch folder path.');
+  }
+
+  await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+  launchConfigState = createDefaultLaunchConfig();
+  await saveLaunchConfigToDisk();
+}
+
+async function saveLaunchEditorDraft() {
+  if (!launchEditorState.open || !launchEditorState.draft) {
+    return;
+  }
+
+  const validationErrors = validateLaunchDraft(launchEditorState.draft);
+  if (Object.keys(validationErrors).length > 0) {
+    setLaunchEditorValidationErrors(validationErrors);
+    renderRunDebugPanel();
+    return;
+  }
+
+  setLaunchEditorValidationErrors({});
+
+  const draft = cloneLaunchOption(launchEditorState.draft);
+  draft.name = String(runDebugOptionNameInput.value || '').trim();
+  draft.description = String(runDebugOptionDescriptionInput.value || '').trim();
+  draft.default = Boolean(runDebugOptionDefaultInput.checked);
+  draft.actions = draft.actions.map((action, index) => normalizeLaunchAction(action, index));
+
+  if (launchEditorState.optionId) {
+    const index = launchConfigState.launchOptions.findIndex((entry) => entry.id === launchEditorState.optionId);
+    if (index >= 0) {
+      launchConfigState.launchOptions[index] = draft;
+    }
+  } else {
+    launchConfigState.launchOptions.push(draft);
+  }
+
+  if (draft.default) {
+    for (const option of launchConfigState.launchOptions) {
+      if (option.id !== draft.id) {
+        option.default = false;
+      }
+    }
+  }
+
+  await saveLaunchConfigToDisk();
+  closeLaunchEditor();
+  renderRunDebugPanel();
+}
+
+async function deleteLaunchOption(optionId) {
+  const option = getLaunchOptionById(optionId);
+  if (!option) {
+    return;
+  }
+
+  const shouldDelete = await showConfirmDialog({
+    title: 'Delete Launch Option',
+    message: `Delete "${option.name}"?`,
+    confirmLabel: 'Delete',
+    confirmStyle: 'danger'
+  });
+
+  if (!shouldDelete) {
+    return;
+  }
+
+  launchConfigState.launchOptions = launchConfigState.launchOptions.filter((entry) => entry.id !== optionId);
+  clearLaunchRuntime(optionId, false);
+  if (launchEditorState.optionId === optionId) {
+    closeLaunchEditor();
+  }
+
+  await saveLaunchConfigToDisk();
+  renderRunDebugPanel();
+}
+
+function renderRunDebugPanel() {
+  const hasProject = Boolean(project.rootPath);
+  const hasConfig = hasProject && launchConfigExists;
+
+  syncEditorPlayButtonState();
+  syncRunDebugToolbarVisibility(hasConfig);
+
+  if (!hasProject) {
+    runDebugEmptyState.classList.remove('hidden');
+    runDebugContent.classList.add('hidden');
+    runDebugCreateBtn.disabled = true;
+    runDebugEmptyDescription.textContent = 'Open a folder to create and run launch options.';
+    closeLaunchEditor();
+    renderRunDebugEditor();
+    runDebugOptionsList.innerHTML = '';
+    return;
+  }
+
+  runDebugCreateBtn.disabled = false;
+
+  if (!hasConfig) {
+    runDebugEmptyState.classList.remove('hidden');
+    runDebugContent.classList.add('hidden');
+    closeLaunchEditor();
+    renderRunDebugEditor();
+    runDebugOptionsList.innerHTML = '';
+    runDebugEmptyDescription.textContent = launchConfigLoadError
+      ? `launch.json could not be loaded: ${launchConfigLoadError}`
+      : 'Create .qwcode/launch.json in this project to define launch options made of command, program, and website actions.';
+    return;
+  }
+
+  runDebugEmptyState.classList.add('hidden');
+  runDebugContent.classList.remove('hidden');
+
+  if (launchEditorState.open && launchEditorState.optionId && !getLaunchOptionById(launchEditorState.optionId)) {
+    closeLaunchEditor();
+  }
+
+  renderRunDebugOptionsList();
+  renderRunDebugEditor();
+}
+
+function clearLaunchRuntime(optionId, shouldRender = true) {
+  const runtime = runningLaunches.get(optionId);
+  if (!runtime) {
+    return;
+  }
+
+  runningLaunches.delete(optionId);
+  launchTermToOption.delete(runtime.termId);
+
+  if (shouldRender) {
+    renderRunDebugPanel();
+  }
+}
+
+function clearLaunchRuntimeByTermId(termId, shouldRender = true) {
+  const optionId = launchTermToOption.get(termId);
+  if (!optionId) {
+    return;
+  }
+
+  launchTermToOption.delete(termId);
+  runningLaunches.delete(optionId);
+
+  if (shouldRender) {
+    renderRunDebugPanel();
+  }
+}
+
+function clearAllLaunchRuntime(shouldRender = true) {
+  if (!runningLaunches.size && !launchTermToOption.size) {
+    return;
+  }
+
+  runningLaunches.clear();
+  launchTermToOption.clear();
+
+  if (shouldRender) {
+    renderRunDebugPanel();
+  }
+}
+
+function isLaunchOptionRunning(optionId) {
+  const runtime = runningLaunches.get(optionId);
+  if (!runtime) {
+    return false;
+  }
+
+  const session = terminalSessions.get(runtime.termId);
+  if (!session || session.exited) {
+    clearLaunchRuntime(optionId, false);
+    return false;
+  }
+
+  return true;
+}
+
+function onLaunchTerminalData(termId) {
+  const optionId = launchTermToOption.get(termId);
+  if (!optionId) {
+    return;
+  }
+
+  const runtime = runningLaunches.get(optionId);
+  const session = terminalSessions.get(termId);
+  if (!runtime || !session) {
+    clearLaunchRuntimeByTermId(termId, true);
+    return;
+  }
+
+  if (session.buffer.includes(runtime.completionMarker)) {
+    clearLaunchRuntime(optionId, true);
+  }
+}
+
+function onLaunchTerminalExit(termId) {
+  clearLaunchRuntimeByTermId(termId, true);
+}
+
+function getLaunchHostShellType(option) {
+  const actions = Array.isArray(option && option.actions) ? option.actions : [];
+  const terminalShells = actions
+    .filter((action) => action && action.type !== 'url')
+    .map((action) => normalizeLaunchShell(action.shell));
+
+  if (!terminalShells.length) {
+    return 'powershell';
+  }
+
+  const unique = [...new Set(terminalShells)];
+  if (unique.length === 1) {
+    return unique[0];
+  }
+
+  // Mixed-shell launch options are executed from PowerShell host commands.
+  return 'powershell';
+}
+
+function hasWslTerminalProfile() {
+  return terminalProfiles.some((profile) => profile && profile.id === 'wsl');
+}
+
+function launchOptionRequiresWsl(option) {
+  const actions = Array.isArray(option && option.actions) ? option.actions : [];
+  return actions.some((action) => {
+    if (!action || action.type === 'url') {
+      return false;
+    }
+
+    return normalizeLaunchShell(action.shell) === 'wsl';
+  });
+}
+
+async function showWslMissingDialog() {
+  await showConfirmDialog({
+    title: 'WSL Not Installed',
+    message: 'This launch option includes at least one WSL action, but WSL is not installed on this device.',
+    confirmLabel: 'OK',
+    confirmStyle: 'primary'
+  });
+}
+
+function findReusableLaunchTerminalId(shellType) {
+  const normalizedShell = normalizeLaunchShell(shellType);
+
+  for (const [termId, session] of terminalSessions) {
+    if (!session || session.exited) {
+      continue;
+    }
+
+    if (launchTermToOption.has(termId)) {
+      continue;
+    }
+
+    if (normalizeLaunchShell(session.shellType) === normalizedShell) {
+      return termId;
+    }
+  }
+
+  return null;
+}
+
+async function getOrCreateLaunchTerminalId(shellType) {
+  const normalizedShell = normalizeLaunchShell(shellType);
+  const reusable = findReusableLaunchTerminalId(normalizedShell);
+  if (reusable) {
+    setActiveTerminal(reusable);
+    return reusable;
+  }
+
+  return createTerminalSession(normalizedShell);
+}
+
+function escapePowerShellLiteral(value) {
+  return `'${String(value || '').replace(/'/g, "''")}'`;
+}
+
+function escapeBashSingleQuoted(value) {
+  return `'${String(value || '').replace(/'/g, "'\\''")}'`;
+}
+
+function toWslPath(inputPath) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  if (/^[A-Za-z]:[\\/]/.test(raw)) {
+    const drive = raw.charAt(0).toLowerCase();
+    const tail = raw.slice(2).replace(/\\/g, '/');
+    return `/mnt/${drive}${tail.startsWith('/') ? '' : '/'}${tail}`;
+  }
+
+  return raw.replace(/\\/g, '/');
+}
+
+function quoteForCmdExecutable(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+
+  if (text.startsWith('"') && text.endsWith('"')) {
+    return text;
+  }
+
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function resolveLaunchActionCwd(cwdValue) {
+  const raw = String(cwdValue || '').trim();
+  if (!raw) {
+    return project.rootPath || '';
+  }
+
+  if (isAbsolutePathInput(raw)) {
+    return raw;
+  }
+
+  return joinPathSegments(project.rootPath || '', raw);
+}
+
+function wrapPowerShellCommandWithLaunchCwd(command, cwdValue) {
+  const resolvedCwd = resolveLaunchActionCwd(cwdValue);
+  if (!resolvedCwd) {
+    return command;
+  }
+
+  return `$__qwalePrev = Get-Location; try { Set-Location -LiteralPath ${escapePowerShellLiteral(resolvedCwd)}; ${command} } finally { Set-Location -LiteralPath $__qwalePrev }`;
+}
+
+function wrapCmdCommandWithLaunchCwd(command, cwdValue) {
+  const resolvedCwd = resolveLaunchActionCwd(cwdValue);
+  if (!resolvedCwd) {
+    return command;
+  }
+
+  return `pushd ${quoteForCmdExecutable(resolvedCwd)} && (${command}) & popd`;
+}
+
+function wrapWslCommandWithLaunchCwd(command, cwdValue) {
+  const resolvedCwd = resolveLaunchActionCwd(cwdValue);
+  if (!resolvedCwd) {
+    return command;
+  }
+
+  const wslPath = toWslPath(resolvedCwd);
+  if (!wslPath) {
+    return command;
+  }
+
+  return `__qwale_prev="$PWD"; cd ${escapeBashSingleQuoted(wslPath)} && { ${command}; }; cd "$__qwale_prev"`;
+}
+
+function buildShellCommand(action) {
+  const shell = normalizeLaunchShell(action.shell);
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  if (shell === 'cmd') {
+    return `cmd.exe /d /s /c ${escapePowerShellLiteral(command)}`;
+  }
+
+  if (shell === 'wsl') {
+    return `wsl.exe -- bash -lc ${escapePowerShellLiteral(command)}`;
+  }
+
+  return command;
+}
+
+function buildDetachedCommandForPowerShellHost(action) {
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  const shell = normalizeLaunchShell(action.shell);
+  const resolvedCwd = resolveLaunchActionCwd(action.cwd);
+
+  if (shell === 'cmd') {
+    const startParts = [
+      'Start-Process -FilePath "cmd.exe"',
+      `-ArgumentList @('/d','/s','/c',${escapePowerShellLiteral(command)})`
+    ];
+
+    if (resolvedCwd) {
+      startParts.push(`-WorkingDirectory ${escapePowerShellLiteral(resolvedCwd)}`);
+    }
+
+    return startParts.join(' ');
+  }
+
+  if (shell === 'wsl') {
+    const cwdScript = resolvedCwd ? `cd ${escapeBashSingleQuoted(toWslPath(resolvedCwd))} && ` : '';
+    return `Start-Process -FilePath "wsl.exe" -ArgumentList @('bash','-lc',${escapePowerShellLiteral(`${cwdScript}${command}`)})`;
+  }
+
+  const startParts = [
+    'Start-Process -FilePath "powershell.exe"',
+    `-ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',${escapePowerShellLiteral(command)})`
+  ];
+
+  if (resolvedCwd) {
+    startParts.push(`-WorkingDirectory ${escapePowerShellLiteral(resolvedCwd)}`);
+  }
+
+  return startParts.join(' ');
+}
+
+function buildDetachedCommandForCmdHost(action) {
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  const resolvedCwd = resolveLaunchActionCwd(action.cwd);
+  const cwdPrefix = resolvedCwd ? `cd /d ${quoteForCmdExecutable(resolvedCwd)} && ` : '';
+  const script = `${cwdPrefix}${command}`.replace(/"/g, '""');
+  return `start "" cmd.exe /d /s /c "${script}"`;
+}
+
+function buildDetachedCommandForWslHost(action) {
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  const resolvedCwd = resolveLaunchActionCwd(action.cwd);
+  const cwdPrefix = resolvedCwd ? `cd ${escapeBashSingleQuoted(toWslPath(resolvedCwd))} && ` : '';
+  return `nohup bash -lc ${escapeBashSingleQuoted(`${cwdPrefix}${command}`)} >/dev/null 2>&1 &`;
+}
+
+function buildProgramCommand(action) {
+  const shell = normalizeLaunchShell(action.shell);
+  const program = String(action.program || '').trim();
+  if (!program) {
+    return '';
+  }
+
+  const args = String(action.args || '').trim();
+  if (shell === 'cmd') {
+    const command = `${quoteForCmdExecutable(program)}${args ? ` ${args}` : ''}`;
+    return `cmd.exe /d /s /c ${escapePowerShellLiteral(command)}`;
+  }
+
+  if (shell === 'wsl') {
+    const command = `${program}${args ? ` ${args}` : ''}`;
+    return `wsl.exe -- bash -lc ${escapePowerShellLiteral(command)}`;
+  }
+
+  return `& ${escapePowerShellLiteral(program)}${args ? ` ${args}` : ''}`;
+}
+
+function buildCmdProgramCommand(action) {
+  const program = String(action.program || '').trim();
+  if (!program) {
+    return '';
+  }
+
+  const args = String(action.args || '').trim();
+  return `${quoteForCmdExecutable(program)}${args ? ` ${args}` : ''}`;
+}
+
+function buildWslProgramCommand(action) {
+  const program = String(action.program || '').trim();
+  if (!program) {
+    return '';
+  }
+
+  const args = String(action.args || '').trim();
+  return `${escapeBashSingleQuoted(program)}${args ? ` ${args}` : ''}`;
+}
+
+function buildLaunchActionCommandForPowerShell(action) {
+  if (!action || typeof action !== 'object') {
+    return '';
+  }
+
+  if (action.type === 'url') {
+    const url = String(action.url || '').trim();
+    if (!url) {
+      return '';
+    }
+    return `Start-Process ${escapePowerShellLiteral(url)}`;
+  }
+
+  if (action.type === 'program') {
+    const command = buildProgramCommand(action);
+    if (!command) {
+      return '';
+    }
+    return wrapPowerShellCommandWithLaunchCwd(command, action.cwd);
+  }
+
+  if (action.skipCompletion) {
+    return buildDetachedCommandForPowerShellHost(action);
+  }
+
+  const command = buildShellCommand(action);
+  if (!command) {
+    return '';
+  }
+
+  return wrapPowerShellCommandWithLaunchCwd(command, action.cwd);
+}
+
+function buildLaunchActionCommandForCmd(action) {
+  if (!action || typeof action !== 'object') {
+    return '';
+  }
+
+  if (action.type === 'url') {
+    const url = String(action.url || '').trim();
+    if (!url) {
+      return '';
+    }
+    return `start "" ${quoteForCmdExecutable(url)}`;
+  }
+
+  if (action.type === 'program') {
+    const command = buildCmdProgramCommand(action);
+    if (!command) {
+      return '';
+    }
+    return wrapCmdCommandWithLaunchCwd(command, action.cwd);
+  }
+
+  if (action.skipCompletion) {
+    return buildDetachedCommandForCmdHost(action);
+  }
+
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  return wrapCmdCommandWithLaunchCwd(command, action.cwd);
+}
+
+function buildLaunchActionCommandForWsl(action) {
+  if (!action || typeof action !== 'object') {
+    return '';
+  }
+
+  if (action.type === 'url') {
+    const url = String(action.url || '').trim();
+    if (!url) {
+      return '';
+    }
+    return `xdg-open ${escapeBashSingleQuoted(url)} >/dev/null 2>&1 || true`;
+  }
+
+  if (action.type === 'program') {
+    const command = buildWslProgramCommand(action);
+    if (!command) {
+      return '';
+    }
+    return wrapWslCommandWithLaunchCwd(command, action.cwd);
+  }
+
+  if (action.skipCompletion) {
+    return buildDetachedCommandForWslHost(action);
+  }
+
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  return wrapWslCommandWithLaunchCwd(command, action.cwd);
+}
+
+function buildLaunchActionCommand(action, hostShellType = 'powershell') {
+  const hostShell = normalizeLaunchShell(hostShellType);
+  if (hostShell === 'cmd') {
+    return buildLaunchActionCommandForCmd(action);
+  }
+
+  if (hostShell === 'wsl' || hostShell === 'shell') {
+    return buildLaunchActionCommandForWsl(action);
+  }
+
+  return buildLaunchActionCommandForPowerShell(action);
+}
+
+function buildLaunchCompletionMarkerCommand(hostShellType, completionMarker) {
+  const hostShell = normalizeLaunchShell(hostShellType);
+  if (hostShell === 'cmd' || hostShell === 'wsl' || hostShell === 'shell') {
+    return `echo ${completionMarker}`;
+  }
+
+  return `Write-Output ${escapePowerShellLiteral(completionMarker)}`;
+}
+
+function buildLaunchCommandSequence(option, completionMarker, hostShellType = 'powershell') {
+  const commands = [];
+  const actions = Array.isArray(option.actions) ? option.actions : [];
+
+  for (const action of actions) {
+    const command = buildLaunchActionCommand(action, hostShellType);
+    if (command) {
+      commands.push(command);
+    }
+  }
+
+  commands.push(buildLaunchCompletionMarkerCommand(hostShellType, completionMarker));
+  return commands;
+}
+
+function validateLaunchOptionForRun(option) {
+  if (!option || !Array.isArray(option.actions) || !option.actions.length) {
+    return 'Launch option has no actions to run.';
+  }
+
+  for (let i = 0; i < option.actions.length; i += 1) {
+    const action = option.actions[i];
+    const indexLabel = i + 1;
+
+    if (action.type === 'url') {
+      if (!String(action.url || '').trim()) {
+        return `Action ${indexLabel} is missing a website URL.`;
+      }
+      continue;
+    }
+
+    if (action.type === 'program') {
+      if (!String(action.program || '').trim()) {
+        return `Action ${indexLabel} is missing a program path.`;
+      }
+      continue;
+    }
+
+    if (!String(action.command || '').trim()) {
+      return `Action ${indexLabel} is missing a command.`;
+    }
+  }
+
+  return '';
+}
+
+async function startLaunchOption(optionId) {
+  const option = getLaunchOptionById(optionId);
+  if (!option) {
+    throw new Error('Launch option not found.');
+  }
+
+  if (isLaunchOptionRunning(optionId)) {
+    return;
+  }
+
+  const normalizedOption = normalizeLaunchOption(option, 0);
+  const validationError = validateLaunchOptionForRun(normalizedOption);
+  if (validationError) {
+    throw new Error(validationError);
+  }
+
+  if (launchOptionRequiresWsl(normalizedOption) && !hasWslTerminalProfile()) {
+    await showWslMissingDialog();
+    return;
+  }
+
+  const hostShellType = getLaunchHostShellType(normalizedOption);
+
+  const completionMarker = `__QWALE_LAUNCH_DONE_${normalizedOption.id}_${Date.now()}__`;
+  const commands = buildLaunchCommandSequence(normalizedOption, completionMarker, hostShellType);
+  const termId = await getOrCreateLaunchTerminalId(hostShellType);
+
+  runningLaunches.set(optionId, {
+    termId,
+    completionMarker
+  });
+  launchTermToOption.set(termId, optionId);
+  renderRunDebugPanel();
+
+  for (const command of commands) {
+    api.sendTerminalInput({ termId, data: `${command}\r` });
+  }
+}
+
+async function stopLaunchOption(optionId) {
+  const runtime = runningLaunches.get(optionId);
+  if (!runtime) {
+    return;
+  }
+
+  const session = terminalSessions.get(runtime.termId);
+  if (!session || session.exited) {
+    clearLaunchRuntime(optionId, true);
+    return;
+  }
+
+  api.sendTerminalInput({ termId: runtime.termId, data: '\u0003' });
+}
+
+function closeEditorPlayMenu() {
+  editorPlayMenu.classList.add('hidden');
+  editorPlayMenu.innerHTML = '';
+}
+
+function getEditorPlayButtonState(options = launchConfigState.launchOptions) {
+  const defaultOption = getDefaultLaunchOption(options);
+  const defaultIsRunning = Boolean(defaultOption && isLaunchOptionRunning(defaultOption.id));
+
+  return {
+    defaultOption,
+    defaultIsRunning,
+    actionLabel: defaultIsRunning ? 'Stop' : 'Run/Debug',
+    actionTitle: defaultIsRunning
+      ? `Stop ${defaultOption && defaultOption.name ? defaultOption.name : 'default launch option'}`
+      : 'Run default launch option'
+  };
+}
+
+function syncEditorPlayButtonState(options = launchConfigState.launchOptions) {
+  const state = getEditorPlayButtonState(options);
+  editorPlayBtnLabel.textContent = state.actionLabel;
+  editorPlayBtnIcon.classList.toggle('editor-play-btn-icon-run', !state.defaultIsRunning);
+  editorPlayBtnIcon.classList.toggle('editor-play-btn-icon-stop', state.defaultIsRunning);
+  editorPlayBtn.title = state.actionTitle;
+}
+
+async function setLaunchOptionAsDefault(optionId) {
+  const options = Array.isArray(launchConfigState.launchOptions) ? launchConfigState.launchOptions : [];
+  let found = false;
+
+  for (const option of options) {
+    if (!option) {
+      continue;
+    }
+
+    const shouldBeDefault = option.id === optionId;
+    if (shouldBeDefault) {
+      found = true;
+    }
+
+    option.default = shouldBeDefault;
+  }
+
+  if (!found) {
+    throw new Error('Launch option not found.');
+  }
+
+  await saveLaunchConfigToDisk();
+}
+
+function showEditorPlayMenu(options, menuBehavior = {}) {
+  const { setSelectedAsDefaultIfMissing = false } = menuBehavior;
+  editorPlayMenu.innerHTML = '';
+
+  for (const option of options) {
+    const isRunning = isLaunchOptionRunning(option.id);
+    const optionName = option.name || 'Untitled launch option';
+
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'editor-play-menu-item';
+    item.textContent = isRunning ? `Stop ${optionName}` : `Run ${optionName}`;
+    item.title = option.description || optionName;
+    item.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      closeEditorPlayMenu();
+
+      try {
+        const currentOptions = Array.isArray(launchConfigState.launchOptions) ? launchConfigState.launchOptions : [];
+        const defaultOption = getDefaultLaunchOption(currentOptions);
+
+        if (!defaultOption && setSelectedAsDefaultIfMissing) {
+          await setLaunchOptionAsDefault(option.id);
+          renderRunDebugPanel();
+        }
+
+        if (isLaunchOptionRunning(option.id)) {
+          await stopLaunchOption(option.id);
+        } else {
+          await startLaunchOption(option.id);
+        }
+      } catch (error) {
+        alert(error.message || String(error));
+      }
+    });
+    editorPlayMenu.appendChild(item);
+  }
+
+  editorPlayMenu.classList.remove('hidden');
+}
+
+async function handleEditorPlayClick() {
+  if (!project.rootPath) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  closeEditorPlayMenu();
+
+  await loadLaunchConfigFromDisk();
+
+  if (!launchConfigExists) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  const options = Array.isArray(launchConfigState.launchOptions) ? launchConfigState.launchOptions : [];
+  if (!options.length) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  const state = getEditorPlayButtonState(options);
+  if (state.defaultOption) {
+    if (state.defaultIsRunning) {
+      await stopLaunchOption(state.defaultOption.id);
+    } else {
+      await startLaunchOption(state.defaultOption.id);
+    }
+    return;
+  }
+
+  showEditorPlayMenu(options, { setSelectedAsDefaultIfMissing: true });
+}
+
+async function handleEditorPlayMenuClick() {
+  if (!project.rootPath) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  if (!editorPlayMenu.classList.contains('hidden')) {
+    closeEditorPlayMenu();
+    return;
+  }
+
+  await loadLaunchConfigFromDisk();
+
+  if (!launchConfigExists) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  const options = Array.isArray(launchConfigState.launchOptions) ? launchConfigState.launchOptions : [];
+  if (!options.length) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  showEditorPlayMenu(options, { setSelectedAsDefaultIfMissing: false });
 }
 
 function renderChangedFilesList(files) {
@@ -1707,11 +4171,23 @@ function ensureExplorerContextMenu() {
   });
 }
 
-function addExplorerMenuItem(container, label, action, { disabled = false } = {}) {
+function addExplorerMenuItem(container, label, action, { disabled = false, shortcut = '' } = {}) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = `explorer-context-item${disabled ? ' disabled' : ''}`;
-  btn.textContent = label;
+
+  const labelText = document.createElement('span');
+  labelText.className = 'explorer-context-label';
+  labelText.textContent = label;
+  btn.appendChild(labelText);
+
+  if (shortcut) {
+    const shortcutText = document.createElement('span');
+    shortcutText.className = 'menu-shortcut';
+    shortcutText.textContent = shortcut;
+    btn.appendChild(shortcutText);
+  }
+
   btn.disabled = disabled;
   btn.addEventListener('click', async (event) => {
     event.stopPropagation();
@@ -1783,7 +4259,7 @@ function showExplorerContextMenu(event, contextNode) {
     if (!hasMultiSelection && contextNode.type === 'file') {
       addExplorerMenuItem(explorerMenu, 'Open', async () => {
         await openFile(contextNode.path, { mode: 'permanent' });
-      });
+      }, { shortcut: explorerShortcutLabel.open });
     }
 
     addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Copy ${contextEntries.length} Items` : (contextNode.type === 'file' ? 'Copy File' : 'Copy Folder'), async () => {
@@ -1791,14 +4267,14 @@ function showExplorerContextMenu(event, contextNode) {
         mode: 'copy',
         items: contextEntries.map((entry) => ({ sourcePath: entry.path, type: entry.type }))
       };
-    });
+    }, { shortcut: explorerShortcutLabel.copy });
 
     addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Cut ${contextEntries.length} Items` : (contextNode.type === 'file' ? 'Cut File' : 'Cut Folder'), async () => {
       explorerClipboard = {
         mode: 'cut',
         items: contextEntries.map((entry) => ({ sourcePath: entry.path, type: entry.type }))
       };
-    });
+    }, { shortcut: explorerShortcutLabel.cut });
 
     if (!hasMultiSelection) {
       addExplorerMenuItem(explorerMenu, 'Copy Path', async () => {
@@ -1811,7 +4287,7 @@ function showExplorerContextMenu(event, contextNode) {
 
       addExplorerMenuItem(explorerMenu, 'Rename', async () => {
         startInlineRename(contextNode.path, contextNode.type);
-      });
+      }, { shortcut: explorerShortcutLabel.rename });
     }
 
     addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Delete ${contextEntries.length} Items` : 'Delete', async () => {
@@ -1829,7 +4305,7 @@ function showExplorerContextMenu(event, contextNode) {
       }
 
       await deleteExplorerEntries(contextEntries);
-    });
+    }, { shortcut: explorerShortcutLabel.del });
 
     if (!hasMultiSelection) {
       addExplorerMenuItem(explorerMenu, 'Open in File Explorer', async () => {
@@ -1841,24 +4317,24 @@ function showExplorerContextMenu(event, contextNode) {
       addExplorerMenuDivider(explorerMenu);
       addExplorerMenuItem(explorerMenu, 'New File', async () => {
         startInlineCreate('file', contextNode.path);
-      });
+      }, { shortcut: explorerShortcutLabel.newFile });
       addExplorerMenuItem(explorerMenu, 'New Folder', async () => {
         startInlineCreate('folder', contextNode.path);
-      });
+      }, { shortcut: explorerShortcutLabel.newFolder });
       addExplorerMenuItem(explorerMenu, 'Paste File/Folder', async () => {
         await pasteIntoPath(contextNode.path);
-      }, { disabled: !canPaste });
+      }, { disabled: !canPaste, shortcut: explorerShortcutLabel.paste });
     }
   } else {
     addExplorerMenuItem(explorerMenu, 'New File', async () => {
       startInlineCreate('file', project.rootPath);
-    }, { disabled: !project.rootPath });
+    }, { disabled: !project.rootPath, shortcut: explorerShortcutLabel.newFile });
     addExplorerMenuItem(explorerMenu, 'New Folder', async () => {
       startInlineCreate('folder', project.rootPath);
-    }, { disabled: !project.rootPath });
+    }, { disabled: !project.rootPath, shortcut: explorerShortcutLabel.newFolder });
     addExplorerMenuItem(explorerMenu, 'Paste', async () => {
       await pasteIntoPath(project.rootPath);
-    }, { disabled: !canPaste });
+    }, { disabled: !canPaste, shortcut: explorerShortcutLabel.paste });
   }
 
   explorerMenu.style.left = `${event.clientX}px`;
@@ -2906,6 +5382,7 @@ function buildTreeNode(node) {
   const row = document.createElement('div');
   row.className = 'tree-node';
   row.dataset.path = node.path;
+  row.draggable = true;
 
   if (node.ignored) {
     row.classList.add('ignored');
@@ -2926,6 +5403,39 @@ function buildTreeNode(node) {
   const label = document.createElement('span');
   label.className = 'tree-node-label';
   label.textContent = node.name;
+
+  row.addEventListener('dragstart', (event) => {
+    if (inlineEditState || !event.dataTransfer) {
+      event.preventDefault();
+      return;
+    }
+
+    setExplorerPanelFocus(true);
+
+    const dragEntries = getDragEntriesForNode(node);
+    if (!dragEntries.length) {
+      event.preventDefault();
+      return;
+    }
+
+    if (!(explorerSelectedPaths.size > 1 && explorerSelectedPaths.has(node.path))) {
+      setExplorerSingleSelection(node.path);
+    }
+
+    explorerDragState = {
+      entries: dragEntries
+    };
+
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', node.path);
+    closeExplorerContextMenu();
+    clearExplorerDragVisualState();
+  });
+
+  row.addEventListener('dragend', () => {
+    explorerDragState = null;
+    clearExplorerDragVisualState();
+  });
 
   row.addEventListener('contextmenu', (event) => {
     event.preventDefault();
@@ -3004,6 +5514,50 @@ function buildTreeNode(node) {
         expandedFolders.add(node.path);
       }
       renderTree();
+    });
+
+    row.addEventListener('dragenter', (event) => {
+      if (!explorerDragState || !canMoveEntriesToDestination(explorerDragState.entries, node.path)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      setExplorerRootDropTarget(false);
+      setExplorerDropTargetPath(node.path);
+    });
+
+    row.addEventListener('dragover', (event) => {
+      if (!explorerDragState || !canMoveEntriesToDestination(explorerDragState.entries, node.path)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'move';
+      }
+      setExplorerRootDropTarget(false);
+      setExplorerDropTargetPath(node.path);
+    });
+
+    row.addEventListener('drop', async (event) => {
+      if (!explorerDragState) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const dragEntries = explorerDragState.entries;
+      explorerDragState = null;
+      clearExplorerDragVisualState();
+
+      try {
+        await moveExplorerEntries(dragEntries, node.path);
+      } catch (error) {
+        alert(error.message || String(error));
+      }
     });
 
     item.appendChild(row);
@@ -3121,6 +5675,7 @@ function buildTreeNode(node) {
 
 function renderTree() {
   treeRoot.innerHTML = '';
+  clearExplorerDragVisualState();
 
   treeRoot.oncontextmenu = (event) => {
     event.preventDefault();
@@ -3183,10 +5738,60 @@ function renderTree() {
   }
 
   treeRoot.appendChild(list);
+
+  treeRoot.ondragover = (event) => {
+    if (!explorerDragState || !project.rootPath) {
+      return;
+    }
+
+    if (event.target.closest('.tree-node')) {
+      return;
+    }
+
+    if (!canMoveEntriesToDestination(explorerDragState.entries, project.rootPath)) {
+      setExplorerRootDropTarget(false);
+      return;
+    }
+
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = 'move';
+    }
+    setExplorerDropTargetPath(null);
+    setExplorerRootDropTarget(true);
+  };
+
+  treeRoot.ondragleave = (event) => {
+    if (!treeRoot.contains(event.relatedTarget)) {
+      clearExplorerDragVisualState();
+    }
+  };
+
+  treeRoot.ondrop = async (event) => {
+    if (!explorerDragState || !project.rootPath) {
+      return;
+    }
+
+    if (event.target.closest('.tree-node')) {
+      return;
+    }
+
+    event.preventDefault();
+    const dragEntries = explorerDragState.entries;
+    explorerDragState = null;
+    clearExplorerDragVisualState();
+
+    try {
+      await moveExplorerEntries(dragEntries, project.rootPath);
+    } catch (error) {
+      alert(error.message || String(error));
+    }
+  };
 }
 
 async function refreshProjectTree() {
-  const hadProject = Boolean(project.rootPath);
+  const previousRootPath = project.rootPath;
+  const hadProject = Boolean(previousRootPath);
   project = await api.refreshProject();
 
   if (hadProject && !project.rootPath) {
@@ -3202,6 +5807,13 @@ async function refreshProjectTree() {
   renderTree();
   refreshFileSearchIndex();
   syncAiChatControls();
+
+  if (previousRootPath !== project.rootPath || activeSidebarPanel === 'run-debug') {
+    await loadLaunchConfigFromDisk();
+  } else {
+    renderRunDebugPanel();
+  }
+
   await refreshSourceControlPanel();
 }
 
@@ -3496,6 +6108,8 @@ async function applyOpenedProject(opened) {
   renderTree();
   refreshFileSearchIndex();
   syncAiChatControls();
+  await loadAiConversationFromDisk();
+  await loadLaunchConfigFromDisk();
   await refreshSourceControlPanel();
 
   killAllTerminalSessions();
@@ -3545,6 +6159,7 @@ async function closeFolder() {
   refreshFileSearchIndex();
   applyScmState('no-project');
   clearAiConversationHistory();
+  await loadLaunchConfigFromDisk();
   updateEditorTitle();
   renderTabs();
 
@@ -3554,6 +6169,10 @@ async function closeFolder() {
 
 sidebarTabExplorer.addEventListener('click', () => {
   setSidebarPanel('explorer');
+});
+
+sidebarTabRunDebug.addEventListener('click', () => {
+  setSidebarPanel('run-debug');
 });
 
 sidebarTabSourceControl.addEventListener('click', () => {
@@ -3576,6 +6195,117 @@ httpMethodSelect.addEventListener('change', () => {
 
 httpSendBtn.addEventListener('click', async () => {
   await sendHttpRequestFromPanel();
+});
+
+editorPlayBtn.addEventListener('click', async (event) => {
+  event.stopPropagation();
+  try {
+    await handleEditorPlayClick();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+editorPlayMenuBtn.addEventListener('click', async (event) => {
+  event.stopPropagation();
+  try {
+    await handleEditorPlayMenuClick();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+runDebugCreateBtn.addEventListener('click', async () => {
+  try {
+    await createLaunchConfigFromPanel();
+    await refreshProjectTree();
+    await loadLaunchConfigFromDisk();
+    openLaunchEditor(null);
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+runDebugRefreshBtn.addEventListener('click', async () => {
+  try {
+    await loadLaunchConfigFromDisk();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+runDebugNewOptionBtn.addEventListener('click', () => {
+  openLaunchEditor(null);
+});
+
+runDebugCancelEditBtn.addEventListener('click', () => {
+  closeLaunchEditor();
+  renderRunDebugPanel();
+});
+
+runDebugAddActionBtn.addEventListener('click', () => {
+  if (!launchEditorState.draft) {
+    return;
+  }
+
+  launchEditorState.draft.actions.push(createDefaultLaunchAction('command'));
+  renderRunDebugPanel();
+});
+
+runDebugSaveOptionBtn.addEventListener('click', async () => {
+  try {
+    await saveLaunchEditorDraft();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+runDebugOptionNameInput.addEventListener('input', () => {
+  if (launchEditorState.draft) {
+    launchEditorState.draft.name = runDebugOptionNameInput.value;
+  }
+
+  clearLaunchEditorValidationError('option.name');
+  removeLaunchFieldErrorByKey('option.name');
+});
+
+runDebugOptionDescriptionInput.addEventListener('input', () => {
+  if (launchEditorState.draft) {
+    launchEditorState.draft.description = runDebugOptionDescriptionInput.value;
+  }
+});
+
+runDebugOptionDefaultInput.addEventListener('change', () => {
+  if (launchEditorState.draft) {
+    launchEditorState.draft.default = Boolean(runDebugOptionDefaultInput.checked);
+  }
+});
+
+runDebugActionsList.addEventListener('dragover', (event) => {
+  if (launchEditorState.dragActionId) {
+    event.preventDefault();
+  }
+});
+
+runDebugActionsList.addEventListener('drop', (event) => {
+  if (!launchEditorState.dragActionId || !launchEditorState.draft || !launchEditorState.draft.actions.length) {
+    return;
+  }
+
+  if (event.target.closest('.run-debug-action-row')) {
+    return;
+  }
+
+  event.preventDefault();
+  const actions = launchEditorState.draft.actions;
+  const fromIndex = actions.findIndex((entry) => entry.id === launchEditorState.dragActionId);
+  if (fromIndex < 0) {
+    return;
+  }
+
+  const [moved] = actions.splice(fromIndex, 1);
+  actions.push(moved);
+  renderRunDebugPanel();
 });
 
 httpBodyInput.addEventListener('keydown', async (event) => {
@@ -3643,6 +6373,10 @@ scmSyncFetchOption.addEventListener('click', async (event) => {
 });
 
 document.addEventListener('click', (event) => {
+  if (!event.target.closest('.editor-play-wrap')) {
+    closeEditorPlayMenu();
+  }
+
   if (!event.target.closest('.scm-sync-split')) {
     closeScmSyncMenu();
   }
@@ -3805,7 +6539,45 @@ if (api.onMenuAction) {
   });
 }
 
+if (api.onProjectChanged) {
+  api.onProjectChanged(() => {
+    if (!project.rootPath) {
+      return;
+    }
+
+    if (externalProjectRefreshTimer) {
+      clearTimeout(externalProjectRefreshTimer);
+    }
+
+    externalProjectRefreshTimer = setTimeout(async () => {
+      externalProjectRefreshTimer = null;
+      try {
+        await refreshProjectTree();
+      } catch {
+        // Keep UI responsive if a transient refresh error occurs.
+      }
+    }, 300);
+  });
+}
+
 document.addEventListener('keydown', async (event) => {
+  if (event.key === 'Escape') {
+    closeEditorPlayMenu();
+  }
+
+  try {
+    const handledByExplorer = await handleExplorerKeyboardShortcut(event);
+    if (handledByExplorer) {
+      event.preventDefault();
+      closeExplorerContextMenu();
+      return;
+    }
+  } catch (error) {
+    event.preventDefault();
+    alert(error.message || String(error));
+    return;
+  }
+
   if ((event.ctrlKey || event.metaKey) && event.altKey && event.key.toLowerCase() === 'l') {
     event.preventDefault();
     toggleThemeMode();
@@ -3907,6 +6679,7 @@ aiClearKeyBtn.addEventListener('click', () => {
 
 aiClearChatBtn.addEventListener('click', () => {
   clearAiConversationHistory();
+  saveAiConversationToDisk().catch(() => {});
 });
 
 aiSendBtn.addEventListener('click', async () => {
@@ -3930,6 +6703,7 @@ aiSendBtn.addEventListener('click', async () => {
   autoResizeAiPrompt();
   const userIndex = recordAiConversation('user', prompt);
   addAiMessage('user', prompt, { convIndex: userIndex });
+  await saveAiConversationToDisk();
   aiAbortController = new AbortController();
   setAiBusy(true);
 
@@ -3937,6 +6711,7 @@ aiSendBtn.addEventListener('click', async () => {
     const reply = await sendAiChat(aiConversation.slice(0, aiConversationCursor + 1), aiAbortController.signal);
     const assistantIndex = recordAiConversation('assistant', reply);
     addAiMessage('assistant', reply, { convIndex: assistantIndex });
+    await saveAiConversationToDisk();
   } catch (error) {
     if (error.name === 'AbortError' || error.message === 'AI request stopped by user.') {
       addAiActivity('Stopped by user.');

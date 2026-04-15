@@ -7,7 +7,7 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   closeProject: () => ipcRenderer.invoke('project:close'),
   clearRecentProjects: () => ipcRenderer.invoke('project:clearRecent'),
   refreshProject: () => ipcRenderer.invoke('project:refresh'),
-  readFile: (filePath) => ipcRenderer.invoke('file:read', filePath),
+  readFile: (payload) => ipcRenderer.invoke('file:read', payload),
   writeFile: (payload) => ipcRenderer.invoke('file:write', payload),
   saveFileAs: (payload) => ipcRenderer.invoke('file:saveAs', payload),
   createFile: (payload) => ipcRenderer.invoke('fs:createFile', payload),
@@ -52,5 +52,10 @@ contextBridge.exposeInMainWorld('qwaleApi', {
     const listener = (_, payload) => callback(payload);
     ipcRenderer.on('menu:action', listener);
     return () => ipcRenderer.removeListener('menu:action', listener);
+  },
+  onProjectChanged: (callback) => {
+    const listener = (_, payload) => callback(payload);
+    ipcRenderer.on('project:changed', listener);
+    return () => ipcRenderer.removeListener('project:changed', listener);
   }
 });

@@ -18,6 +18,9 @@
           <button id="sidebarTabExplorer" class="explorer-side-tab active" type="button" title="Explorer">
             <span class="explorer-side-icon explorer-side-icon-files" aria-hidden="true"></span>
           </button>
+          <button id="sidebarTabRunDebug" class="explorer-side-tab" type="button" title="Run and Debug" aria-label="Run and Debug">
+            <span class="explorer-side-icon explorer-side-icon-run-debug" aria-hidden="true"></span>
+          </button>
           <button id="sidebarTabSourceControl" class="explorer-side-tab" type="button" title="Version Control" aria-label="Version Control">
             <span class="explorer-side-icon explorer-side-icon-branch" aria-hidden="true"></span>
             <span id="scmTabBadge" class="scm-tab-badge hidden" aria-hidden="true"></span>
@@ -33,6 +36,64 @@
             <span id="projectInfo" class="project-info">No folder opened</span>
           </div>
           <div id="treeRoot" class="tree"></div>
+        </div>
+
+        <div id="runDebugPanelView" class="explorer-panel-view">
+          <div class="panel-title panel-title-split">
+            <span>Run and Debug</span>
+            <div class="run-debug-toolbar">
+              <button id="runDebugNewOptionBtn" class="run-debug-icon-btn hidden" type="button" title="New launch option" aria-label="New launch option">
+                <span class="run-debug-icon run-debug-icon-add" aria-hidden="true"></span>
+              </button>
+              <button id="runDebugRefreshBtn" class="run-debug-icon-btn hidden" type="button" title="Refresh launch options" aria-label="Refresh launch options">
+                <span class="run-debug-icon run-debug-icon-refresh" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+          <div class="run-debug-panel-body">
+            <div id="runDebugEmptyState" class="run-debug-empty-state hidden">
+              <button id="runDebugCreateBtn" class="run-debug-create-btn" type="button">Create Launch Options</button>
+              <p id="runDebugEmptyDescription" class="run-debug-empty-text">Create .qwcode/launch.json in this project to define launch options made of command, program, and website actions.</p>
+            </div>
+
+            <div id="runDebugContent" class="run-debug-content hidden">
+              <div id="runDebugOptionsList" class="run-debug-options-list"></div>
+            </div>
+
+            <div id="runDebugEditor" class="run-debug-editor hidden">
+              <div class="run-debug-editor-header">
+                <span id="runDebugEditorTitle" class="run-debug-editor-title">Launch Option</span>
+                <div class="run-debug-editor-actions">
+                  <button id="runDebugSaveOptionBtn" class="run-debug-icon-btn primary" type="button" title="Save launch option" aria-label="Save launch option">
+                    <span class="run-debug-icon run-debug-icon-save" aria-hidden="true"></span>
+                  </button>
+                  <button id="runDebugCancelEditBtn" class="run-debug-icon-btn" type="button" title="Cancel editing" aria-label="Cancel editing">
+                    <span class="run-debug-icon run-debug-icon-cancel" aria-hidden="true"></span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="run-debug-editor-grid">
+                <label class="run-debug-label" for="runDebugOptionNameInput">Name</label>
+                <input id="runDebugOptionNameInput" class="run-debug-input" type="text" placeholder="My launch option" />
+                <label class="run-debug-label" for="runDebugOptionDescriptionInput">Description</label>
+                <input id="runDebugOptionDescriptionInput" class="run-debug-input" type="text" placeholder="Optional description" />
+                <label class="run-debug-checkbox" for="runDebugOptionDefaultInput">
+                  <input id="runDebugOptionDefaultInput" type="checkbox" />
+                  <span>Default launch option</span>
+                </label>
+              </div>
+
+              <div class="run-debug-actions-header">
+                <span class="run-debug-label">Actions</span>
+                <button id="runDebugAddActionBtn" class="run-debug-icon-btn" type="button" title="Add action" aria-label="Add action">
+                  <span class="run-debug-icon run-debug-icon-add" aria-hidden="true"></span>
+                </button>
+              </div>
+
+              <div id="runDebugActionsList" class="run-debug-actions-list"></div>
+            </div>
+          </div>
         </div>
 
         <div id="sourceControlPanelView" class="explorer-panel-view">
@@ -137,6 +198,16 @@
       <div id="aiResizeHandle" class="ai-resize-handle"></div>
       <div class="editor-tabs-bar">
         <div id="editorTabs" class="editor-tabs"></div>
+        <div class="editor-play-wrap">
+          <button id="editorPlayBtn" class="editor-play-btn" type="button" title="Run default launch option">
+            <span id="editorPlayBtnIcon" class="editor-play-btn-icon editor-play-btn-icon-run" aria-hidden="true"></span>
+            <span id="editorPlayBtnLabel">Run/Debug</span>
+          </button>
+          <button id="editorPlayMenuBtn" class="editor-play-menu-btn" type="button" title="Show launch options" aria-label="Show launch options">
+            <span class="editor-play-chevron" aria-hidden="true"></span>
+          </button>
+          <div id="editorPlayMenu" class="editor-play-menu hidden"></div>
+        </div>
         <button id="aiPanelOpenBtn" class="ai-panel-open-btn hidden" type="button" title="Open AI panel" aria-label="Open AI panel">
           <span class="ai-panel-open-icon" aria-hidden="true"></span>
         </button>

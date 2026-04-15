@@ -12,7 +12,120 @@ let mainWindow = null;
 const terminals = new Map();
 let recentProjects = [];
 const windowProjectState = new Map();
+const projectWatchers = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
+
+function killTerminalSession(termId) {
+  const session = terminals.get(termId);
+  if (!session) {
+    return;
+  }
+
+  try {
+    session.ptyProcess.kill();
+  } catch {
+    // Ignore teardown failures while closing terminal sessions.
+  }
+
+  terminals.delete(termId);
+}
+
+function killTerminalsForWebContents(webContentsId) {
+  for (const [id, term] of terminals.entries()) {
+    if (term.webContentsId === webContentsId) {
+      killTerminalSession(id);
+    }
+  }
+}
+
+function killAllTerminals() {
+  for (const termId of terminals.keys()) {
+    killTerminalSession(termId);
+  }
+}
+
+function stopProjectWatcherForWebContents(webContentsId) {
+  const watcherEntry = projectWatchers.get(webContentsId);
+  if (!watcherEntry) {
+    return;
+  }
+
+  if (watcherEntry.timer) {
+    clearTimeout(watcherEntry.timer);
+  }
+
+  try {
+    watcherEntry.watcher.close();
+  } catch {
+    // Ignore watcher close errors during teardown.
+  }
+
+  projectWatchers.delete(webContentsId);
+}
+
+function stopAllProjectWatchers() {
+  for (const webContentsId of projectWatchers.keys()) {
+    stopProjectWatcherForWebContents(webContentsId);
+  }
+}
+
+function notifyProjectChanged(webContentsId, expectedProjectPath) {
+  const currentProjectPath = windowProjectState.get(webContentsId);
+  if (!currentProjectPath || path.resolve(currentProjectPath) !== path.resolve(expectedProjectPath)) {
+    return;
+  }
+
+  const targetWindow = BrowserWindow
+    .getAllWindows()
+    .find((win) => !win.isDestroyed() && win.webContents.id === webContentsId);
+  if (!targetWindow || targetWindow.isDestroyed()) {
+    return;
+  }
+
+  targetWindow.webContents.send('project:changed', {
+    rootPath: currentProjectPath
+  });
+}
+
+function scheduleProjectChangedNotification(webContentsId, expectedProjectPath) {
+  const watcherEntry = projectWatchers.get(webContentsId);
+  if (!watcherEntry) {
+    return;
+  }
+
+  if (watcherEntry.timer) {
+    clearTimeout(watcherEntry.timer);
+  }
+
+  watcherEntry.timer = setTimeout(() => {
+    watcherEntry.timer = null;
+    notifyProjectChanged(webContentsId, expectedProjectPath);
+  }, 250);
+}
+
+function startProjectWatcherForWebContents(webContentsId, projectPath) {
+  stopProjectWatcherForWebContents(webContentsId);
+
+  if (!projectPath) {
+    return;
+  }
+
+  const normalizedProjectPath = path.resolve(projectPath);
+
+  try {
+    const watcher = fs.watch(normalizedProjectPath, { recursive: true }, () => {
+      scheduleProjectChangedNotification(webContentsId, normalizedProjectPath);
+    });
+
+    projectWatchers.set(webContentsId, {
+      watcher,
+      rootPath: normalizedProjectPath,
+      timer: null
+    });
+  } catch {
+    // If watcher setup fails, project refresh remains manual.
+  }
+}
 
 function configureChromiumStoragePaths() {
   try {
@@ -300,6 +413,7 @@ function createWindow(initialProjectPath = null) {
   }
 
   windowProjectState.set(createdWebContentsId, initialProjectPath ? path.resolve(initialProjectPath) : null);
+  startProjectWatcherForWebContents(createdWebContentsId, windowProjectState.get(createdWebContentsId));
 
   createdWindow.loadFile(path.join(__dirname, 'renderer/index.html'));
   createdWindow.setMenuBarVisibility(!isWindows);
@@ -310,13 +424,8 @@ function createWindow(initialProjectPath = null) {
     }
 
     windowProjectState.delete(createdWebContentsId);
-
-    for (const [id, term] of terminals.entries()) {
-      if (term.webContentsId === createdWebContentsId) {
-        term.ptyProcess.kill();
-        terminals.delete(id);
-      }
-    }
+    stopProjectWatcherForWebContents(createdWebContentsId);
+    killTerminalsForWebContents(createdWebContentsId);
   });
 
   return createdWindow;
@@ -384,18 +493,27 @@ async function buildTree(dirPath, projectPath, matcher, inheritedIgnored = false
   const dirents = await fsp.readdir(dirPath, { withFileTypes: true });
   const folders = [];
   const files = [];
+  const pendingFolderChildren = [];
 
   for (const dirent of dirents) {
     const fullPath = path.join(dirPath, dirent.name);
     if (dirent.isDirectory()) {
       const ignored = inheritedIgnored || isIgnoredPath(matcher, projectPath, fullPath, true);
-      folders.push({
+      const folderNode = {
         name: dirent.name,
         path: fullPath,
         type: 'folder',
         ignored,
-        children: await buildTree(fullPath, projectPath, matcher, ignored)
-      });
+        children: []
+      };
+      folders.push(folderNode);
+
+      pendingFolderChildren.push(
+        buildTree(fullPath, projectPath, matcher, ignored)
+          .then((children) => {
+            folderNode.children = children;
+          })
+      );
     } else {
       const ignored = inheritedIgnored || isIgnoredPath(matcher, projectPath, fullPath, false);
       files.push({
@@ -405,6 +523,10 @@ async function buildTree(dirPath, projectPath, matcher, inheritedIgnored = false
         ignored
       });
     }
+  }
+
+  if (pendingFolderChildren.length > 0) {
+    await Promise.all(pendingFolderChildren);
   }
 
   folders.sort((a, b) => a.name.localeCompare(b.name));
@@ -445,6 +567,7 @@ function isIgnoredPath(matcher, projectPath, targetPath, isDirectory) {
 async function buildSearchableFiles(dirPath, projectPath, matcher) {
   const dirents = await fsp.readdir(dirPath, { withFileTypes: true });
   const files = [];
+  const pendingNestedFiles = [];
 
   for (const dirent of dirents) {
     const fullPath = path.join(dirPath, dirent.name);
@@ -453,7 +576,7 @@ async function buildSearchableFiles(dirPath, projectPath, matcher) {
       if (isIgnoredPath(matcher, projectPath, fullPath, true)) {
         continue;
       }
-      files.push(...await buildSearchableFiles(fullPath, projectPath, matcher));
+      pendingNestedFiles.push(buildSearchableFiles(fullPath, projectPath, matcher));
       continue;
     }
 
@@ -462,6 +585,13 @@ async function buildSearchableFiles(dirPath, projectPath, matcher) {
     }
 
     files.push(fullPath);
+  }
+
+  if (pendingNestedFiles.length > 0) {
+    const nestedLists = await Promise.all(pendingNestedFiles);
+    for (const nestedFiles of nestedLists) {
+      files.push(...nestedFiles);
+    }
   }
 
   files.sort((a, b) => a.localeCompare(b));
@@ -489,9 +619,12 @@ ipcMain.handle('project:open', async (event) => {
   }
 
   windowProjectState.set(event.sender.id, selectedProjectPath);
+  startProjectWatcherForWebContents(event.sender.id, selectedProjectPath);
   const matcher = await createGitignoreMatcher(selectedProjectPath);
-  const tree = await buildTree(selectedProjectPath, selectedProjectPath, matcher, false);
-  const searchableFiles = await buildSearchableFiles(selectedProjectPath, selectedProjectPath, matcher);
+  const [tree, searchableFiles] = await Promise.all([
+    buildTree(selectedProjectPath, selectedProjectPath, matcher, false),
+    buildSearchableFiles(selectedProjectPath, selectedProjectPath, matcher)
+  ]);
 
   return {
     canceled: false,
@@ -523,9 +656,12 @@ ipcMain.handle('project:openPath', async (event, folderPath) => {
   }
 
   windowProjectState.set(event.sender.id, resolved);
+  startProjectWatcherForWebContents(event.sender.id, resolved);
   const matcher = await createGitignoreMatcher(resolved);
-  const tree = await buildTree(resolved, resolved, matcher, false);
-  const searchableFiles = await buildSearchableFiles(resolved, resolved, matcher);
+  const [tree, searchableFiles] = await Promise.all([
+    buildTree(resolved, resolved, matcher, false),
+    buildSearchableFiles(resolved, resolved, matcher)
+  ]);
 
   return {
     canceled: false,
@@ -542,6 +678,7 @@ ipcMain.handle('project:getRecent', async () => {
 
 ipcMain.handle('project:close', async (event) => {
   windowProjectState.set(event.sender.id, null);
+  stopProjectWatcherForWebContents(event.sender.id);
   return { ok: true };
 });
 
@@ -559,8 +696,10 @@ ipcMain.handle('project:refresh', async (event) => {
   }
 
   const matcher = await createGitignoreMatcher(currentProjectPath);
-  const tree = await buildTree(currentProjectPath, currentProjectPath, matcher, false);
-  const searchableFiles = await buildSearchableFiles(currentProjectPath, currentProjectPath, matcher);
+  const [tree, searchableFiles] = await Promise.all([
+    buildTree(currentProjectPath, currentProjectPath, matcher, false),
+    buildSearchableFiles(currentProjectPath, currentProjectPath, matcher)
+  ]);
   return {
     rootPath: currentProjectPath,
     rootName: path.basename(currentProjectPath),
@@ -569,14 +708,32 @@ ipcMain.handle('project:refresh', async (event) => {
   };
 });
 
-ipcMain.handle('file:read', async (event, filePath) => {
+ipcMain.handle('file:read', async (event, input) => {
+  const request = typeof input === 'string'
+    ? { filePath: input, allowMissing: false }
+    : (input && typeof input === 'object' ? input : {});
+
+  const filePath = String(request.filePath || '');
+  const allowMissing = Boolean(request.allowMissing);
+
+  if (!filePath) {
+    throw new Error('File path is required.');
+  }
+
   const currentProjectPath = getProjectPathForSender(event.sender);
   if (!isWithinProject(filePath, currentProjectPath)) {
     throw new Error('File is outside the opened project.');
   }
 
-  const buffer = await fsp.readFile(filePath);
-  return decodeBufferWithEncoding(buffer);
+  try {
+    const buffer = await fsp.readFile(filePath);
+    return decodeBufferWithEncoding(buffer);
+  } catch (error) {
+    if (allowMissing && error && error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
 });
 
 ipcMain.handle('file:write', async (event, { filePath, content }) => {
@@ -651,8 +808,21 @@ ipcMain.handle('fs:createFolder', async (event, { parentPath, name }) => {
     throw new Error('Target path is outside the opened project.');
   }
 
-  await fsp.mkdir(targetPath, { recursive: false });
-  return { ok: true, path: targetPath };
+  try {
+    await fsp.mkdir(targetPath, { recursive: false });
+    return { ok: true, path: targetPath, created: true };
+  } catch (error) {
+    if (error && error.code === 'EEXIST') {
+      const existing = await fsp.stat(targetPath).catch(() => null);
+      if (existing && existing.isDirectory()) {
+        return { ok: true, path: targetPath, created: false };
+      }
+
+      throw new Error('A file with the same name already exists.');
+    }
+
+    throw error;
+  }
 });
 
 ipcMain.handle('fs:rename', async (event, { targetPath, newName }) => {
@@ -1214,6 +1384,11 @@ ipcMain.handle('terminal:create', (event, { cwd, shellType }) => {
   const termId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const projectCwd = cwd && fs.existsSync(cwd) ? cwd : senderProjectPath || app.getPath('home');
   const requestedShellType = typeof shellType === 'string' ? shellType : 'powershell';
+
+  if (requestedShellType === 'wsl' && !isWslAvailable()) {
+    throw new Error('WSL is not installed on this device.');
+  }
+
   const command = resolveTerminalCommand(requestedShellType);
 
   const ptyProcess = pty.spawn(command.shell, command.args, {
@@ -1274,11 +1449,7 @@ ipcMain.on('terminal:resize', (_, { termId, cols, rows }) => {
 });
 
 ipcMain.on('terminal:kill', (_, { termId }) => {
-  const terminal = terminals.get(termId);
-  if (terminal) {
-    terminal.ptyProcess.kill();
-    terminals.delete(termId);
-  }
+  killTerminalSession(termId);
 });
 
 ipcMain.handle('ai:runCommand', async (event, { command }) => {
@@ -1325,7 +1496,14 @@ app.whenReady().then(async () => {
   });
 });
 
+app.on('before-quit', () => {
+  stopAllProjectWatchers();
+  killAllTerminals();
+});
+
 app.on('window-all-closed', () => {
+  stopAllProjectWatchers();
+  killAllTerminals();
   if (process.platform !== 'darwin') {
     app.quit();
   }
