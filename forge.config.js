@@ -5,14 +5,16 @@ const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 module.exports = {
   packagerConfig: {
     asar: true,
-    icon: path.join(__dirname, 'src/renderer/assets/app-logo.ico'),
+    // Used for the packaged app executable icon (Windows expects .ico).
+    icon: path.join(__dirname, 'src/renderer/assets/desktop-app-logo'),
   },
   rebuildConfig: {},
   makers: [
     {
       name: '@electron-forge/maker-squirrel',
       config: {
-        iconUrl: path.join(__dirname, 'src/renderer/assets/app-logo.ico'),
+        // iconUrl is used by Squirrel metadata (Add/Remove Programs), not the app EXE icon.
+        iconUrl: path.join(__dirname, 'src/renderer/assets/desktop-app-logo.ico'),
         setupIcon: path.join(__dirname, 'src/renderer/assets/setup-app-logo.ico'),
       },
     },
