@@ -199,7 +199,13 @@
       <div class="editor-tabs-bar">
         <div id="editorTabs" class="editor-tabs"></div>
         <div class="editor-play-wrap">
-          <button id="editorPlayBtn" class="editor-play-btn" type="button" title="Run launch option">Play</button>
+          <button id="editorPlayBtn" class="editor-play-btn" type="button" title="Run default launch option">
+            <span id="editorPlayBtnIcon" class="editor-play-btn-icon editor-play-btn-icon-run" aria-hidden="true"></span>
+            <span id="editorPlayBtnLabel">Run/Debug</span>
+          </button>
+          <button id="editorPlayMenuBtn" class="editor-play-menu-btn" type="button" title="Show launch options" aria-label="Show launch options">
+            <span class="editor-play-chevron" aria-hidden="true"></span>
+          </button>
           <div id="editorPlayMenu" class="editor-play-menu hidden"></div>
         </div>
         <button id="aiPanelOpenBtn" class="ai-panel-open-btn hidden" type="button" title="Open AI panel" aria-label="Open AI panel">

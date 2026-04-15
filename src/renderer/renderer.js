@@ -31,7 +31,10 @@ const projectInfo = document.getElementById('projectInfo');
 const treeRoot = document.getElementById('treeRoot');
 const scmTabBadge = document.getElementById('scmTabBadge');
 const editorTabs = document.getElementById('editorTabs');
+const editorPlayMenuBtn = document.getElementById('editorPlayMenuBtn');
 const editorPlayBtn = document.getElementById('editorPlayBtn');
+const editorPlayBtnIcon = document.getElementById('editorPlayBtnIcon');
+const editorPlayBtnLabel = document.getElementById('editorPlayBtnLabel');
 const editorPlayMenu = document.getElementById('editorPlayMenu');
 const editor = document.getElementById('editor');
 const imagePreview = document.getElementById('imagePreview');
@@ -2022,6 +2025,7 @@ function renderRunDebugPanel() {
   const hasProject = Boolean(project.rootPath);
   const hasConfig = hasProject && launchConfigExists;
 
+  syncEditorPlayButtonState();
   syncRunDebugToolbarVisibility(hasConfig);
 
   if (!hasProject) {
@@ -2537,20 +2541,83 @@ function closeEditorPlayMenu() {
   editorPlayMenu.innerHTML = '';
 }
 
-function showEditorPlayMenu(options) {
+function getEditorPlayButtonState(options = launchConfigState.launchOptions) {
+  const defaultOption = getDefaultLaunchOption(options);
+  const defaultIsRunning = Boolean(defaultOption && isLaunchOptionRunning(defaultOption.id));
+
+  return {
+    defaultOption,
+    defaultIsRunning,
+    actionLabel: defaultIsRunning ? 'Stop' : 'Run/Debug',
+    actionTitle: defaultIsRunning
+      ? `Stop ${defaultOption && defaultOption.name ? defaultOption.name : 'default launch option'}`
+      : 'Run default launch option'
+  };
+}
+
+function syncEditorPlayButtonState(options = launchConfigState.launchOptions) {
+  const state = getEditorPlayButtonState(options);
+  editorPlayBtnLabel.textContent = state.actionLabel;
+  editorPlayBtnIcon.classList.toggle('editor-play-btn-icon-run', !state.defaultIsRunning);
+  editorPlayBtnIcon.classList.toggle('editor-play-btn-icon-stop', state.defaultIsRunning);
+  editorPlayBtn.title = state.actionTitle;
+}
+
+async function setLaunchOptionAsDefault(optionId) {
+  const options = Array.isArray(launchConfigState.launchOptions) ? launchConfigState.launchOptions : [];
+  let found = false;
+
+  for (const option of options) {
+    if (!option) {
+      continue;
+    }
+
+    const shouldBeDefault = option.id === optionId;
+    if (shouldBeDefault) {
+      found = true;
+    }
+
+    option.default = shouldBeDefault;
+  }
+
+  if (!found) {
+    throw new Error('Launch option not found.');
+  }
+
+  await saveLaunchConfigToDisk();
+}
+
+function showEditorPlayMenu(options, menuBehavior = {}) {
+  const { setSelectedAsDefaultIfMissing = false } = menuBehavior;
   editorPlayMenu.innerHTML = '';
 
   for (const option of options) {
+    const isRunning = isLaunchOptionRunning(option.id);
+    const optionName = option.name || 'Untitled launch option';
+
     const item = document.createElement('button');
     item.type = 'button';
     item.className = 'editor-play-menu-item';
-    item.textContent = option.name || 'Untitled launch option';
-    item.title = option.description || option.name || '';
+    item.textContent = isRunning ? `Stop ${optionName}` : `Run ${optionName}`;
+    item.title = option.description || optionName;
     item.addEventListener('click', async (event) => {
       event.stopPropagation();
       closeEditorPlayMenu();
+
       try {
-        await startLaunchOption(option.id);
+        const currentOptions = Array.isArray(launchConfigState.launchOptions) ? launchConfigState.launchOptions : [];
+        const defaultOption = getDefaultLaunchOption(currentOptions);
+
+        if (!defaultOption && setSelectedAsDefaultIfMissing) {
+          await setLaunchOptionAsDefault(option.id);
+          renderRunDebugPanel();
+        }
+
+        if (isLaunchOptionRunning(option.id)) {
+          await stopLaunchOption(option.id);
+        } else {
+          await startLaunchOption(option.id);
+        }
       } catch (error) {
         alert(error.message || String(error));
       }
@@ -2562,6 +2629,40 @@ function showEditorPlayMenu(options) {
 }
 
 async function handleEditorPlayClick() {
+  if (!project.rootPath) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  closeEditorPlayMenu();
+
+  await loadLaunchConfigFromDisk();
+
+  if (!launchConfigExists) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  const options = Array.isArray(launchConfigState.launchOptions) ? launchConfigState.launchOptions : [];
+  if (!options.length) {
+    setSidebarPanel('run-debug');
+    return;
+  }
+
+  const state = getEditorPlayButtonState(options);
+  if (state.defaultOption) {
+    if (state.defaultIsRunning) {
+      await stopLaunchOption(state.defaultOption.id);
+    } else {
+      await startLaunchOption(state.defaultOption.id);
+    }
+    return;
+  }
+
+  showEditorPlayMenu(options, { setSelectedAsDefaultIfMissing: true });
+}
+
+async function handleEditorPlayMenuClick() {
   if (!project.rootPath) {
     setSidebarPanel('run-debug');
     return;
@@ -2585,13 +2686,7 @@ async function handleEditorPlayClick() {
     return;
   }
 
-  const defaultOption = getDefaultLaunchOption(options);
-  if (defaultOption) {
-    await startLaunchOption(defaultOption.id);
-    return;
-  }
-
-  showEditorPlayMenu(options);
+  showEditorPlayMenu(options, { setSelectedAsDefaultIfMissing: false });
 }
 
 function renderChangedFilesList(files) {
@@ -5079,6 +5174,15 @@ editorPlayBtn.addEventListener('click', async (event) => {
   event.stopPropagation();
   try {
     await handleEditorPlayClick();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+editorPlayMenuBtn.addEventListener('click', async (event) => {
+  event.stopPropagation();
+  try {
+    await handleEditorPlayMenuClick();
   } catch (error) {
     alert(error.message || String(error));
   }
