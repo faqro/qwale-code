@@ -7,7 +7,7 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   closeProject: () => ipcRenderer.invoke('project:close'),
   clearRecentProjects: () => ipcRenderer.invoke('project:clearRecent'),
   refreshProject: () => ipcRenderer.invoke('project:refresh'),
-  readFile: (filePath) => ipcRenderer.invoke('file:read', filePath),
+  readFile: (payload) => ipcRenderer.invoke('file:read', payload),
   writeFile: (payload) => ipcRenderer.invoke('file:write', payload),
   saveFileAs: (payload) => ipcRenderer.invoke('file:saveAs', payload),
   createFile: (payload) => ipcRenderer.invoke('fs:createFile', payload),
@@ -17,9 +17,6 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   copyPath: (payload) => ipcRenderer.invoke('fs:copy', payload),
   movePath: (payload) => ipcRenderer.invoke('fs:move', payload),
   openInExplorer: (payload) => ipcRenderer.invoke('fs:openInExplorer', payload),
-  getLaunchState: () => ipcRenderer.invoke('launch:getState'),
-  createLaunchConfig: (payload) => ipcRenderer.invoke('launch:createConfig', payload),
-  saveLaunchConfig: (payload) => ipcRenderer.invoke('launch:saveConfig', payload),
   getGitOverview: () => ipcRenderer.invoke('git:getOverview'),
   gitInitRepo: () => ipcRenderer.invoke('git:initRepo'),
   gitCommit: (payload) => ipcRenderer.invoke('git:commit', payload),
@@ -41,7 +38,6 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   sendTerminalInput: (payload) => ipcRenderer.send('terminal:input', payload),
   resizeTerminal: (payload) => ipcRenderer.send('terminal:resize', payload),
   killTerminal: (payload) => ipcRenderer.send('terminal:kill', payload),
-  interruptTerminal: (payload) => ipcRenderer.send('terminal:interrupt', payload),
   onTerminalData: (callback) => {
     const listener = (_, payload) => callback(payload);
     ipcRenderer.on('terminal:data', listener);

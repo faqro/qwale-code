@@ -13,9 +13,6 @@ const terminals = new Map();
 let recentProjects = [];
 const windowProjectState = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
-const LAUNCH_CONFIG_VERSION = 1;
-
-const LAUNCH_ACTION_TYPES = new Set(['command', 'program', 'website']);
 
 function configureChromiumStoragePaths() {
   try {
@@ -471,196 +468,6 @@ async function buildSearchableFiles(dirPath, projectPath, matcher) {
   return files;
 }
 
-async function pathExists(targetPath) {
-  try {
-    await fsp.access(targetPath, fs.constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function getLaunchDirectoryPath(projectPath) {
-  return path.join(projectPath, '.qwcode');
-}
-
-function getLaunchConfigPath(projectPath) {
-  return path.join(getLaunchDirectoryPath(projectPath), 'launch.json');
-}
-
-function getDefaultLaunchConfig() {
-  return {
-    version: LAUNCH_CONFIG_VERSION,
-    launchOptions: []
-  };
-}
-
-function getDefaultShellType() {
-  return process.platform === 'win32' ? 'powershell' : 'shell';
-}
-
-function toTrimmedString(value, maxLength = 4000) {
-  return String(value || '').trim().slice(0, maxLength);
-}
-
-function sanitizeShellType(value) {
-  const shellType = String(value || '').trim().toLowerCase();
-  const availableProfiles = getAvailableTerminalProfiles().map((profile) => profile.id);
-  return availableProfiles.includes(shellType) ? shellType : getDefaultShellType();
-}
-
-function ensureLaunchEntityId(value) {
-  const id = String(value || '').trim();
-  if (id) {
-    return id;
-  }
-  return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-}
-
-function sanitizeLaunchAction(action) {
-  if (!action || typeof action !== 'object') {
-    return null;
-  }
-
-  const type = String(action.type || '').trim().toLowerCase();
-  if (!LAUNCH_ACTION_TYPES.has(type)) {
-    return null;
-  }
-
-  if (type === 'website') {
-    const url = toTrimmedString(action.url, 3000);
-    if (!url) {
-      return null;
-    }
-
-    return {
-      id: ensureLaunchEntityId(action.id),
-      type,
-      url
-    };
-  }
-
-  if (type === 'program') {
-    const program = toTrimmedString(action.program, 2000);
-    if (!program) {
-      return null;
-    }
-
-    return {
-      id: ensureLaunchEntityId(action.id),
-      type,
-      shell: sanitizeShellType(action.shell),
-      program,
-      args: toTrimmedString(action.args, 4000),
-      cwd: toTrimmedString(action.cwd, 2000)
-    };
-  }
-
-  const command = toTrimmedString(action.command, 8000);
-  if (!command) {
-    return null;
-  }
-
-  return {
-    id: ensureLaunchEntityId(action.id),
-    type,
-    shell: sanitizeShellType(action.shell),
-    command,
-    cwd: toTrimmedString(action.cwd, 2000)
-  };
-}
-
-function sanitizeLaunchOption(option) {
-  if (!option || typeof option !== 'object') {
-    return null;
-  }
-
-  const name = toTrimmedString(option.name, 160);
-  if (!name) {
-    return null;
-  }
-
-  const sourceActions = Array.isArray(option.actions) ? option.actions : [];
-  const actions = sourceActions.map((action) => sanitizeLaunchAction(action)).filter(Boolean);
-  if (!actions.length) {
-    return null;
-  }
-
-  return {
-    id: ensureLaunchEntityId(option.id),
-    name,
-    description: toTrimmedString(option.description, 800),
-    actions
-  };
-}
-
-function sanitizeLaunchConfig(input) {
-  const source = input && typeof input === 'object' ? input : {};
-  const sourceOptions = Array.isArray(source.launchOptions) ? source.launchOptions : [];
-  const launchOptions = sourceOptions.map((option) => sanitizeLaunchOption(option)).filter(Boolean);
-
-  return {
-    version: LAUNCH_CONFIG_VERSION,
-    launchOptions
-  };
-}
-
-async function getLaunchConfigState(projectPath) {
-  const launchDirPath = getLaunchDirectoryPath(projectPath);
-  const launchConfigPath = getLaunchConfigPath(projectPath);
-  const gitignorePath = path.join(projectPath, '.gitignore');
-
-  const hasQwcodeDir = await pathExists(launchDirPath);
-  const hasLaunchFile = await pathExists(launchConfigPath);
-  const hasGitignore = await pathExists(gitignorePath);
-
-  if (!hasLaunchFile) {
-    return {
-      state: 'missing',
-      hasQwcodeDir,
-      hasLaunchFile,
-      hasGitignore,
-      launchPath: launchConfigPath,
-      config: null
-    };
-  }
-
-  let parsed;
-  try {
-    const raw = await fsp.readFile(launchConfigPath, 'utf8');
-    parsed = raw.trim() ? JSON.parse(raw) : getDefaultLaunchConfig();
-  } catch (error) {
-    throw new Error(`Unable to read launch options: ${error.message}`);
-  }
-
-  return {
-    state: 'ready',
-    hasQwcodeDir,
-    hasLaunchFile,
-    hasGitignore,
-    launchPath: launchConfigPath,
-    config: sanitizeLaunchConfig(parsed)
-  };
-}
-
-async function addQwcodeToGitignore(projectPath) {
-  const gitignorePath = path.join(projectPath, '.gitignore');
-  const hasGitignore = await pathExists(gitignorePath);
-  if (!hasGitignore) {
-    return { updated: false, reason: 'missing' };
-  }
-
-  const current = await fsp.readFile(gitignorePath, 'utf8');
-  const lines = current.split(/\r?\n/).map((line) => line.trim());
-  if (lines.includes('.qwcode') || lines.includes('.qwcode/')) {
-    return { updated: false, reason: 'already-present' };
-  }
-
-  const separator = current.length === 0 || current.endsWith('\n') ? '' : '\n';
-  await fsp.writeFile(gitignorePath, `${current}${separator}.qwcode/\n`, 'utf8');
-  return { updated: true };
-}
-
 ipcMain.handle('project:open', async (event) => {
   const senderWindow = BrowserWindow.fromWebContents(event.sender);
   const existingProjectPath = getProjectPathForSender(event.sender);
@@ -762,74 +569,32 @@ ipcMain.handle('project:refresh', async (event) => {
   };
 });
 
-ipcMain.handle('launch:getState', async (event) => {
-  const currentProjectPath = getProjectPathForSender(event.sender);
-  if (!currentProjectPath) {
-    return {
-      state: 'no-project',
-      hasQwcodeDir: false,
-      hasLaunchFile: false,
-      hasGitignore: false,
-      launchPath: null,
-      config: null
-    };
+ipcMain.handle('file:read', async (event, input) => {
+  const request = typeof input === 'string'
+    ? { filePath: input, allowMissing: false }
+    : (input && typeof input === 'object' ? input : {});
+
+  const filePath = String(request.filePath || '');
+  const allowMissing = Boolean(request.allowMissing);
+
+  if (!filePath) {
+    throw new Error('File path is required.');
   }
 
-  return getLaunchConfigState(currentProjectPath);
-});
-
-ipcMain.handle('launch:createConfig', async (event, payload = {}) => {
-  const currentProjectPath = getProjectPathForSender(event.sender);
-  if (!currentProjectPath) {
-    throw new Error('Open a project first.');
-  }
-
-  const launchDirPath = getLaunchDirectoryPath(currentProjectPath);
-  const launchConfigPath = getLaunchConfigPath(currentProjectPath);
-  const hasQwcodeDir = await pathExists(launchDirPath);
-
-  await fsp.mkdir(launchDirPath, { recursive: true });
-
-  if (!await pathExists(launchConfigPath)) {
-    const initialConfig = getDefaultLaunchConfig();
-    await fsp.writeFile(launchConfigPath, JSON.stringify(initialConfig, null, 2), 'utf8');
-  }
-
-  const shouldAddToGitignore = Boolean(payload && payload.addToGitignore);
-  if (shouldAddToGitignore && !hasQwcodeDir) {
-    await addQwcodeToGitignore(currentProjectPath);
-  }
-
-  return getLaunchConfigState(currentProjectPath);
-});
-
-ipcMain.handle('launch:saveConfig', async (event, payload = {}) => {
-  const currentProjectPath = getProjectPathForSender(event.sender);
-  if (!currentProjectPath) {
-    throw new Error('Open a project first.');
-  }
-
-  const launchDirPath = getLaunchDirectoryPath(currentProjectPath);
-  const launchConfigPath = getLaunchConfigPath(currentProjectPath);
-  const sanitized = sanitizeLaunchConfig(payload && payload.config);
-
-  await fsp.mkdir(launchDirPath, { recursive: true });
-  await fsp.writeFile(launchConfigPath, JSON.stringify(sanitized, null, 2), 'utf8');
-
-  return {
-    ok: true,
-    config: sanitized
-  };
-});
-
-ipcMain.handle('file:read', async (event, filePath) => {
   const currentProjectPath = getProjectPathForSender(event.sender);
   if (!isWithinProject(filePath, currentProjectPath)) {
     throw new Error('File is outside the opened project.');
   }
 
-  const buffer = await fsp.readFile(filePath);
-  return decodeBufferWithEncoding(buffer);
+  try {
+    const buffer = await fsp.readFile(filePath);
+    return decodeBufferWithEncoding(buffer);
+  } catch (error) {
+    if (allowMissing && error && error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
 });
 
 ipcMain.handle('file:write', async (event, { filePath, content }) => {
@@ -1532,15 +1297,6 @@ ipcMain.on('terminal:kill', (_, { termId }) => {
     terminal.ptyProcess.kill();
     terminals.delete(termId);
   }
-});
-
-ipcMain.on('terminal:interrupt', (_, { termId }) => {
-  const terminal = terminals.get(termId);
-  if (!terminal) {
-    return;
-  }
-
-  terminal.ptyProcess.write('\x03');
 });
 
 ipcMain.handle('ai:runCommand', async (event, { command }) => {
