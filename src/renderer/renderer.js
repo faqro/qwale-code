@@ -132,6 +132,9 @@ let inlineEditState = null;
 let explorerClipboard = null;
 let explorerPanelFocused = true;
 let explorerSelectionAnchorPath = null;
+let explorerDragState = null;
+let explorerDropTargetPath = null;
+let explorerRootDropTarget = false;
 let fileSearchContainer = null;
 let fileSearchInput = null;
 let fileSearchResults = null;
@@ -146,7 +149,8 @@ let launchEditorState = {
   open: false,
   optionId: null,
   dragActionId: null,
-  draft: null
+  draft: null,
+  validationErrors: {}
 };
 let scmRefreshInProgress = false;
 let scmSyncMode = 'fetch';
@@ -169,6 +173,17 @@ const launchTermToOption = new Map();
 
 const expandedFolders = new Set();
 const explorerSelectedPaths = new Set();
+const isMacPlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || '');
+const explorerShortcutLabel = {
+  open: 'Enter',
+  copy: isMacPlatform ? 'Cmd+C' : 'Ctrl+C',
+  cut: isMacPlatform ? 'Cmd+X' : 'Ctrl+X',
+  paste: isMacPlatform ? 'Cmd+V' : 'Ctrl+V',
+  rename: 'F2',
+  del: isMacPlatform ? 'Backspace' : 'Delete',
+  newFile: isMacPlatform ? 'Cmd+N' : 'Ctrl+N',
+  newFolder: isMacPlatform ? 'Cmd+Shift+N' : 'Ctrl+Shift+N'
+};
 
 const terminal = new Terminal({
   convertEol: true,
@@ -322,6 +337,101 @@ function clearAiConversationHistory() {
   aiConversationCursor = -1;
   aiMessages.innerHTML = '';
   syncAiChatControls();
+}
+
+function normalizeAiConversationEntries(rawConversation) {
+  if (!Array.isArray(rawConversation)) {
+    return [];
+  }
+
+  const normalized = [];
+  for (const entry of rawConversation) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const role = entry.role === 'assistant' ? 'assistant' : (entry.role === 'user' ? 'user' : null);
+    if (!role) {
+      continue;
+    }
+
+    normalized.push({
+      role,
+      content: String(entry.content || '')
+    });
+  }
+
+  return normalized;
+}
+
+function renderAiConversationFromState() {
+  aiMessages.innerHTML = '';
+  for (let i = 0; i < aiConversation.length; i += 1) {
+    const entry = aiConversation[i];
+    addAiMessage(entry.role, entry.content, { convIndex: i });
+  }
+}
+
+async function loadAiConversationFromDisk() {
+  if (!project.rootPath) {
+    clearAiConversationHistory();
+    return;
+  }
+
+  const chatConfigPath = getAiChatConfigPath();
+  if (!chatConfigPath) {
+    clearAiConversationHistory();
+    return;
+  }
+
+  try {
+    const payload = await api.readFile({ filePath: chatConfigPath, allowMissing: true });
+    if (!payload) {
+      clearAiConversationHistory();
+      return;
+    }
+
+    const raw = typeof payload === 'string' ? payload : payload.content;
+    const parsed = JSON.parse(raw);
+    const source = Array.isArray(parsed) ? parsed : parsed && parsed.conversation;
+    aiConversation = normalizeAiConversationEntries(source);
+    aiConversationCursor = aiConversation.length ? aiConversation.length - 1 : -1;
+    renderAiConversationFromState();
+    syncAiChatControls();
+  } catch {
+    clearAiConversationHistory();
+  }
+}
+
+async function saveAiConversationToDisk() {
+  if (!project.rootPath) {
+    return;
+  }
+
+  const qwcodeFolderPath = getQwcodeStorageFolderPath();
+  const chatConfigPath = getAiChatConfigPath();
+  if (!qwcodeFolderPath || !chatConfigPath) {
+    return;
+  }
+
+  let createdFolder = false;
+  try {
+    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+    createdFolder = true;
+  } catch (error) {
+    if (!isAlreadyExistsError(error)) {
+      throw error;
+    }
+  }
+
+  if (createdFolder) {
+    await maybePromptAddQwcodeToGitignore();
+  }
+
+  await api.writeFile({
+    filePath: chatConfigPath,
+    content: JSON.stringify({ version: 1, conversation: aiConversation }, null, 2)
+  });
 }
 
 function syncAiChatControls() {
@@ -659,15 +769,15 @@ terminal.onData((data) => {
 
 function getTerminalTypeLabel(profileId) {
   if (profileId === 'cmd') {
-    return 'CMD';
+    return 'cmd';
   }
   if (profileId === 'wsl') {
-    return 'WSL';
+    return 'wsl';
   }
   if (profileId === 'shell') {
-    return 'SH';
+    return 'shell';
   }
-  return 'PS';
+  return 'powershell';
 }
 
 function closeTerminalTypeMenu() {
@@ -704,7 +814,7 @@ function renderTerminalTabs() {
 
     const label = document.createElement('span');
     label.className = 'terminal-tab-label';
-    label.textContent = `${session.profileLabel} ${session.index}`;
+    label.textContent = session.profileLabel;
 
     const close = document.createElement('button');
     close.type = 'button';
@@ -996,6 +1106,218 @@ function getExplorerContextEntries(contextNode) {
   return [{ path: contextNode.path, type: contextNode.type, name: contextNode.name }];
 }
 
+function getCurrentExplorerContextEntries() {
+  if (!selectedNodePath) {
+    return [];
+  }
+
+  const node = getTreeNodeByPath(project.tree, selectedNodePath);
+  if (!node) {
+    return [];
+  }
+
+  return getExplorerContextEntries(node);
+}
+
+function getExplorerPrimaryContextNode() {
+  if (!selectedNodePath) {
+    return null;
+  }
+
+  return getTreeNodeByPath(project.tree, selectedNodePath);
+}
+
+function isKeyboardEventFromEditableTarget(event) {
+  const target = event && event.target;
+  if (!target || typeof target.closest !== 'function') {
+    return false;
+  }
+
+  return Boolean(target.closest('input, textarea, [contenteditable="true"], .monaco-editor'));
+}
+
+function hasBlockingOverlayOpen() {
+  return Boolean(document.querySelector('.help-overlay:not(.hidden)'));
+}
+
+function focusExplorerNodeRow(nodePath) {
+  if (!nodePath || !treeRoot) {
+    return;
+  }
+
+  const selector = `.tree-node[data-path="${CSS.escape(nodePath)}"]`;
+  const row = treeRoot.querySelector(selector);
+  if (row && typeof row.scrollIntoView === 'function') {
+    row.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function moveExplorerSelection(step, extendSelection) {
+  const visiblePaths = getExplorerVisiblePaths();
+  if (!visiblePaths.length) {
+    return false;
+  }
+
+  const currentIndex = selectedNodePath ? visiblePaths.indexOf(selectedNodePath) : -1;
+  const fallbackIndex = step > 0 ? -1 : visiblePaths.length;
+  const baseIndex = currentIndex >= 0 ? currentIndex : fallbackIndex;
+  const nextIndex = Math.max(0, Math.min(visiblePaths.length - 1, baseIndex + step));
+  const targetPath = visiblePaths[nextIndex];
+  if (!targetPath) {
+    return false;
+  }
+
+  if (extendSelection) {
+    setExplorerRangeSelection(targetPath);
+  } else {
+    setExplorerSingleSelection(targetPath);
+  }
+
+  renderTree();
+  focusExplorerNodeRow(targetPath);
+  return true;
+}
+
+function setExplorerClipboardFromEntries(mode, entries) {
+  if (!entries.length) {
+    return false;
+  }
+
+  explorerClipboard = {
+    mode,
+    items: entries.map((entry) => ({ sourcePath: entry.path, type: entry.type }))
+  };
+
+  return true;
+}
+
+async function handleExplorerKeyboardShortcut(event) {
+  if (activeSidebarPanel !== 'explorer' || !explorerPanelFocused || !project.rootPath) {
+    return false;
+  }
+
+  if (inlineEditState || hasBlockingOverlayOpen() || isKeyboardEventFromEditableTarget(event)) {
+    return false;
+  }
+
+  const key = String(event.key || '').toLowerCase();
+  const hasPrimaryModifier = event.ctrlKey || event.metaKey;
+
+  if (key === 'arrowdown') {
+    return moveExplorerSelection(1, event.shiftKey);
+  }
+
+  if (key === 'arrowup') {
+    return moveExplorerSelection(-1, event.shiftKey);
+  }
+
+  if (key === 'enter') {
+    const node = getExplorerPrimaryContextNode();
+    if (!node) {
+      return false;
+    }
+
+    if (node.type === 'folder') {
+      if (expandedFolders.has(node.path)) {
+        expandedFolders.delete(node.path);
+      } else {
+        expandedFolders.add(node.path);
+      }
+      renderTree();
+      return true;
+    }
+
+    await openFile(node.path, { mode: 'permanent' });
+    renderTree();
+    return true;
+  }
+
+  if (key === 'f2') {
+    const node = getExplorerPrimaryContextNode();
+    if (!node || explorerSelectedPaths.size > 1) {
+      return false;
+    }
+
+    startInlineRename(node.path, node.type);
+    return true;
+  }
+
+  if (key === 'delete' || (isMacPlatform && key === 'backspace')) {
+    const contextEntries = getCurrentExplorerContextEntries();
+    if (!contextEntries.length) {
+      return false;
+    }
+
+    const hasMultiSelection = contextEntries.length > 1;
+    const primaryNode = getExplorerPrimaryContextNode();
+    const message = hasMultiSelection
+      ? `Delete ${contextEntries.length} selected items? This cannot be undone.`
+      : `Delete ${primaryNode ? primaryNode.name : 'selected item'}? This cannot be undone.`;
+    const shouldDelete = await showConfirmDialog({
+      title: 'Delete',
+      message,
+      confirmLabel: 'Delete',
+      confirmStyle: 'danger'
+    });
+    if (!shouldDelete) {
+      return true;
+    }
+
+    await deleteExplorerEntries(contextEntries);
+    return true;
+  }
+
+  if (hasPrimaryModifier && key === 'n') {
+    if (event.shiftKey) {
+      await createNewFolder();
+    } else {
+      await createNewFile();
+    }
+    return true;
+  }
+
+  if (hasPrimaryModifier && key === 'a') {
+    const visiblePaths = getExplorerVisiblePaths();
+    if (!visiblePaths.length) {
+      return false;
+    }
+
+    explorerSelectedPaths.clear();
+    for (const visiblePath of visiblePaths) {
+      explorerSelectedPaths.add(visiblePath);
+    }
+
+    const anchor = selectedNodePath && explorerSelectedPaths.has(selectedNodePath)
+      ? selectedNodePath
+      : visiblePaths[0];
+    selectedNodePath = anchor;
+    explorerSelectionAnchorPath = anchor;
+    renderTree();
+    focusExplorerNodeRow(anchor);
+    return true;
+  }
+
+  if (hasPrimaryModifier && key === 'c') {
+    return setExplorerClipboardFromEntries('copy', getCurrentExplorerContextEntries());
+  }
+
+  if (hasPrimaryModifier && key === 'x') {
+    return setExplorerClipboardFromEntries('cut', getCurrentExplorerContextEntries());
+  }
+
+  if (hasPrimaryModifier && key === 'v') {
+    const destination = getTargetFolderPath();
+    if (!destination || !explorerClipboard) {
+      return false;
+    }
+
+    await pasteIntoPath(destination);
+    return true;
+  }
+
+  return false;
+}
+
 function compactExplorerEntries(entries) {
   const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
   const compacted = [];
@@ -1008,6 +1330,102 @@ function compactExplorerEntries(entries) {
   }
 
   return compacted;
+}
+
+function setExplorerDropTargetPath(targetPath) {
+  const next = targetPath || null;
+  if (explorerDropTargetPath === next) {
+    return;
+  }
+
+  if (explorerDropTargetPath && treeRoot) {
+    const prevSelector = `.tree-node[data-path="${CSS.escape(explorerDropTargetPath)}"]`;
+    const prev = treeRoot.querySelector(prevSelector);
+    if (prev) {
+      prev.classList.remove('drag-over');
+    }
+  }
+
+  explorerDropTargetPath = next;
+
+  if (explorerDropTargetPath && treeRoot) {
+    const nextSelector = `.tree-node[data-path="${CSS.escape(explorerDropTargetPath)}"]`;
+    const nextNode = treeRoot.querySelector(nextSelector);
+    if (nextNode) {
+      nextNode.classList.add('drag-over');
+    }
+  }
+}
+
+function setExplorerRootDropTarget(active) {
+  const next = Boolean(active);
+  if (explorerRootDropTarget === next) {
+    return;
+  }
+
+  explorerRootDropTarget = next;
+  if (treeRoot) {
+    treeRoot.classList.toggle('root-drag-over', explorerRootDropTarget);
+  }
+}
+
+function clearExplorerDragVisualState() {
+  setExplorerDropTargetPath(null);
+  setExplorerRootDropTarget(false);
+}
+
+function getDragEntriesForNode(node) {
+  if (!node) {
+    return [];
+  }
+
+  const entries = explorerSelectedPaths.size > 1 && explorerSelectedPaths.has(node.path)
+    ? getExplorerContextEntries(node)
+    : [{ path: node.path, type: node.type, name: node.name }];
+
+  return compactExplorerEntries(entries);
+}
+
+function getParentFolderPath(targetPath) {
+  return String(targetPath || '').replace(/[\\/][^\\/]+$/, '');
+}
+
+function canMoveEntriesToDestination(entries, destinationPath) {
+  if (!entries.length || !destinationPath) {
+    return false;
+  }
+
+  const destinationNormalized = normalizeExplorerPath(destinationPath);
+  for (const entry of entries) {
+    const sourceNormalized = normalizeExplorerPath(entry.path);
+    if (!sourceNormalized || sourceNormalized === destinationNormalized) {
+      return false;
+    }
+
+    if (entry.type === 'folder' && isPathWithinFolderPath(destinationPath, entry.path)) {
+      return false;
+    }
+
+    if (normalizeExplorerPath(getParentFolderPath(entry.path)) === destinationNormalized) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+async function moveExplorerEntries(entries, destinationPath) {
+  const compacted = compactExplorerEntries(entries);
+  if (!canMoveEntriesToDestination(compacted, destinationPath)) {
+    return;
+  }
+
+  for (const entry of compacted) {
+    await api.movePath({ sourcePath: entry.path, destinationDir: destinationPath });
+  }
+
+  setExplorerSingleSelection(destinationPath);
+  await refreshProjectTree();
 }
 
 function getOpenTabsUnderEntry(entry) {
@@ -1202,6 +1620,7 @@ function createDefaultLaunchAction(type = 'command') {
     type: 'command',
     shell: 'powershell',
     command: '',
+    skipCompletion: false,
     cwd: ''
   };
 }
@@ -1233,11 +1652,23 @@ function isAbsolutePathInput(inputPath) {
   return /^[A-Za-z]:[\\/]/.test(candidate) || candidate.startsWith('\\\\') || candidate.startsWith('/');
 }
 
-function getLaunchStorageFolderPath() {
+function getQwcodeStorageFolderPath() {
   if (!project.rootPath) {
     return null;
   }
   return joinPathSegments(project.rootPath, '.qwcode');
+}
+
+function getLaunchStorageFolderPath() {
+  return getQwcodeStorageFolderPath();
+}
+
+function getAiChatConfigPath() {
+  const folderPath = getQwcodeStorageFolderPath();
+  if (!folderPath) {
+    return null;
+  }
+  return joinPathSegments(folderPath, 'chat.json');
 }
 
 function getLaunchConfigPath() {
@@ -1279,6 +1710,9 @@ function normalizeLaunchAction(rawAction, index = 0) {
   }
 
   action.command = typeof input.command === 'string' ? input.command : '';
+  action.skipCompletion = input.skipCompletion === true
+    || input.skipCompletion === 1
+    || String(input.skipCompletion || '').trim().toLowerCase() === 'true';
   return action;
 }
 
@@ -1366,7 +1800,8 @@ function getLaunchActionSummary(action) {
   const shellLabel = action.shell === 'cmd' ? 'CMD' : (action.shell === 'wsl' ? 'WSL' : 'PowerShell');
   const command = String(action.command || '').trim() || '(command required)';
   const cwd = String(action.cwd || '').trim();
-  return cwd ? `${shellLabel}: ${command}  [cwd: ${cwd}]` : `${shellLabel}: ${command}`;
+  const skipTag = action.skipCompletion ? '  [skip completion]' : '';
+  return cwd ? `${shellLabel}: ${command}  [cwd: ${cwd}]${skipTag}` : `${shellLabel}: ${command}${skipTag}`;
 }
 
 function syncRunDebugToolbarVisibility(showToolbar) {
@@ -1516,6 +1951,7 @@ function closeLaunchEditor() {
   launchEditorState.optionId = null;
   launchEditorState.dragActionId = null;
   launchEditorState.draft = null;
+  launchEditorState.validationErrors = {};
 }
 
 function openLaunchEditor(optionId = null) {
@@ -1524,12 +1960,70 @@ function openLaunchEditor(optionId = null) {
   launchEditorState.optionId = existing ? existing.id : null;
   launchEditorState.dragActionId = null;
   launchEditorState.draft = existing ? cloneLaunchOption(existing) : createDefaultLaunchOptionDraft();
+  launchEditorState.validationErrors = {};
 
   renderRunDebugPanel();
   requestAnimationFrame(() => {
     runDebugOptionNameInput.focus();
     runDebugOptionNameInput.select();
   });
+}
+
+function getLaunchEditorValidationError(fieldKey) {
+  if (!launchEditorState || !launchEditorState.validationErrors) {
+    return '';
+  }
+
+  return String(launchEditorState.validationErrors[fieldKey] || '');
+}
+
+function setLaunchEditorValidationErrors(nextErrors = {}) {
+  launchEditorState.validationErrors = nextErrors && typeof nextErrors === 'object' ? { ...nextErrors } : {};
+}
+
+function clearLaunchEditorValidationError(fieldKey) {
+  if (!launchEditorState || !launchEditorState.validationErrors || !launchEditorState.validationErrors[fieldKey]) {
+    return;
+  }
+
+  delete launchEditorState.validationErrors[fieldKey];
+}
+
+function createLaunchFieldErrorElement(fieldKey, message) {
+  const error = document.createElement('div');
+  error.className = 'run-debug-field-error';
+  error.dataset.fieldKey = fieldKey;
+
+  const icon = document.createElement('span');
+  icon.className = 'run-debug-field-error-icon';
+  icon.textContent = '!';
+
+  const text = document.createElement('span');
+  text.className = 'run-debug-field-error-text';
+  text.textContent = message;
+
+  error.appendChild(icon);
+  error.appendChild(text);
+  return error;
+}
+
+function removeLaunchFieldErrorByKey(fieldKey) {
+  const errors = runDebugEditor.querySelectorAll('.run-debug-field-error');
+  for (const error of errors) {
+    if (error.dataset.fieldKey === fieldKey) {
+      error.remove();
+    }
+  }
+}
+
+function attachLaunchFieldErrorAfter(inputElement, fieldKey) {
+  const message = getLaunchEditorValidationError(fieldKey);
+  if (!message || !inputElement || !inputElement.parentNode) {
+    return;
+  }
+
+  const error = createLaunchFieldErrorElement(fieldKey, message);
+  inputElement.insertAdjacentElement('afterend', error);
 }
 
 function moveLaunchDraftAction(draggedActionId, targetActionId, insertAfter) {
@@ -1562,6 +2056,7 @@ function renderRunDebugEditor() {
   const isOpen = Boolean(launchEditorState.open && launchEditorState.draft);
   runDebugEditor.classList.toggle('hidden', !isOpen);
   runDebugActionsList.innerHTML = '';
+  runDebugEditor.querySelectorAll('.run-debug-field-error').forEach((entry) => entry.remove());
 
   if (!isOpen) {
     runDebugOptionDefaultInput.checked = false;
@@ -1573,8 +2068,14 @@ function renderRunDebugEditor() {
   runDebugOptionNameInput.value = draft.name || '';
   runDebugOptionDescriptionInput.value = draft.description || '';
   runDebugOptionDefaultInput.checked = Boolean(draft.default);
+  attachLaunchFieldErrorAfter(runDebugOptionNameInput, 'option.name');
 
   const actions = Array.isArray(draft.actions) ? draft.actions : [];
+  const actionsError = getLaunchEditorValidationError('actions');
+  if (actionsError) {
+    runDebugActionsList.appendChild(createLaunchFieldErrorElement('actions', actionsError));
+  }
+
   for (const action of actions) {
     const row = document.createElement('div');
     row.className = 'run-debug-action-row';
@@ -1689,8 +2190,12 @@ function renderRunDebugEditor() {
       urlInput.value = action.url || '';
       urlInput.addEventListener('input', () => {
         action.url = urlInput.value;
+        const fieldKey = `action.${action.id}.url`;
+        clearLaunchEditorValidationError(fieldKey);
+        removeLaunchFieldErrorByKey(fieldKey);
       });
       fields.appendChild(urlInput);
+      attachLaunchFieldErrorAfter(urlInput, `action.${action.id}.url`);
     } else {
       const shellCwdGrid = document.createElement('div');
       shellCwdGrid.className = 'run-debug-action-grid-two';
@@ -1739,6 +2244,9 @@ function renderRunDebugEditor() {
         programInput.value = action.program || '';
         programInput.addEventListener('input', () => {
           action.program = programInput.value;
+          const fieldKey = `action.${action.id}.program`;
+          clearLaunchEditorValidationError(fieldKey);
+          removeLaunchFieldErrorByKey(fieldKey);
         });
 
         const argsInput = document.createElement('input');
@@ -1753,6 +2261,7 @@ function renderRunDebugEditor() {
         programGrid.appendChild(programInput);
         programGrid.appendChild(argsInput);
         fields.appendChild(programGrid);
+        attachLaunchFieldErrorAfter(programInput, `action.${action.id}.program`);
       } else {
         const commandInput = document.createElement('input');
         commandInput.className = 'run-debug-input';
@@ -1761,8 +2270,29 @@ function renderRunDebugEditor() {
         commandInput.value = action.command || '';
         commandInput.addEventListener('input', () => {
           action.command = commandInput.value;
+          const fieldKey = `action.${action.id}.command`;
+          clearLaunchEditorValidationError(fieldKey);
+          removeLaunchFieldErrorByKey(fieldKey);
         });
         fields.appendChild(commandInput);
+        attachLaunchFieldErrorAfter(commandInput, `action.${action.id}.command`);
+
+        const skipCompletionLabel = document.createElement('label');
+        skipCompletionLabel.className = 'run-debug-action-checkbox';
+
+        const skipCompletionInput = document.createElement('input');
+        skipCompletionInput.type = 'checkbox';
+        skipCompletionInput.checked = Boolean(action.skipCompletion);
+        skipCompletionInput.addEventListener('change', () => {
+          action.skipCompletion = Boolean(skipCompletionInput.checked);
+        });
+
+        const skipCompletionText = document.createElement('span');
+        skipCompletionText.textContent = 'Skip completion';
+
+        skipCompletionLabel.appendChild(skipCompletionInput);
+        skipCompletionLabel.appendChild(skipCompletionText);
+        fields.appendChild(skipCompletionLabel);
       }
     }
 
@@ -1773,43 +2303,47 @@ function renderRunDebugEditor() {
 }
 
 function validateLaunchDraft(draft) {
+  const errors = {};
+
   if (!draft) {
-    return 'Launch option is not ready to save.';
+    errors.actions = 'Launch option is not ready to save.';
+    return errors;
   }
 
   const name = String(runDebugOptionNameInput.value || '').trim();
   if (!name) {
-    return 'Enter a launch option name.';
+    errors['option.name'] = 'You must enter a launch option name.';
   }
 
   if (!Array.isArray(draft.actions) || draft.actions.length === 0) {
-    return 'Add at least one action to this launch option.';
+    errors.actions = 'You must add at least one action.';
+    return errors;
   }
 
   for (let i = 0; i < draft.actions.length; i += 1) {
     const action = draft.actions[i];
-    const indexLabel = i + 1;
+    const actionId = action && action.id ? action.id : `missing-${i}`;
 
     if (action.type === 'url') {
       if (!String(action.url || '').trim()) {
-        return `Action ${indexLabel}: enter a website URL.`;
+        errors[`action.${actionId}.url`] = 'You must enter a valid URL.';
       }
       continue;
     }
 
     if (action.type === 'program') {
       if (!String(action.program || '').trim()) {
-        return `Action ${indexLabel}: enter a program path or executable.`;
+        errors[`action.${actionId}.program`] = 'You must enter a valid program path.';
       }
       continue;
     }
 
     if (!String(action.command || '').trim()) {
-      return `Action ${indexLabel}: enter a command to run.`;
+      errors[`action.${actionId}.command`] = 'You must enter a valid command.';
     }
   }
 
-  return '';
+  return errors;
 }
 
 async function saveLaunchConfigToDisk() {
@@ -1839,13 +2373,12 @@ async function maybePromptAddQwcodeToGitignore() {
 
   const gitignorePath = joinPathSegments(project.rootPath, '.gitignore');
 
-  let content;
-  try {
-    const payload = await api.readFile(gitignorePath);
-    content = typeof payload === 'string' ? payload : payload.content;
-  } catch {
+  const payload = await api.readFile({ filePath: gitignorePath, allowMissing: true });
+  if (!payload) {
     return;
   }
+
+  const content = typeof payload === 'string' ? payload : payload.content;
 
   if (/(^|[\r\n])\.qwcode\/?(?=[\r\n]|$)/i.test(content)) {
     return;
@@ -1964,11 +2497,14 @@ async function saveLaunchEditorDraft() {
     return;
   }
 
-  const validationError = validateLaunchDraft(launchEditorState.draft);
-  if (validationError) {
-    alert(validationError);
+  const validationErrors = validateLaunchDraft(launchEditorState.draft);
+  if (Object.keys(validationErrors).length > 0) {
+    setLaunchEditorValidationErrors(validationErrors);
+    renderRunDebugPanel();
     return;
   }
+
+  setLaunchEditorValidationErrors({});
 
   const draft = cloneLaunchOption(launchEditorState.draft);
   draft.name = String(runDebugOptionNameInput.value || '').trim();
@@ -2165,6 +2701,30 @@ function getLaunchHostShellType(option) {
   return 'powershell';
 }
 
+function hasWslTerminalProfile() {
+  return terminalProfiles.some((profile) => profile && profile.id === 'wsl');
+}
+
+function launchOptionRequiresWsl(option) {
+  const actions = Array.isArray(option && option.actions) ? option.actions : [];
+  return actions.some((action) => {
+    if (!action || action.type === 'url') {
+      return false;
+    }
+
+    return normalizeLaunchShell(action.shell) === 'wsl';
+  });
+}
+
+async function showWslMissingDialog() {
+  await showConfirmDialog({
+    title: 'WSL Not Installed',
+    message: 'This launch option includes at least one WSL action, but WSL is not installed on this device.',
+    confirmLabel: 'OK',
+    confirmStyle: 'primary'
+  });
+}
+
 function findReusableLaunchTerminalId(shellType) {
   const normalizedShell = normalizeLaunchShell(shellType);
 
@@ -2295,6 +2855,68 @@ function buildShellCommand(action) {
   return command;
 }
 
+function buildDetachedCommandForPowerShellHost(action) {
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  const shell = normalizeLaunchShell(action.shell);
+  const resolvedCwd = resolveLaunchActionCwd(action.cwd);
+
+  if (shell === 'cmd') {
+    const startParts = [
+      'Start-Process -FilePath "cmd.exe"',
+      `-ArgumentList @('/d','/s','/c',${escapePowerShellLiteral(command)})`
+    ];
+
+    if (resolvedCwd) {
+      startParts.push(`-WorkingDirectory ${escapePowerShellLiteral(resolvedCwd)}`);
+    }
+
+    return startParts.join(' ');
+  }
+
+  if (shell === 'wsl') {
+    const cwdScript = resolvedCwd ? `cd ${escapeBashSingleQuoted(toWslPath(resolvedCwd))} && ` : '';
+    return `Start-Process -FilePath "wsl.exe" -ArgumentList @('bash','-lc',${escapePowerShellLiteral(`${cwdScript}${command}`)})`;
+  }
+
+  const startParts = [
+    'Start-Process -FilePath "powershell.exe"',
+    `-ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',${escapePowerShellLiteral(command)})`
+  ];
+
+  if (resolvedCwd) {
+    startParts.push(`-WorkingDirectory ${escapePowerShellLiteral(resolvedCwd)}`);
+  }
+
+  return startParts.join(' ');
+}
+
+function buildDetachedCommandForCmdHost(action) {
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  const resolvedCwd = resolveLaunchActionCwd(action.cwd);
+  const cwdPrefix = resolvedCwd ? `cd /d ${quoteForCmdExecutable(resolvedCwd)} && ` : '';
+  const script = `${cwdPrefix}${command}`.replace(/"/g, '""');
+  return `start "" cmd.exe /d /s /c "${script}"`;
+}
+
+function buildDetachedCommandForWslHost(action) {
+  const command = String(action.command || '').trim();
+  if (!command) {
+    return '';
+  }
+
+  const resolvedCwd = resolveLaunchActionCwd(action.cwd);
+  const cwdPrefix = resolvedCwd ? `cd ${escapeBashSingleQuoted(toWslPath(resolvedCwd))} && ` : '';
+  return `nohup bash -lc ${escapeBashSingleQuoted(`${cwdPrefix}${command}`)} >/dev/null 2>&1 &`;
+}
+
 function buildProgramCommand(action) {
   const shell = normalizeLaunchShell(action.shell);
   const program = String(action.program || '').trim();
@@ -2357,6 +2979,10 @@ function buildLaunchActionCommandForPowerShell(action) {
     return wrapPowerShellCommandWithLaunchCwd(command, action.cwd);
   }
 
+  if (action.skipCompletion) {
+    return buildDetachedCommandForPowerShellHost(action);
+  }
+
   const command = buildShellCommand(action);
   if (!command) {
     return '';
@@ -2386,6 +3012,10 @@ function buildLaunchActionCommandForCmd(action) {
     return wrapCmdCommandWithLaunchCwd(command, action.cwd);
   }
 
+  if (action.skipCompletion) {
+    return buildDetachedCommandForCmdHost(action);
+  }
+
   const command = String(action.command || '').trim();
   if (!command) {
     return '';
@@ -2413,6 +3043,10 @@ function buildLaunchActionCommandForWsl(action) {
       return '';
     }
     return wrapWslCommandWithLaunchCwd(command, action.cwd);
+  }
+
+  if (action.skipCompletion) {
+    return buildDetachedCommandForWslHost(action);
   }
 
   const command = String(action.command || '').trim();
@@ -2505,6 +3139,11 @@ async function startLaunchOption(optionId) {
   const validationError = validateLaunchOptionForRun(normalizedOption);
   if (validationError) {
     throw new Error(validationError);
+  }
+
+  if (launchOptionRequiresWsl(normalizedOption) && !hasWslTerminalProfile()) {
+    await showWslMissingDialog();
+    return;
   }
 
   const hostShellType = getLaunchHostShellType(normalizedOption);
@@ -3289,11 +3928,23 @@ function ensureExplorerContextMenu() {
   });
 }
 
-function addExplorerMenuItem(container, label, action, { disabled = false } = {}) {
+function addExplorerMenuItem(container, label, action, { disabled = false, shortcut = '' } = {}) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = `explorer-context-item${disabled ? ' disabled' : ''}`;
-  btn.textContent = label;
+
+  const labelText = document.createElement('span');
+  labelText.className = 'explorer-context-label';
+  labelText.textContent = label;
+  btn.appendChild(labelText);
+
+  if (shortcut) {
+    const shortcutText = document.createElement('span');
+    shortcutText.className = 'menu-shortcut';
+    shortcutText.textContent = shortcut;
+    btn.appendChild(shortcutText);
+  }
+
   btn.disabled = disabled;
   btn.addEventListener('click', async (event) => {
     event.stopPropagation();
@@ -3365,7 +4016,7 @@ function showExplorerContextMenu(event, contextNode) {
     if (!hasMultiSelection && contextNode.type === 'file') {
       addExplorerMenuItem(explorerMenu, 'Open', async () => {
         await openFile(contextNode.path, { mode: 'permanent' });
-      });
+      }, { shortcut: explorerShortcutLabel.open });
     }
 
     addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Copy ${contextEntries.length} Items` : (contextNode.type === 'file' ? 'Copy File' : 'Copy Folder'), async () => {
@@ -3373,14 +4024,14 @@ function showExplorerContextMenu(event, contextNode) {
         mode: 'copy',
         items: contextEntries.map((entry) => ({ sourcePath: entry.path, type: entry.type }))
       };
-    });
+    }, { shortcut: explorerShortcutLabel.copy });
 
     addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Cut ${contextEntries.length} Items` : (contextNode.type === 'file' ? 'Cut File' : 'Cut Folder'), async () => {
       explorerClipboard = {
         mode: 'cut',
         items: contextEntries.map((entry) => ({ sourcePath: entry.path, type: entry.type }))
       };
-    });
+    }, { shortcut: explorerShortcutLabel.cut });
 
     if (!hasMultiSelection) {
       addExplorerMenuItem(explorerMenu, 'Copy Path', async () => {
@@ -3393,7 +4044,7 @@ function showExplorerContextMenu(event, contextNode) {
 
       addExplorerMenuItem(explorerMenu, 'Rename', async () => {
         startInlineRename(contextNode.path, contextNode.type);
-      });
+      }, { shortcut: explorerShortcutLabel.rename });
     }
 
     addExplorerMenuItem(explorerMenu, hasMultiSelection ? `Delete ${contextEntries.length} Items` : 'Delete', async () => {
@@ -3411,7 +4062,7 @@ function showExplorerContextMenu(event, contextNode) {
       }
 
       await deleteExplorerEntries(contextEntries);
-    });
+    }, { shortcut: explorerShortcutLabel.del });
 
     if (!hasMultiSelection) {
       addExplorerMenuItem(explorerMenu, 'Open in File Explorer', async () => {
@@ -3423,24 +4074,24 @@ function showExplorerContextMenu(event, contextNode) {
       addExplorerMenuDivider(explorerMenu);
       addExplorerMenuItem(explorerMenu, 'New File', async () => {
         startInlineCreate('file', contextNode.path);
-      });
+      }, { shortcut: explorerShortcutLabel.newFile });
       addExplorerMenuItem(explorerMenu, 'New Folder', async () => {
         startInlineCreate('folder', contextNode.path);
-      });
+      }, { shortcut: explorerShortcutLabel.newFolder });
       addExplorerMenuItem(explorerMenu, 'Paste File/Folder', async () => {
         await pasteIntoPath(contextNode.path);
-      }, { disabled: !canPaste });
+      }, { disabled: !canPaste, shortcut: explorerShortcutLabel.paste });
     }
   } else {
     addExplorerMenuItem(explorerMenu, 'New File', async () => {
       startInlineCreate('file', project.rootPath);
-    }, { disabled: !project.rootPath });
+    }, { disabled: !project.rootPath, shortcut: explorerShortcutLabel.newFile });
     addExplorerMenuItem(explorerMenu, 'New Folder', async () => {
       startInlineCreate('folder', project.rootPath);
-    }, { disabled: !project.rootPath });
+    }, { disabled: !project.rootPath, shortcut: explorerShortcutLabel.newFolder });
     addExplorerMenuItem(explorerMenu, 'Paste', async () => {
       await pasteIntoPath(project.rootPath);
-    }, { disabled: !canPaste });
+    }, { disabled: !canPaste, shortcut: explorerShortcutLabel.paste });
   }
 
   explorerMenu.style.left = `${event.clientX}px`;
@@ -4488,6 +5139,7 @@ function buildTreeNode(node) {
   const row = document.createElement('div');
   row.className = 'tree-node';
   row.dataset.path = node.path;
+  row.draggable = true;
 
   if (node.ignored) {
     row.classList.add('ignored');
@@ -4508,6 +5160,39 @@ function buildTreeNode(node) {
   const label = document.createElement('span');
   label.className = 'tree-node-label';
   label.textContent = node.name;
+
+  row.addEventListener('dragstart', (event) => {
+    if (inlineEditState || !event.dataTransfer) {
+      event.preventDefault();
+      return;
+    }
+
+    setExplorerPanelFocus(true);
+
+    const dragEntries = getDragEntriesForNode(node);
+    if (!dragEntries.length) {
+      event.preventDefault();
+      return;
+    }
+
+    if (!(explorerSelectedPaths.size > 1 && explorerSelectedPaths.has(node.path))) {
+      setExplorerSingleSelection(node.path);
+    }
+
+    explorerDragState = {
+      entries: dragEntries
+    };
+
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', node.path);
+    closeExplorerContextMenu();
+    clearExplorerDragVisualState();
+  });
+
+  row.addEventListener('dragend', () => {
+    explorerDragState = null;
+    clearExplorerDragVisualState();
+  });
 
   row.addEventListener('contextmenu', (event) => {
     event.preventDefault();
@@ -4586,6 +5271,50 @@ function buildTreeNode(node) {
         expandedFolders.add(node.path);
       }
       renderTree();
+    });
+
+    row.addEventListener('dragenter', (event) => {
+      if (!explorerDragState || !canMoveEntriesToDestination(explorerDragState.entries, node.path)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      setExplorerRootDropTarget(false);
+      setExplorerDropTargetPath(node.path);
+    });
+
+    row.addEventListener('dragover', (event) => {
+      if (!explorerDragState || !canMoveEntriesToDestination(explorerDragState.entries, node.path)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'move';
+      }
+      setExplorerRootDropTarget(false);
+      setExplorerDropTargetPath(node.path);
+    });
+
+    row.addEventListener('drop', async (event) => {
+      if (!explorerDragState) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const dragEntries = explorerDragState.entries;
+      explorerDragState = null;
+      clearExplorerDragVisualState();
+
+      try {
+        await moveExplorerEntries(dragEntries, node.path);
+      } catch (error) {
+        alert(error.message || String(error));
+      }
     });
 
     item.appendChild(row);
@@ -4703,6 +5432,7 @@ function buildTreeNode(node) {
 
 function renderTree() {
   treeRoot.innerHTML = '';
+  clearExplorerDragVisualState();
 
   treeRoot.oncontextmenu = (event) => {
     event.preventDefault();
@@ -4765,6 +5495,55 @@ function renderTree() {
   }
 
   treeRoot.appendChild(list);
+
+  treeRoot.ondragover = (event) => {
+    if (!explorerDragState || !project.rootPath) {
+      return;
+    }
+
+    if (event.target.closest('.tree-node')) {
+      return;
+    }
+
+    if (!canMoveEntriesToDestination(explorerDragState.entries, project.rootPath)) {
+      setExplorerRootDropTarget(false);
+      return;
+    }
+
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = 'move';
+    }
+    setExplorerDropTargetPath(null);
+    setExplorerRootDropTarget(true);
+  };
+
+  treeRoot.ondragleave = (event) => {
+    if (!treeRoot.contains(event.relatedTarget)) {
+      clearExplorerDragVisualState();
+    }
+  };
+
+  treeRoot.ondrop = async (event) => {
+    if (!explorerDragState || !project.rootPath) {
+      return;
+    }
+
+    if (event.target.closest('.tree-node')) {
+      return;
+    }
+
+    event.preventDefault();
+    const dragEntries = explorerDragState.entries;
+    explorerDragState = null;
+    clearExplorerDragVisualState();
+
+    try {
+      await moveExplorerEntries(dragEntries, project.rootPath);
+    } catch (error) {
+      alert(error.message || String(error));
+    }
+  };
 }
 
 async function refreshProjectTree() {
@@ -5086,6 +5865,7 @@ async function applyOpenedProject(opened) {
   renderTree();
   refreshFileSearchIndex();
   syncAiChatControls();
+  await loadAiConversationFromDisk();
   await loadLaunchConfigFromDisk();
   await refreshSourceControlPanel();
 
@@ -5241,6 +6021,9 @@ runDebugOptionNameInput.addEventListener('input', () => {
   if (launchEditorState.draft) {
     launchEditorState.draft.name = runDebugOptionNameInput.value;
   }
+
+  clearLaunchEditorValidationError('option.name');
+  removeLaunchFieldErrorByKey('option.name');
 });
 
 runDebugOptionDescriptionInput.addEventListener('input', () => {
@@ -5518,6 +6301,19 @@ document.addEventListener('keydown', async (event) => {
     closeEditorPlayMenu();
   }
 
+  try {
+    const handledByExplorer = await handleExplorerKeyboardShortcut(event);
+    if (handledByExplorer) {
+      event.preventDefault();
+      closeExplorerContextMenu();
+      return;
+    }
+  } catch (error) {
+    event.preventDefault();
+    alert(error.message || String(error));
+    return;
+  }
+
   if ((event.ctrlKey || event.metaKey) && event.altKey && event.key.toLowerCase() === 'l') {
     event.preventDefault();
     toggleThemeMode();
@@ -5619,6 +6415,7 @@ aiClearKeyBtn.addEventListener('click', () => {
 
 aiClearChatBtn.addEventListener('click', () => {
   clearAiConversationHistory();
+  saveAiConversationToDisk().catch(() => {});
 });
 
 aiSendBtn.addEventListener('click', async () => {
@@ -5642,6 +6439,7 @@ aiSendBtn.addEventListener('click', async () => {
   autoResizeAiPrompt();
   const userIndex = recordAiConversation('user', prompt);
   addAiMessage('user', prompt, { convIndex: userIndex });
+  await saveAiConversationToDisk();
   aiAbortController = new AbortController();
   setAiBusy(true);
 
@@ -5649,6 +6447,7 @@ aiSendBtn.addEventListener('click', async () => {
     const reply = await sendAiChat(aiConversation.slice(0, aiConversationCursor + 1), aiAbortController.signal);
     const assistantIndex = recordAiConversation('assistant', reply);
     addAiMessage('assistant', reply, { convIndex: assistantIndex });
+    await saveAiConversationToDisk();
   } catch (error) {
     if (error.name === 'AbortError' || error.message === 'AI request stopped by user.') {
       addAiActivity('Stopped by user.');

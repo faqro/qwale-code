@@ -963,6 +963,9 @@ body {
   width: 30px;
   border-radius: 0 6px 6px 0;
   border-left: 0;
+  background: #5a52c4;
+  border-color: #766ff0;
+  color: #ffffff;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -978,14 +981,27 @@ body {
   border-radius: 6px 0 0 6px;
   border-right: 0;
   padding: 0 12px;
+  background: #5a52c4;
+  border-color: #766ff0;
+  color: #ffffff;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
 }
 
+.editor-play-btn:hover {
+  background: #645be0;
+  border-color: #8c85ff;
+  color: #ffffff;
+  filter: none;
+}
+
 .editor-play-menu-btn:hover {
-  filter: brightness(1.08);
+  background: #645be0;
+  border-color: #8c85ff;
+  color: #ffffff;
+  filter: none;
 }
 
 .editor-play-btn-icon {
@@ -1660,9 +1676,55 @@ body {
   user-select: none;
 }
 
-.run-debug-checkbox input {
+.run-debug-checkbox input,
+.run-debug-action-checkbox input {
   margin: 0;
-  accent-color: #766ff0;
+  width: 14px;
+  height: 14px;
+  border: 1px solid #5d7aa0;
+  border-radius: 4px;
+  background: #0f2032;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-grid;
+  place-content: center;
+  transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.run-debug-checkbox input::before,
+.run-debug-action-checkbox input::before {
+  content: '';
+  width: 4px;
+  height: 8px;
+  border-right: 2px solid #ffffff;
+  border-bottom: 2px solid #ffffff;
+  transform: rotate(45deg) scale(0);
+  transform-origin: center;
+  margin-top: -1px;
+  transition: transform 120ms ease;
+}
+
+.run-debug-checkbox input:hover,
+.run-debug-action-checkbox input:hover {
+  border-color: #86a4ca;
+}
+
+.run-debug-checkbox input:checked,
+.run-debug-action-checkbox input:checked {
+  background: #766ff0;
+  border-color: #766ff0;
+}
+
+.run-debug-checkbox input:checked::before,
+.run-debug-action-checkbox input:checked::before {
+  transform: rotate(45deg) scale(1);
+}
+
+.run-debug-checkbox input:focus-visible,
+.run-debug-action-checkbox input:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(118, 111, 240, 0.28);
 }
 
 .run-debug-label {
@@ -1688,6 +1750,37 @@ body {
 .run-debug-select:focus {
   border-color: #45d483;
   box-shadow: 0 0 0 1px rgba(69, 212, 131, 0.28);
+}
+
+.run-debug-field-error {
+  margin-top: 4px;
+  border: 1px solid #a07810;
+  background: rgba(255, 212, 86, 0.12);
+  color: #ffe7a9;
+  border-radius: 6px;
+  padding: 5px 7px;
+  font-size: 11px;
+  line-height: 1.35;
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  gap: 6px;
+  align-items: start;
+}
+
+.run-debug-field-error-icon {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: #f8cc4a;
+  color: #3d2a00;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
+
+.run-debug-field-error-text {
+  min-width: 0;
 }
 
 .run-debug-actions-list {
@@ -1740,6 +1833,15 @@ body {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 6px;
+}
+
+.run-debug-action-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #c5d9ef;
+  font-size: 12px;
+  user-select: none;
 }
 
 @media (max-width: 760px) {
@@ -1903,6 +2005,11 @@ body {
   background: rgba(111, 103, 255, 0.26);
 }
 
+.tree-node.drag-over {
+  background: rgba(69, 212, 131, 0.24);
+  outline: 1px dashed rgba(69, 212, 131, 0.85);
+}
+
 .tree-node.ignored {
   opacity: 0.5;
 }
@@ -1935,6 +2042,12 @@ body {
   box-shadow: 0 0 0 1px rgba(69, 212, 131, 0.3);
 }
 
+#treeRoot.root-drag-over {
+  outline: 1px dashed rgba(69, 212, 131, 0.75);
+  outline-offset: -2px;
+  border-radius: 6px;
+}
+
 .explorer-context-menu {
   position: fixed;
   min-width: 210px;
@@ -1951,6 +2064,10 @@ body {
 }
 
 .explorer-context-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   width: 100%;
   height: 30px;
   border: 0;
@@ -1961,6 +2078,13 @@ body {
   font-size: 13px;
   padding: 0 10px;
   cursor: pointer;
+}
+
+.explorer-context-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .explorer-context-item:hover {
@@ -2683,6 +2807,43 @@ body.light-theme .run-debug-label {
   color: #5a6c86;
 }
 
+body.light-theme .run-debug-action-checkbox {
+  color: #5a6c86;
+}
+
+body.light-theme .run-debug-checkbox input,
+body.light-theme .run-debug-action-checkbox input {
+  background: #ffffff;
+  border-color: #9eb2d2;
+}
+
+body.light-theme .run-debug-checkbox input:hover,
+body.light-theme .run-debug-action-checkbox input:hover {
+  border-color: #7f97bc;
+}
+
+body.light-theme .run-debug-checkbox input:checked,
+body.light-theme .run-debug-action-checkbox input:checked {
+  background: #6f67ff;
+  border-color: #6f67ff;
+}
+
+body.light-theme .run-debug-checkbox input:focus-visible,
+body.light-theme .run-debug-action-checkbox input:focus-visible {
+  box-shadow: 0 0 0 2px rgba(111, 103, 255, 0.22);
+}
+
+body.light-theme .run-debug-field-error {
+  border-color: #e0b44b;
+  background: #fff4cf;
+  color: #6f5000;
+}
+
+body.light-theme .run-debug-field-error-icon {
+  background: #f2b737;
+  color: #3b2a00;
+}
+
 body.light-theme .scm-file-status {
   color: #46688d;
 }
@@ -2755,8 +2916,7 @@ body.light-theme .confirm-btn.primary {
 body.light-theme .ai-btn,
 body.light-theme .ai-header-btn,
 body.light-theme .ai-panel-open-btn,
-body.light-theme .editor-play-menu-btn,
-body.light-theme .editor-play-btn {
+body.light-theme .editor-play-menu-btn {
   background: #4b5f82;
   border-color: #445575;
   color: #ffffff;
@@ -2765,9 +2925,34 @@ body.light-theme .editor-play-btn {
 body.light-theme .ai-btn:hover,
 body.light-theme .ai-header-btn:hover,
 body.light-theme .ai-panel-open-btn:hover,
-body.light-theme .editor-play-menu-btn:hover,
-body.light-theme .editor-play-btn:hover {
+body.light-theme .editor-play-menu-btn:hover {
   background: #405272;
+  color: #ffffff;
+  filter: none;
+}
+
+body.light-theme .editor-play-btn {
+  background: #6f67ff;
+  border-color: #6f67ff;
+  color: #ffffff;
+}
+
+body.light-theme .editor-play-menu-btn {
+  background: #6f67ff;
+  border-color: #6f67ff;
+  color: #ffffff;
+}
+
+body.light-theme .editor-play-btn:hover {
+  background: #5f57ef;
+  border-color: #5f57ef;
+  color: #ffffff;
+  filter: none;
+}
+
+body.light-theme .editor-play-menu-btn:hover {
+  background: #5f57ef;
+  border-color: #5f57ef;
   color: #ffffff;
   filter: none;
 }
