@@ -42,6 +42,9 @@ const collabActivityList = document.getElementById('collabActivityList');
 const treeRoot = document.getElementById('treeRoot');
 const scmTabBadge = document.getElementById('scmTabBadge');
 const editorTabs = document.getElementById('editorTabs');
+const collabQuickWrap = document.getElementById('collabQuickWrap');
+const collabQuickBtn = document.getElementById('collabQuickBtn');
+const collabQuickMenu = document.getElementById('collabQuickMenu');
 const editorPlayMenuBtn = document.getElementById('editorPlayMenuBtn');
 const editorPlayBtn = document.getElementById('editorPlayBtn');
 const editorPlayBtnIcon = document.getElementById('editorPlayBtnIcon');
@@ -196,6 +199,7 @@ const collabRemoteCursorDecorations = new Map();
 const collabRemoteCursorNames = new Map();
 const collabPendingRequests = new Map();
 const collabAssignedColors = new Map();
+const collabPeerLocations = new Map();
 
 const openFiles = new Map();
 const terminalSessions = new Map();
@@ -3482,6 +3486,11 @@ function closeEditorPlayMenu() {
   editorPlayMenu.innerHTML = '';
 }
 
+function closeCollabQuickMenu() {
+  collabQuickMenu.classList.add('hidden');
+  collabQuickMenu.innerHTML = '';
+}
+
 function getEditorPlayButtonState(options = launchConfigState.launchOptions) {
   const defaultOption = getDefaultLaunchOption(options);
   const defaultIsRunning = Boolean(defaultOption && isLaunchOptionRunning(defaultOption.id));
@@ -6096,6 +6105,182 @@ function getCollabColorById(clientId) {
   return fallback;
 }
 
+function getCollabNameInitial(name) {
+  const displayName = String(name || '').trim();
+  return (displayName.charAt(0) || '?').toUpperCase();
+}
+
+function createCollabAvatarNode(name, color, className = '') {
+  const avatar = document.createElement('span');
+  avatar.className = `collab-presence-avatar ${className}`.trim();
+  avatar.style.background = color;
+  avatar.textContent = getCollabNameInitial(name);
+  return avatar;
+}
+
+function getOtherCollaborators() {
+  return [...collabPresenceById.values()]
+    .filter((entry) => entry && entry.clientId && entry.clientId !== collabClientId)
+    .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+}
+
+function renderCollabQuickButton() {
+  if (!(collabConnected && collabQuickWrap && collabQuickBtn)) {
+    collabQuickWrap.classList.add('hidden');
+    closeCollabQuickMenu();
+    return;
+  }
+
+  collabQuickWrap.classList.remove('hidden');
+  collabQuickBtn.innerHTML = '';
+  const others = getOtherCollaborators();
+
+  if (!others.length) {
+    collabQuickBtn.classList.remove('has-avatars');
+    collabQuickBtn.classList.add('show-plus');
+    const plusIcon = document.createElement('span');
+    plusIcon.className = 'collab-quick-plus-icon';
+    plusIcon.setAttribute('aria-hidden', 'true');
+    collabQuickBtn.appendChild(plusIcon);
+    return;
+  }
+
+  collabQuickBtn.classList.remove('show-plus');
+  collabQuickBtn.classList.add('has-avatars');
+
+  const avatarStack = document.createElement('div');
+  avatarStack.className = 'collab-quick-avatar-stack';
+  for (const entry of others.slice(0, 3)) {
+    const avatar = createCollabAvatarNode(entry.name, getCollabColorById(entry.clientId), 'collab-quick-avatar');
+    avatarStack.appendChild(avatar);
+  }
+  collabQuickBtn.appendChild(avatarStack);
+}
+
+async function copyCollabJoinDetails() {
+  const serverUrl = String(collabServerUrlInput.value || '').trim();
+  const code = String(collabCodeInput.value || collabSessionCode || '').trim().toUpperCase();
+  if (!serverUrl || !code) {
+    throw new Error('Session details are not available yet.');
+  }
+
+  await api.copyToClipboard(`Server: ${serverUrl}\nCode: ${code}`);
+  setCollabInfo('Join details copied to clipboard');
+}
+
+async function jumpToCollaborator(entry) {
+  if (!entry || !entry.clientId) {
+    return;
+  }
+
+  const location = collabPeerLocations.get(entry.clientId) || {};
+  const sourceFilePath = String(entry.currentFile || location.filePath || '').trim();
+  if (!sourceFilePath) {
+    throw new Error('Collaborator has no active file.');
+  }
+
+  const targetFilePath = collabFilePathToProjectPath(sourceFilePath);
+  if (!targetFilePath) {
+    throw new Error('Could not resolve collaborator file path.');
+  }
+
+  await openFile(targetFilePath, { mode: 'permanent' });
+
+  if (!monacoEditor) {
+    return;
+  }
+
+  const model = monacoEditor.getModel();
+  if (!model) {
+    return;
+  }
+
+  const pos = location.position || null;
+  const lineNumber = Math.max(1, Math.min(model.getLineCount(), Number(pos && pos.lineNumber) || 1));
+  const column = Math.max(1, Math.min(model.getLineMaxColumn(lineNumber), Number(pos && pos.column) || 1));
+
+  monacoEditor.setPosition({ lineNumber, column });
+  monacoEditor.revealPositionInCenter({ lineNumber, column });
+  monacoEditor.focus();
+}
+
+function showCollabQuickMenu() {
+  collabQuickMenu.innerHTML = '';
+  const others = getOtherCollaborators();
+
+  for (const entry of others) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'collab-quick-menu-item collab-quick-menu-item-user';
+
+    const avatar = createCollabAvatarNode(entry.name, getCollabColorById(entry.clientId), 'collab-quick-menu-avatar');
+    row.appendChild(avatar);
+
+    const textWrap = document.createElement('span');
+    textWrap.className = 'collab-quick-menu-text';
+
+    const name = document.createElement('span');
+    name.className = 'collab-quick-menu-name';
+    name.textContent = entry.name || 'Collaborator';
+    textWrap.appendChild(name);
+
+    const location = collabPeerLocations.get(entry.clientId) || {};
+    const fileLabel = String(entry.currentFile || location.filePath || '').trim();
+    const canJumpToCollaborator = Boolean(fileLabel);
+    if (fileLabel) {
+      const subtitle = document.createElement('span');
+      subtitle.className = 'collab-quick-menu-subtitle';
+      const lineText = location.position && Number(location.position.lineNumber)
+        ? `:${Math.max(1, Number(location.position.lineNumber) || 1)}`
+        : '';
+      subtitle.textContent = `${fileLabel}${lineText}`;
+      textWrap.appendChild(subtitle);
+    }
+
+    row.appendChild(textWrap);
+    if (!canJumpToCollaborator) {
+      row.disabled = true;
+      row.classList.add('is-disabled');
+      row.title = 'No open file';
+    } else {
+      row.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        try {
+          await jumpToCollaborator(entry);
+          closeCollabQuickMenu();
+        } catch (error) {
+          alert(error.message || String(error));
+        }
+      });
+    }
+
+    collabQuickMenu.appendChild(row);
+  }
+
+  if (others.length) {
+    const divider = document.createElement('div');
+    divider.className = 'collab-quick-menu-divider';
+    collabQuickMenu.appendChild(divider);
+  }
+
+  const copyItem = document.createElement('button');
+  copyItem.type = 'button';
+  copyItem.className = 'collab-quick-menu-item collab-quick-menu-copy-item';
+  copyItem.textContent = 'Copy join details';
+  copyItem.addEventListener('click', async (event) => {
+    event.stopPropagation();
+    try {
+      await copyCollabJoinDetails();
+      closeCollabQuickMenu();
+    } catch (error) {
+      alert(error.message || String(error));
+    }
+  });
+  collabQuickMenu.appendChild(copyItem);
+
+  collabQuickMenu.classList.remove('hidden');
+}
+
 function collabColorWithAlpha(hexColor, alpha) {
   const fallbackAlpha = Math.max(0, Math.min(1, Number(alpha) || 0));
   const normalized = String(hexColor || '').replace('#', '');
@@ -6185,8 +6370,7 @@ function renderCollabPresence() {
     const avatar = document.createElement('span');
     avatar.className = 'collab-presence-avatar';
     avatar.style.background = getCollabColorById(entry.clientId);
-    const displayName = String(entry.name || '').trim();
-    avatar.textContent = (displayName.charAt(0) || '?').toUpperCase();
+    avatar.textContent = getCollabNameInitial(entry.name);
 
     const label = document.createElement('span');
     label.className = 'collab-presence-name';
@@ -6217,6 +6401,8 @@ function renderCollabPresence() {
 
     collabPresenceList.appendChild(item);
   }
+
+  renderCollabQuickButton();
 }
 
 function setCollabInfo(text) {
@@ -6232,6 +6418,7 @@ function updateCollabButtons() {
   collabServerUrlInput.disabled = collabConnected;
   collabCodeInput.disabled = collabConnected;
   collabNameInput.disabled = collabConnected;
+  renderCollabQuickButton();
 }
 
 function getRequestedCollabName() {
@@ -6368,8 +6555,10 @@ function clearCollabSessionState() {
   collabFileVersions.clear();
   collabRemoteCursorNames.clear();
   collabAssignedColors.clear();
+  collabPeerLocations.clear();
   collabPresenceList.innerHTML = '';
   collabActivityList.innerHTML = '';
+  closeCollabQuickMenu();
 
   clearAllRemoteDecorations();
   updateCollabButtons();
@@ -6559,6 +6748,7 @@ function handleCollabPacket(packet) {
 
   if (packet.type === 'presence:left') {
     collabAssignedColors.delete(packet.clientId);
+    collabPeerLocations.delete(packet.clientId);
     clearRemoteDecorationsForClient(packet.clientId);
     collabPresenceById.delete(packet.clientId);
     renderCollabPresence();
@@ -6586,6 +6776,11 @@ function handleCollabPacket(packet) {
     };
     existing.currentFile = packet.currentFile || null;
     collabPresenceById.set(packet.clientId, existing);
+    const existingLocation = collabPeerLocations.get(packet.clientId);
+    if (existingLocation) {
+      existingLocation.filePath = packet.currentFile || existingLocation.filePath || '';
+      collabPeerLocations.set(packet.clientId, existingLocation);
+    }
     renderCollabPresence();
     return;
   }
@@ -6600,7 +6795,19 @@ function handleCollabPacket(packet) {
       return;
     }
 
+    collabPeerLocations.set(packet.clientId, {
+      filePath: String(packet.filePath || ''),
+      position: packet.position || null,
+      at: Date.now()
+    });
+
     const projectPath = collabFilePathToProjectPath(packet.filePath || '');
+    const existing = collabPresenceById.get(packet.clientId);
+    if (existing) {
+      existing.currentFile = packet.filePath || existing.currentFile || null;
+      collabPresenceById.set(packet.clientId, existing);
+      renderCollabPresence();
+    }
     updateRemoteCursorDecoration(packet.clientId, packet.name || 'Collaborator', projectPath, packet.position || null, packet.selection || null);
     return;
   }
@@ -6616,6 +6823,12 @@ function handleCollabPacket(packet) {
       if (!cursor || !cursor.clientId || cursor.clientId === collabClientId) {
         continue;
       }
+
+      collabPeerLocations.set(cursor.clientId, {
+        filePath: String(cursor.filePath || packet.filePath || ''),
+        position: cursor.position || null,
+        at: Date.now()
+      });
 
       updateRemoteCursorDecoration(
         cursor.clientId,
@@ -7299,6 +7512,22 @@ editorPlayMenuBtn.addEventListener('click', async (event) => {
   }
 });
 
+if (collabQuickBtn) {
+  collabQuickBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (!collabConnected) {
+      return;
+    }
+
+    if (!collabQuickMenu.classList.contains('hidden')) {
+      closeCollabQuickMenu();
+      return;
+    }
+
+    showCollabQuickMenu();
+  });
+}
+
 runDebugCreateBtn.addEventListener('click', async () => {
   try {
     await createLaunchConfigFromPanel();
@@ -7459,6 +7688,10 @@ scmSyncFetchOption.addEventListener('click', async (event) => {
 document.addEventListener('click', (event) => {
   if (!event.target.closest('.editor-play-wrap')) {
     closeEditorPlayMenu();
+  }
+
+  if (!event.target.closest('.collab-quick-wrap')) {
+    closeCollabQuickMenu();
   }
 
   if (!event.target.closest('.scm-sync-split')) {
