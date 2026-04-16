@@ -45,6 +45,7 @@ const editorTabs = document.getElementById('editorTabs');
 const collabQuickWrap = document.getElementById('collabQuickWrap');
 const collabQuickBtn = document.getElementById('collabQuickBtn');
 const collabQuickMenu = document.getElementById('collabQuickMenu');
+const editorPlayWrap = document.querySelector('.editor-play-wrap');
 const editorPlayMenuBtn = document.getElementById('editorPlayMenuBtn');
 const editorPlayBtn = document.getElementById('editorPlayBtn');
 const editorPlayBtnIcon = document.getElementById('editorPlayBtnIcon');
@@ -192,6 +193,18 @@ let collabRequestSeq = 1;
 let collabCursorBroadcastTimer = null;
 let collabDisconnectNotice = '';
 let collabRemoteTeardownInProgress = false;
+
+imagePreviewImg.addEventListener('load', () => {
+  updateImagePreviewDimensions();
+});
+
+imagePreviewImg.addEventListener('error', () => {
+  const state = currentFilePath ? openFiles.get(currentFilePath) : null;
+  if (state && state.kind === 'image') {
+    state.imageDimensions = null;
+    updateEditorStatusBar();
+  }
+});
 
 const collabPresenceById = new Map();
 const collabFileVersions = new Map();
@@ -2038,6 +2051,10 @@ function getLaunchActionSummary(action) {
 }
 
 function syncRunDebugToolbarVisibility(showToolbar) {
+  if (editorPlayWrap) {
+    editorPlayWrap.classList.toggle('hidden', !showToolbar);
+  }
+
   runDebugNewOptionBtn.classList.toggle('hidden', !showToolbar);
   runDebugRefreshBtn.classList.toggle('hidden', !Boolean(project.rootPath));
 }
@@ -2868,7 +2885,11 @@ function renderRunDebugPanel() {
   const hasConfig = hasProject && launchConfigExists;
 
   syncEditorPlayButtonState();
-  syncRunDebugToolbarVisibility(hasConfig);
+  syncRunDebugToolbarVisibility(hasProject);
+
+  if (!hasProject) {
+    closeEditorPlayMenu();
+  }
 
   if (!hasProject) {
     runDebugEmptyState.classList.remove('hidden');
@@ -4653,7 +4674,12 @@ function updateEditorStatusBar() {
   }
 
   if (state.kind === 'image') {
-    statusPosition.textContent = 'Ln -, Col -';
+    const dimensions = state.imageDimensions;
+    if (dimensions && dimensions.width && dimensions.height) {
+      statusPosition.textContent = `${dimensions.width} × ${dimensions.height}`;
+    } else {
+      statusPosition.textContent = 'Image';
+    }
     statusEncoding.textContent = state.encoding || 'Image';
     return;
   }
@@ -5326,7 +5352,7 @@ function detectMonacoLanguage(filePath) {
 }
 
 function isImageFile(filePath) {
-  return /\.(png|jpe?g|svg)$/i.test(filePath);
+  return /\.(png|jpe?g|gif|webp|svg|ico)$/i.test(filePath);
 }
 
 function toFileUrl(filePath) {
@@ -5341,14 +5367,38 @@ function showTextEditor() {
   imagePreviewImg.alt = '';
 }
 
-function showImagePreview(filePath) {
+function updateImagePreviewDimensions() {
+  if (!currentFilePath) {
+    return;
+  }
+
+  const state = openFiles.get(currentFilePath);
+  if (!state || state.kind !== 'image') {
+    return;
+  }
+
+  const width = Math.max(0, Number(imagePreviewImg.naturalWidth) || 0);
+  const height = Math.max(0, Number(imagePreviewImg.naturalHeight) || 0);
+  if (!width || !height) {
+    return;
+  }
+
+  state.imageDimensions = { width, height };
+  updateEditorStatusBar();
+}
+
+function showImagePreview(filePath, imageSrc = '') {
   if (monacoEditor) {
     monacoEditor.setModel(null);
   }
   editor.classList.add('hidden');
   imagePreview.classList.remove('hidden');
-  imagePreviewImg.src = `${toFileUrl(filePath)}?t=${Date.now()}`;
+  imagePreviewImg.src = imageSrc || `${toFileUrl(filePath)}?t=${Date.now()}`;
   imagePreviewImg.alt = getFileName(filePath);
+
+  if (imagePreviewImg.complete) {
+    updateImagePreviewDimensions();
+  }
 }
 
 function disposeOpenFileState(state) {
@@ -5423,7 +5473,7 @@ function switchToFile(filePath) {
 
   currentFilePath = filePath;
   if (state.kind === 'image') {
-    showImagePreview(filePath);
+    showImagePreview(filePath, state.imageSrc || '');
   } else {
     showTextEditor();
     if (!monacoEditor) {
@@ -6712,7 +6762,9 @@ async function openFileWithCollabSupport(filePath) {
   const response = await sendCollabRequest('file:get', { filePath: collabPath });
   return {
     content: String(response.content || ''),
-    version: Math.max(0, Number(response.version) || 0)
+    version: Math.max(0, Number(response.version) || 0),
+    encoding: String(response.encoding || ''),
+    mimeType: String(response.mimeType || '')
   };
 }
 
@@ -7112,10 +7164,25 @@ async function openFile(filePath, options = {}) {
   }
 
   if (isImageFile(filePath)) {
+    let imageSrc = '';
+    let encoding = 'Image';
+
+    if (collabConnected && collabMode === 'remote') {
+      const collabFile = await openFileWithCollabSupport(filePath);
+      if (collabFile && collabFile.content) {
+        const mimeType = collabFile.mimeType || 'image/png';
+        imageSrc = `data:${mimeType};base64,${collabFile.content}`;
+        encoding = mimeType;
+        collabFileVersions.set(projectPathToCollabPath(filePath), collabFile.version);
+      }
+    }
+
     openFiles.set(filePath, {
       kind: 'image',
       preview: openAsPreview,
-      encoding: 'Image'
+      encoding,
+      imageSrc,
+      imageDimensions: null
     });
   } else {
     let content = '';

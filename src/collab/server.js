@@ -68,6 +68,10 @@ function filterIgnoredNodes(nodes) {
   return filtered;
 }
 
+function isImageFilePath(filePath) {
+  return /\.(png|jpe?g|gif|webp|svg|ico)$/i.test(String(filePath || ''));
+}
+
 class CollaborationHostServer {
   constructor(options = {}) {
     this.getProjectPath = options.getProjectPath;
@@ -569,6 +573,20 @@ class CollaborationHostServer {
       return;
     }
 
+    const resolved = this.resolveRelativePath(targetPath);
+    if (isImageFilePath(targetPath)) {
+      const content = await fs.readFile(resolved.absolutePath);
+      this.send(socket, 'file:data', {
+        requestId: packet.requestId || null,
+        filePath: targetPath,
+        content: content.toString('base64'),
+        encoding: 'base64',
+        mimeType: this.getImageMimeType(targetPath),
+        version: 0
+      });
+      return;
+    }
+
     const fileState = await this.getFileState(targetPath);
     this.send(socket, 'file:data', {
       requestId: packet.requestId || null,
@@ -578,9 +596,33 @@ class CollaborationHostServer {
     });
   }
 
+  getImageMimeType(filePath) {
+    const lowerPath = String(filePath || '').toLowerCase();
+    if (lowerPath.endsWith('.png')) {
+      return 'image/png';
+    }
+    if (lowerPath.endsWith('.jpg') || lowerPath.endsWith('.jpeg')) {
+      return 'image/jpeg';
+    }
+    if (lowerPath.endsWith('.gif')) {
+      return 'image/gif';
+    }
+    if (lowerPath.endsWith('.webp')) {
+      return 'image/webp';
+    }
+    if (lowerPath.endsWith('.svg')) {
+      return 'image/svg+xml';
+    }
+    if (lowerPath.endsWith('.ico')) {
+      return 'image/x-icon';
+    }
+    return 'application/octet-stream';
+  }
+
   async handleFileOps(socket, packet, client) {
     const filePath = String(packet.filePath || '').replace(/^[\\/]+/, '');
-    if (!this.isSharedPath(filePath, false)) {
+    const isIgnoredPath = !this.isSharedPath(filePath, false);
+    if (isIgnoredPath && !client.isHostClient) {
       this.send(socket, 'file:ops:error', {
         requestId: packet.requestId || null,
         message: 'That path is not shared in this session.'
@@ -633,6 +675,10 @@ class CollaborationHostServer {
       filePath,
       version: nextVersion
     });
+
+    if (client.isHostClient && isIgnoredPath) {
+      return;
+    }
 
     this.broadcast('file:ops', {
       filePath,
@@ -740,6 +786,7 @@ class CollaborationHostServer {
     }
 
     const type = operation.type;
+    let hostIgnoredOperation = false;
     if (!client.isHostClient) {
       if (type === 'create-file') {
         const parent = this.resolveRelativePath(String(operation.parentPath || ''));
@@ -790,6 +837,54 @@ class CollaborationHostServer {
       } else {
         return;
       }
+    } else if (type === 'create-file') {
+      const parent = this.resolveRelativePath(String(operation.parentPath || ''));
+      const name = String(operation.name || '').trim();
+      if (!name) {
+        throw new Error('File name is required.');
+      }
+      const relativeTarget = path.join(parent.relativePath, name).split(path.sep).join('/');
+      hostIgnoredOperation = !this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, false);
+      await fs.writeFile(path.join(parent.absolutePath, name), '', { flag: 'wx' });
+    } else if (type === 'create-folder') {
+      const parent = this.resolveRelativePath(String(operation.parentPath || ''));
+      const name = String(operation.name || '').trim();
+      if (!name) {
+        throw new Error('Folder name is required.');
+      }
+      const relativeTarget = path.join(parent.relativePath, name).split(path.sep).join('/');
+      hostIgnoredOperation = !this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, true);
+      await fs.mkdir(path.join(parent.absolutePath, name));
+    } else if (type === 'delete') {
+      const target = this.resolveRelativePath(String(operation.targetPath || ''));
+      const stat = await fs.stat(target.absolutePath);
+      hostIgnoredOperation = !this.isSharedPath(target.relativePath, stat.isDirectory());
+      if (stat.isDirectory()) {
+        await fs.rm(target.absolutePath, { recursive: true, force: false });
+      } else {
+        await fs.unlink(target.absolutePath);
+      }
+    } else if (type === 'rename') {
+      const target = this.resolveRelativePath(String(operation.targetPath || ''));
+      const newName = String(operation.newName || '').trim();
+      if (!newName) {
+        throw new Error('New name is required.');
+      }
+      const stat = await fs.stat(target.absolutePath);
+      const destinationRelativePath = path.join(path.dirname(target.relativePath), newName).split(path.sep).join('/');
+      hostIgnoredOperation = !this.isSharedPath(target.relativePath, stat.isDirectory()) || !this.isSharedPath(destinationRelativePath, stat.isDirectory());
+      const destination = path.join(path.dirname(target.absolutePath), newName);
+      await fs.rename(target.absolutePath, destination);
+    } else {
+      return;
+    }
+
+    if (hostIgnoredOperation) {
+      this.send(socket, 'file:operation:ok', {
+        requestId: packet.requestId || null,
+        type
+      });
+      return;
     }
 
     const snapshot = await this.buildSnapshotPayload();
