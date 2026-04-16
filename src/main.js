@@ -704,6 +704,34 @@ ipcMain.handle('collab:getServerInfo', async () => {
   };
 });
 
+ipcMain.handle('collab:openJoinWindow', async (_event, payload = {}) => {
+  const serverUrl = String(payload.serverUrl || '').trim();
+  const code = String(payload.code || '').trim().toUpperCase();
+  const name = String(payload.name || '').trim();
+
+  if (!serverUrl || !code) {
+    throw new Error('Enter both server URL and session code.');
+  }
+
+  const joinWindow = createWindow();
+  joinWindow.webContents.once('did-finish-load', () => {
+    if (joinWindow.isDestroyed()) {
+      return;
+    }
+
+    joinWindow.webContents.send('menu:action', {
+      action: 'collab:autoJoin',
+      payload: {
+        serverUrl,
+        code,
+        name
+      }
+    });
+  });
+
+  return { ok: true };
+});
+
 ipcMain.handle('project:open', async (event) => {
   const senderWindow = BrowserWindow.fromWebContents(event.sender);
   const existingProjectPath = getProjectPathForSender(event.sender);

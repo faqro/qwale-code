@@ -35,6 +35,7 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   startCollabServer: (payload) => ipcRenderer.invoke('collab:startServer', payload),
   stopCollabServer: () => ipcRenderer.invoke('collab:stopServer'),
   getCollabServerInfo: () => ipcRenderer.invoke('collab:getServerInfo'),
+  openCollabJoinWindow: (payload) => ipcRenderer.invoke('collab:openJoinWindow', payload),
   runAiCommand: (payload) => ipcRenderer.invoke('ai:runCommand', payload),
   getTerminalProfiles: () => ipcRenderer.invoke('terminal:getProfiles'),
   createTerminal: (payload) => ipcRenderer.invoke('terminal:create', payload),

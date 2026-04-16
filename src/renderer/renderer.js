@@ -187,6 +187,8 @@ let collabMode = 'offline';
 let collabSuppressBroadcast = false;
 let collabRequestSeq = 1;
 let collabCursorBroadcastTimer = null;
+let collabDisconnectNotice = '';
+let collabRemoteTeardownInProgress = false;
 
 const collabPresenceById = new Map();
 const collabFileVersions = new Map();
@@ -6219,8 +6221,10 @@ function setCollabInfo(text) {
 }
 
 function updateCollabButtons() {
+  const isHostingSession = collabConnected && collabMode === 'host';
   collabStartBtn.classList.toggle('hidden', collabConnected || !project.rootPath);
   collabStopBtn.classList.toggle('hidden', !collabConnected);
+  collabJoinBtn.classList.toggle('hidden', isHostingSession);
   collabJoinBtn.disabled = collabConnected;
   collabServerUrlInput.disabled = collabConnected;
   collabCodeInput.disabled = collabConnected;
@@ -6230,6 +6234,18 @@ function updateCollabButtons() {
 function getRequestedCollabName() {
   const inputName = String(collabNameInput.value || '').trim();
   return inputName || collabParticipantName;
+}
+
+function resetHttpPanelState() {
+  httpMethodSelect.value = 'GET';
+  httpUrlInput.value = '';
+  httpHeadersInput.value = '';
+  httpBodyInput.value = '';
+  httpSendBtn.disabled = false;
+  httpSendBtn.textContent = 'Send Request';
+  httpResultStatus.textContent = 'No request sent yet.';
+  httpResultOutput.textContent = '{}';
+  updateHttpBodyState();
 }
 
 function sendCollabPacket(type, payload = {}) {
@@ -6260,15 +6276,97 @@ function sendCollabRequest(type, payload = {}) {
   });
 }
 
+function rejectAllPendingCollabRequests(message = 'Collaboration session ended.') {
+  for (const pending of collabPendingRequests.values()) {
+    if (!pending || typeof pending.reject !== 'function') {
+      continue;
+    }
+    pending.reject(new Error(message));
+  }
+  collabPendingRequests.clear();
+}
+
+async function resetWorkspaceToNoProjectState() {
+  clearAllRemoteDecorations();
+
+  for (const [, state] of openFiles) {
+    disposeOpenFileState(state);
+  }
+  openFiles.clear();
+
+  previewFilePath = null;
+  currentFilePath = null;
+  selectedNodePath = null;
+  explorerSelectionAnchorPath = null;
+  explorerSelectedPaths.clear();
+  showTextEditor();
+  if (monacoEditor) {
+    monacoEditor.setModel(null);
+  }
+
+  project = {
+    rootPath: null,
+    rootName: '',
+    tree: []
+  };
+
+  projectInfo.textContent = 'No folder opened';
+  expandedFolders.clear();
+  clearExplorerDragVisualState();
+  updateEditorStatusBar();
+  updateEditorTitle();
+  renderTabs();
+  renderTree();
+  refreshFileSearchIndex();
+  applyScmState('no-project');
+  clearAiConversationHistory();
+  await loadLaunchConfigFromDisk();
+  resetHttpPanelState();
+}
+
+async function resetTerminalBaseline() {
+  killAllTerminalSessions();
+  await createTerminalSession('powershell');
+}
+
+async function teardownRemoteCollaborationWorkspace(notice = 'Collaboration offline') {
+  const alreadyAtNoProject = !project.rootPath && openFiles.size === 0 && !currentFilePath && !previewFilePath;
+  if (collabRemoteTeardownInProgress || alreadyAtNoProject) {
+    setCollabInfo(notice || 'Collaboration offline');
+    return;
+  }
+
+  collabRemoteTeardownInProgress = true;
+  try {
+    await resetWorkspaceToNoProjectState();
+    await resetTerminalBaseline();
+    updateCollabButtons();
+    setCollabInfo(notice || 'Collaboration offline');
+  } finally {
+    collabRemoteTeardownInProgress = false;
+  }
+}
+
 function clearCollabSessionState() {
+  rejectAllPendingCollabRequests();
+  if (collabCursorBroadcastTimer) {
+    clearTimeout(collabCursorBroadcastTimer);
+    collabCursorBroadcastTimer = null;
+  }
+
   collabClientId = null;
   collabIsSessionHost = false;
   collabConnected = false;
   collabSessionCode = '';
   collabMode = 'offline';
+  collabSuppressBroadcast = false;
+  collabRequestSeq = 1;
   collabPresenceById.clear();
   collabFileVersions.clear();
+  collabRemoteCursorNames.clear();
   collabAssignedColors.clear();
+  collabPresenceList.innerHTML = '';
+  collabActivityList.innerHTML = '';
 
   clearAllRemoteDecorations();
   updateCollabButtons();
@@ -6467,8 +6565,7 @@ function handleCollabPacket(packet) {
 
   if (packet.type === 'session:kicked') {
     const byName = packet.byName ? String(packet.byName) : 'The host';
-    addCollabActivity(`${byName} removed you from the session`);
-    setCollabInfo('You were removed from the collaboration session');
+    collabDisconnectNotice = `${byName} removed you from the session`;
     if (collabSocket) {
       try {
         collabSocket.close();
@@ -6637,9 +6734,18 @@ function connectCollabSocket(serverUrl, code, name, mode) {
     });
 
     socket.addEventListener('close', () => {
+      const wasRemoteSession = collabMode === 'remote';
+      const disconnectNotice = collabDisconnectNotice || 'Collaboration offline';
+      collabDisconnectNotice = '';
       collabSocket = null;
       clearCollabSessionState();
-      setCollabInfo('Collaboration offline');
+      if (wasRemoteSession) {
+        teardownRemoteCollaborationWorkspace(disconnectNotice).catch((error) => {
+          setCollabInfo(error && error.message ? error.message : 'Collaboration offline');
+        });
+      } else {
+        setCollabInfo(disconnectNotice);
+      }
       if (!settled) {
         reject(new Error('Collaboration connection closed.'));
       }
@@ -6683,10 +6789,24 @@ async function joinCollaborationAsClient() {
     throw new Error('Enter both server URL and session code.');
   }
 
-  await connectCollabSocket(serverUrl, code, getRequestedCollabName(), project.rootPath ? 'host' : 'remote');
+  if (project.rootPath) {
+    await api.openCollabJoinWindow({
+      serverUrl,
+      code,
+      name: getRequestedCollabName()
+    });
+    return;
+  }
+
+  await connectCollabSocket(serverUrl, code, getRequestedCollabName(), 'remote');
 }
 
 async function stopCollaborationSession() {
+  const wasRemoteSession = collabMode === 'remote';
+  const wasHostSession = collabMode === 'host';
+  const stopNotice = collabDisconnectNotice || 'Collaboration offline';
+  collabDisconnectNotice = '';
+
   if (collabSocket) {
     try {
       collabSocket.close();
@@ -6696,12 +6816,19 @@ async function stopCollaborationSession() {
   }
   collabSocket = null;
 
-  if (collabMode === 'host') {
+  if (wasHostSession) {
     await api.stopCollabServer();
+    collabServerUrlInput.value = '';
+    collabCodeInput.value = '';
   }
 
   clearCollabSessionState();
-  setCollabInfo('Collaboration offline');
+  if (wasRemoteSession) {
+    await teardownRemoteCollaborationWorkspace(stopNotice);
+    return;
+  }
+
+  setCollabInfo(stopNotice);
 }
 
 function scheduleCursorBroadcast() {
@@ -7061,6 +7188,7 @@ async function closeFolder() {
 
   if (collabConnected && collabMode === 'remote') {
     await stopCollaborationSession();
+    return;
   }
 
   if (hasDirtyFiles()) {
@@ -7506,6 +7634,19 @@ if (api.onMenuAction) {
         }
       } else if (action === 'view:toggleTheme') {
         toggleThemeMode();
+      } else if (action === 'collab:autoJoin') {
+        setSidebarPanel('collaborate');
+        const incomingServerUrl = payload && payload.serverUrl ? String(payload.serverUrl) : '';
+        const incomingCode = payload && payload.code ? String(payload.code).toUpperCase() : '';
+        const incomingName = payload && payload.name ? String(payload.name) : '';
+
+        collabServerUrlInput.value = incomingServerUrl;
+        collabCodeInput.value = incomingCode;
+        if (incomingName) {
+          collabNameInput.value = incomingName;
+        }
+
+        await joinCollaborationAsClient();
       } else if (action === 'project:recentCleared') {
         await refreshRecentProjectsCache();
         renderMenuBar();

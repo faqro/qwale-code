@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs/promises');
 const { randomUUID } = require('crypto');
 const { WebSocketServer } = require('ws');
+const ignore = require('ignore');
 const {
   normalizeOperation,
   transformOperationAgainstApplied,
@@ -45,6 +46,28 @@ function createTreeNodeSnapshot(node, projectPath) {
   return base;
 }
 
+function filterIgnoredNodes(nodes) {
+  const list = Array.isArray(nodes) ? nodes : [];
+  const filtered = [];
+  for (const node of list) {
+    if (!node || node.ignored) {
+      continue;
+    }
+
+    if (node.type === 'folder') {
+      filtered.push({
+        ...node,
+        children: filterIgnoredNodes(node.children)
+      });
+      continue;
+    }
+
+    filtered.push(node);
+  }
+
+  return filtered;
+}
+
 class CollaborationHostServer {
   constructor(options = {}) {
     this.getProjectPath = options.getProjectPath;
@@ -59,6 +82,7 @@ class CollaborationHostServer {
     this.hostSenderId = null;
     this.sessionHostClientId = null;
     this.projectPath = null;
+    this.gitignoreMatcher = null;
 
     this.clients = new Map();
     this.fileStates = new Map();
@@ -132,6 +156,7 @@ class CollaborationHostServer {
     this.hostSenderId = null;
     this.sessionHostClientId = null;
     this.projectPath = null;
+    this.gitignoreMatcher = null;
 
     if (typeof this.onServerStopped === 'function') {
       this.onServerStopped();
@@ -149,6 +174,7 @@ class CollaborationHostServer {
     }
 
     this.projectPath = projectPath;
+    this.gitignoreMatcher = await this.createGitignoreMatcher(projectPath);
     this.hostSenderId = senderId;
     this.sessionId = randomUUID ? randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     this.sessionCode = randomCode(6);
@@ -225,12 +251,6 @@ class CollaborationHostServer {
     }
     this.clearEditActivityForClient(client.clientId);
     this.broadcast('presence:left', {
-      clientId: client.clientId,
-      name: client.name,
-      at: Date.now()
-    });
-
-    this.emitHostEvent('presence:left', {
       clientId: client.clientId,
       name: client.name,
       at: Date.now()
@@ -328,9 +348,42 @@ class CollaborationHostServer {
     };
   }
 
+  async createGitignoreMatcher(projectPath) {
+    const matcher = ignore();
+    matcher.add('.git/');
+
+    const gitignorePath = path.join(projectPath, '.gitignore');
+    try {
+      const content = await fs.readFile(gitignorePath, 'utf8');
+      matcher.add(content);
+    } catch {
+      // .gitignore is optional.
+    }
+
+    return matcher;
+  }
+
+  isIgnoredRelativePath(relativePath, isDirectory) {
+    if (!this.gitignoreMatcher) {
+      return false;
+    }
+
+    const rel = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!rel || rel.startsWith('..')) {
+      return false;
+    }
+
+    return this.gitignoreMatcher.ignores(isDirectory ? `${rel}/` : rel);
+  }
+
+  isSharedPath(relativePath, isDirectory = false) {
+    return !this.isIgnoredRelativePath(relativePath, isDirectory);
+  }
+
   async buildSnapshotPayload() {
     const fullTree = await this.buildTreeSnapshot(this.projectPath);
-    const snapshotTree = (fullTree.tree || []).map((node) => createTreeNodeSnapshot(node, this.projectPath));
+    const sharedTree = filterIgnoredNodes(fullTree.tree || []);
+    const snapshotTree = sharedTree.map((node) => createTreeNodeSnapshot(node, this.projectPath));
     return {
       rootName: path.basename(this.projectPath),
       tree: snapshotTree
@@ -400,13 +453,9 @@ class CollaborationHostServer {
     }
 
     if (packet.type === 'presence:file') {
-      client.currentFile = String(packet.filePath || '');
+      const nextFilePath = String(packet.filePath || '');
+      client.currentFile = this.isSharedPath(nextFilePath, false) ? nextFilePath : '';
       this.broadcast('presence:update', {
-        clientId: client.clientId,
-        name: client.name,
-        currentFile: client.currentFile
-      });
-      this.emitHostEvent('presence:update', {
         clientId: client.clientId,
         name: client.name,
         currentFile: client.currentFile
@@ -508,17 +557,18 @@ class CollaborationHostServer {
       isHostClient,
       at: Date.now()
     }, socket);
-
-    this.emitHostEvent('presence:joined', {
-      clientId,
-      name: clientName,
-      isHostClient,
-      at: Date.now()
-    });
   }
 
   async handleFileGet(socket, packet, client) {
     const targetPath = String(packet.filePath || '').replace(/^[\\/]+/, '');
+    if (!this.isSharedPath(targetPath, false)) {
+      this.send(socket, 'file:get:error', {
+        requestId: packet.requestId || null,
+        message: 'That path is not shared in this session.'
+      });
+      return;
+    }
+
     const fileState = await this.getFileState(targetPath);
     this.send(socket, 'file:data', {
       requestId: packet.requestId || null,
@@ -526,16 +576,18 @@ class CollaborationHostServer {
       content: fileState.content,
       version: fileState.history.length
     });
-
-    this.emitHostEvent('activity:add', {
-      level: 'info',
-      message: `${client.name} opened ${targetPath || '(root)'}`,
-      at: Date.now()
-    });
   }
 
   async handleFileOps(socket, packet, client) {
     const filePath = String(packet.filePath || '').replace(/^[\\/]+/, '');
+    if (!this.isSharedPath(filePath, false)) {
+      this.send(socket, 'file:ops:error', {
+        requestId: packet.requestId || null,
+        message: 'That path is not shared in this session.'
+      });
+      return;
+    }
+
     const requestedBaseVersion = Math.max(0, Number(packet.baseVersion) || 0);
     const incomingOps = Array.isArray(packet.ops) ? packet.ops.map((entry) => normalizeOperation(entry)) : [];
     if (!filePath || !incomingOps.length) {
@@ -594,10 +646,15 @@ class CollaborationHostServer {
   }
 
   handleCursorUpdate(socket, packet, client) {
+    const targetPath = String(packet.filePath || '');
+    if (!this.isSharedPath(targetPath, false)) {
+      return;
+    }
+
     const payload = {
       clientId: client.clientId,
       name: client.name,
-      filePath: String(packet.filePath || ''),
+      filePath: targetPath,
       position: packet.position || null,
       selection: packet.selection || null,
       at: Date.now()
@@ -611,7 +668,6 @@ class CollaborationHostServer {
     };
 
     this.broadcast('cursor:update', payload, socket);
-    this.emitHostEvent('cursor:update', payload);
   }
 
   async handleClientKick(socket, packet, requester) {
@@ -669,12 +725,6 @@ class CollaborationHostServer {
       at: Date.now(),
       clientId: requester.clientId
     });
-    this.emitHostEvent('activity:add', {
-      level: 'moderation',
-      message: `${requester.name} removed ${targetClient.name}`,
-      at: Date.now(),
-      clientId: requester.clientId
-    });
 
     try {
       targetSocket.close();
@@ -697,6 +747,10 @@ class CollaborationHostServer {
         if (!name) {
           throw new Error('File name is required.');
         }
+        const relativeTarget = path.join(parent.relativePath, name).split(path.sep).join('/');
+        if (!this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, false)) {
+          throw new Error('Cannot create files in ignored paths.');
+        }
         await fs.writeFile(path.join(parent.absolutePath, name), '', { flag: 'wx' });
       } else if (type === 'create-folder') {
         const parent = this.resolveRelativePath(String(operation.parentPath || ''));
@@ -704,10 +758,17 @@ class CollaborationHostServer {
         if (!name) {
           throw new Error('Folder name is required.');
         }
+        const relativeTarget = path.join(parent.relativePath, name).split(path.sep).join('/');
+        if (!this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, true)) {
+          throw new Error('Cannot create folders in ignored paths.');
+        }
         await fs.mkdir(path.join(parent.absolutePath, name));
       } else if (type === 'delete') {
         const target = this.resolveRelativePath(String(operation.targetPath || ''));
         const stat = await fs.stat(target.absolutePath);
+        if (!this.isSharedPath(target.relativePath, stat.isDirectory())) {
+          throw new Error('Cannot modify ignored paths.');
+        }
         if (stat.isDirectory()) {
           await fs.rm(target.absolutePath, { recursive: true, force: false });
         } else {
@@ -718,6 +779,11 @@ class CollaborationHostServer {
         const newName = String(operation.newName || '').trim();
         if (!newName) {
           throw new Error('New name is required.');
+        }
+        const stat = await fs.stat(target.absolutePath);
+        const destinationRelativePath = path.join(path.dirname(target.relativePath), newName).split(path.sep).join('/');
+        if (!this.isSharedPath(target.relativePath, stat.isDirectory()) || !this.isSharedPath(destinationRelativePath, stat.isDirectory())) {
+          throw new Error('Cannot rename ignored paths.');
         }
         const destination = path.join(path.dirname(target.absolutePath), newName);
         await fs.rename(target.absolutePath, destination);
@@ -731,17 +797,8 @@ class CollaborationHostServer {
       tree: snapshot.tree,
       rootName: snapshot.rootName
     });
-    this.emitHostEvent('tree:update', {
-      tree: snapshot.tree,
-      rootName: snapshot.rootName
-    });
 
     this.broadcast('activity:add', {
-      level: 'file-op',
-      message: `${client.name} performed ${type}`,
-      at: Date.now()
-    });
-    this.emitHostEvent('activity:add', {
       level: 'file-op',
       message: `${client.name} performed ${type}`,
       at: Date.now()
