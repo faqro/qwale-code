@@ -6182,6 +6182,20 @@ function renderCollabPresence() {
     const item = document.createElement('div');
     item.className = 'collab-presence-item';
 
+    const avatar = document.createElement('span');
+    avatar.className = 'collab-presence-avatar';
+    avatar.style.background = getCollabColorById(entry.clientId);
+    const displayName = String(entry.name || '').trim();
+    avatar.textContent = (displayName.charAt(0) || '?').toUpperCase();
+
+    const label = document.createElement('span');
+    label.className = 'collab-presence-name';
+    const suffix = entry.currentFile ? ` - ${entry.currentFile}` : '';
+    label.textContent = `${entry.name}${entry.clientId === collabClientId ? ' (you)' : ''}${suffix}`;
+
+    item.appendChild(avatar);
+    item.appendChild(label);
+
     const canKick = collabIsSessionHost && collabConnected && entry.clientId !== collabClientId;
     if (canKick) {
       const kickBtn = document.createElement('button');
@@ -6189,7 +6203,7 @@ function renderCollabPresence() {
       kickBtn.className = 'collab-presence-kick-btn';
       kickBtn.title = `Remove ${entry.name || 'collaborator'}`;
       kickBtn.setAttribute('aria-label', `Remove ${entry.name || 'collaborator'}`);
-      kickBtn.textContent = 'x';
+      kickBtn.innerHTML = '&times;';
       kickBtn.addEventListener('click', async (event) => {
         event.stopPropagation();
         try {
@@ -6201,17 +6215,6 @@ function renderCollabPresence() {
       item.appendChild(kickBtn);
     }
 
-    const dot = document.createElement('span');
-    dot.className = 'collab-presence-dot';
-    dot.style.background = getCollabColorById(entry.clientId);
-
-    const label = document.createElement('span');
-    label.className = 'collab-presence-name';
-    const suffix = entry.currentFile ? ` - ${entry.currentFile}` : '';
-    label.textContent = `${entry.name}${entry.clientId === collabClientId ? ' (you)' : ''}${suffix}`;
-
-    item.appendChild(dot);
-    item.appendChild(label);
     collabPresenceList.appendChild(item);
   }
 }
