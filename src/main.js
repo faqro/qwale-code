@@ -7,6 +7,8 @@ const pty = require('node-pty');
 const ignore = require('ignore');
 const { spawnSync } = require('child_process');
 const { execFile } = require('child_process');
+const { networkInterfaces } = require('os');
+const { CollaborationHostServer } = require('./collab/server');
 
 if (require('electron-squirrel-startup')) { //prevent duplicate startups from electron squirrel setup
   app.quit();
@@ -18,6 +20,23 @@ let recentProjects = [];
 const windowProjectState = new Map();
 const projectWatchers = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
+let collaborationHostServer = null;
+
+function getServerHostCandidates() {
+  const hosts = new Set(['127.0.0.1', 'localhost']);
+  const nets = networkInterfaces();
+
+  for (const entries of Object.values(nets || {})) {
+    for (const entry of entries || []) {
+      if (!entry || entry.internal || entry.family !== 'IPv4') {
+        continue;
+      }
+      hosts.add(entry.address);
+    }
+  }
+
+  return [...hosts];
+}
 
 function killTerminalSession(termId) {
   const session = terminals.get(termId);
@@ -71,6 +90,17 @@ function stopAllProjectWatchers() {
   for (const webContentsId of projectWatchers.keys()) {
     stopProjectWatcherForWebContents(webContentsId);
   }
+}
+
+function sendCollabEventToRenderer(webContentsId, payload) {
+  const targetWindow = BrowserWindow
+    .getAllWindows()
+    .find((win) => !win.isDestroyed() && win.webContents.id === webContentsId);
+  if (!targetWindow || targetWindow.isDestroyed()) {
+    return;
+  }
+
+  targetWindow.webContents.send('collab:event', payload);
 }
 
 function notifyProjectChanged(webContentsId, expectedProjectPath) {
@@ -601,6 +631,106 @@ async function buildSearchableFiles(dirPath, projectPath, matcher) {
   files.sort((a, b) => a.localeCompare(b));
   return files;
 }
+
+async function buildProjectSnapshot(projectPath) {
+  const matcher = await createGitignoreMatcher(projectPath);
+  const [tree, searchableFiles] = await Promise.all([
+    buildTree(projectPath, projectPath, matcher, false),
+    buildSearchableFiles(projectPath, projectPath, matcher)
+  ]);
+  return {
+    tree,
+    searchableFiles
+  };
+}
+
+function ensureCollaborationServer() {
+  if (collaborationHostServer) {
+    return collaborationHostServer;
+  }
+
+  collaborationHostServer = new CollaborationHostServer({
+    getProjectPath: (senderId) => windowProjectState.get(senderId) || null,
+    buildTreeSnapshot: buildProjectSnapshot,
+    emitToHostRenderer: (senderId, payload) => {
+      sendCollabEventToRenderer(senderId, payload);
+    },
+    onServerStopped: () => {
+      collaborationHostServer = null;
+    }
+  });
+
+  return collaborationHostServer;
+}
+
+ipcMain.handle('collab:startServer', async (event, payload = {}) => {
+  const server = ensureCollaborationServer();
+  const port = Number(payload.port) || 0;
+  const info = await server.start(event.sender.id, port);
+  const hosts = getServerHostCandidates();
+
+  return {
+    ...info,
+    hosts,
+    urls: hosts.map((host) => `ws://${host}:${info.port}`)
+  };
+});
+
+ipcMain.handle('collab:stopServer', async () => {
+  if (collaborationHostServer) {
+    collaborationHostServer.stop();
+    collaborationHostServer = null;
+  }
+
+  return { ok: true };
+});
+
+ipcMain.handle('collab:getServerInfo', async () => {
+  if (!collaborationHostServer) {
+    return {
+      running: false,
+      clients: [],
+      hosts: getServerHostCandidates(),
+      urls: []
+    };
+  }
+
+  const info = collaborationHostServer.getInfo();
+  const hosts = getServerHostCandidates();
+  return {
+    ...info,
+    hosts,
+    urls: info.running && info.port ? hosts.map((host) => `ws://${host}:${info.port}`) : []
+  };
+});
+
+ipcMain.handle('collab:openJoinWindow', async (_event, payload = {}) => {
+  const serverUrl = String(payload.serverUrl || '').trim();
+  const code = String(payload.code || '').trim().toUpperCase();
+  const name = String(payload.name || '').trim();
+
+  if (!serverUrl || !code) {
+    throw new Error('Enter both server URL and session code.');
+  }
+
+  const joinWindow = createWindow();
+  joinWindow.webContents.once('did-finish-load', () => {
+    if (joinWindow.isDestroyed()) {
+      return;
+    }
+
+    joinWindow.webContents.send('menu:action', {
+      action: 'collab:autoJoin',
+      payload: {
+        serverUrl,
+        code,
+        name
+      }
+    });
+  });
+
+  return { ok: true };
+});
 
 ipcMain.handle('project:open', async (event) => {
   const senderWindow = BrowserWindow.fromWebContents(event.sender);
@@ -1501,11 +1631,19 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', () => {
+  if (collaborationHostServer) {
+    collaborationHostServer.stop();
+    collaborationHostServer = null;
+  }
   stopAllProjectWatchers();
   killAllTerminals();
 });
 
 app.on('window-all-closed', () => {
+  if (collaborationHostServer) {
+    collaborationHostServer.stop();
+    collaborationHostServer = null;
+  }
   stopAllProjectWatchers();
   killAllTerminals();
   if (process.platform !== 'darwin') {

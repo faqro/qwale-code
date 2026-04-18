@@ -25,6 +25,9 @@
             <span class="explorer-side-icon explorer-side-icon-branch" aria-hidden="true"></span>
             <span id="scmTabBadge" class="scm-tab-badge hidden" aria-hidden="true"></span>
           </button>
+          <button id="sidebarTabCollaborate" class="explorer-side-tab" type="button" title="Collaborate" aria-label="Collaborate">
+            <span class="explorer-side-icon explorer-side-icon-collaborate" aria-hidden="true"></span>
+          </button>
           <button id="sidebarTabHttp" class="explorer-side-tab" type="button" title="HTTP" aria-label="HTTP">
             <span class="explorer-side-icon explorer-side-icon-http" aria-hidden="true"></span>
           </button>
@@ -160,6 +163,33 @@
           </div>
         </div>
 
+        <div id="collaboratePanelView" class="explorer-panel-view">
+          <div class="panel-title">Collaborate</div>
+          <div id="collabPanel" class="collab-panel">
+            <div class="collab-row">
+              <button id="collabStartBtn" class="collab-btn" type="button">Start Sharing</button>
+              <button id="collabStopBtn" class="collab-btn hidden" type="button">Stop Sharing</button>
+              <button id="collabJoinBtn" class="collab-btn" type="button">Join Session</button>
+            </div>
+            <div class="collab-row">
+              <input id="collabServerUrlInput" class="collab-input" type="text" placeholder="ws://host:port" />
+              <input id="collabCodeInput" class="collab-input" type="text" placeholder="Code" maxlength="6" />
+            </div>
+            <div class="collab-row collab-row-single">
+              <input id="collabNameInput" class="collab-input" type="text" placeholder="Username (optional)" maxlength="40" />
+            </div>
+            <div id="collabInfo" class="collab-info">Collaboration offline</div>
+            <div class="collab-presence-wrap">
+              <div class="collab-subtitle">Collaborators</div>
+              <div id="collabPresenceList" class="collab-presence-list"></div>
+            </div>
+            <div class="collab-activity-wrap">
+              <div class="collab-subtitle">Activity</div>
+              <div id="collabActivityList" class="collab-activity-list"></div>
+            </div>
+          </div>
+        </div>
+
         <div id="httpPanelView" class="explorer-panel-view">
           <div class="panel-title">HTTP</div>
           <div class="http-panel-body">
@@ -198,6 +228,10 @@
       <div id="aiResizeHandle" class="ai-resize-handle"></div>
       <div class="editor-tabs-bar">
         <div id="editorTabs" class="editor-tabs"></div>
+        <div id="collabQuickWrap" class="collab-quick-wrap hidden">
+          <button id="collabQuickBtn" class="collab-quick-btn" type="button" title="Collaborators" aria-label="Collaborators"></button>
+          <div id="collabQuickMenu" class="collab-quick-menu hidden"></div>
+        </div>
         <div class="editor-play-wrap">
           <button id="editorPlayBtn" class="editor-play-btn" type="button" title="Run default launch option">
             <span id="editorPlayBtnIcon" class="editor-play-btn-icon editor-play-btn-icon-run" aria-hidden="true"></span>

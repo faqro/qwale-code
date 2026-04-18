@@ -1,10 +1,11 @@
 {
   "name": "qwalecode",
   "productName": "QwaleCode",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "description": "Lightweight Electron IDE and Code Platform",
   "main": "src/main.js",
   "scripts": {
+    "dev": "electron .",
     "start": "electron-forge start",
     "package": "electron-forge package",
     "make": "electron-forge make"
@@ -23,7 +24,8 @@
     "ignore": "^7.0.5",
     "monaco-editor": "^0.52.2",
     "node-pty": "^1.0.0",
-    "sharp": "^0.34.5"
+    "sharp": "^0.34.5",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@electron-forge/cli": "^7.11.1",
