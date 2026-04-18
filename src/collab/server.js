@@ -787,84 +787,75 @@ class CollaborationHostServer {
 
     const type = operation.type;
     let hostIgnoredOperation = false;
-    if (!client.isHostClient) {
-      if (type === 'create-file') {
-        const parent = this.resolveRelativePath(String(operation.parentPath || ''));
-        const name = String(operation.name || '').trim();
-        if (!name) {
-          throw new Error('File name is required.');
-        }
-        const relativeTarget = path.join(parent.relativePath, name).split(path.sep).join('/');
-        if (!this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, false)) {
-          throw new Error('Cannot create files in ignored paths.');
-        }
-        await fs.writeFile(path.join(parent.absolutePath, name), '', { flag: 'wx' });
-      } else if (type === 'create-folder') {
-        const parent = this.resolveRelativePath(String(operation.parentPath || ''));
-        const name = String(operation.name || '').trim();
-        if (!name) {
-          throw new Error('Folder name is required.');
-        }
-        const relativeTarget = path.join(parent.relativePath, name).split(path.sep).join('/');
-        if (!this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, true)) {
-          throw new Error('Cannot create folders in ignored paths.');
-        }
-        await fs.mkdir(path.join(parent.absolutePath, name));
-      } else if (type === 'delete') {
-        const target = this.resolveRelativePath(String(operation.targetPath || ''));
-        const stat = await fs.stat(target.absolutePath);
-        if (!this.isSharedPath(target.relativePath, stat.isDirectory())) {
-          throw new Error('Cannot modify ignored paths.');
-        }
-        if (stat.isDirectory()) {
-          await fs.rm(target.absolutePath, { recursive: true, force: false });
-        } else {
-          await fs.unlink(target.absolutePath);
-        }
-      } else if (type === 'rename') {
-        const target = this.resolveRelativePath(String(operation.targetPath || ''));
-        const newName = String(operation.newName || '').trim();
-        if (!newName) {
-          throw new Error('New name is required.');
-        }
-        const stat = await fs.stat(target.absolutePath);
-        const destinationRelativePath = path.join(path.dirname(target.relativePath), newName).split(path.sep).join('/');
-        if (!this.isSharedPath(target.relativePath, stat.isDirectory()) || !this.isSharedPath(destinationRelativePath, stat.isDirectory())) {
-          throw new Error('Cannot rename ignored paths.');
-        }
-        const destination = path.join(path.dirname(target.absolutePath), newName);
-        await fs.rename(target.absolutePath, destination);
-      } else {
-        return;
-      }
-    } else if (type === 'create-file') {
+    let broadcastOperation = null;
+
+    const createFile = async (isHost) => {
       const parent = this.resolveRelativePath(String(operation.parentPath || ''));
       const name = String(operation.name || '').trim();
       if (!name) {
         throw new Error('File name is required.');
       }
       const relativeTarget = path.join(parent.relativePath, name).split(path.sep).join('/');
-      hostIgnoredOperation = !this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, false);
+      if (!isHost) {
+        if (!this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, false)) {
+          throw new Error('Cannot create files in ignored paths.');
+        }
+      } else {
+        hostIgnoredOperation = !this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, false);
+      }
       await fs.writeFile(path.join(parent.absolutePath, name), '', { flag: 'wx' });
-    } else if (type === 'create-folder') {
+      broadcastOperation = {
+        type,
+        targetPath: relativeTarget,
+        isDirectory: false
+      };
+    };
+
+    const createFolder = async (isHost) => {
       const parent = this.resolveRelativePath(String(operation.parentPath || ''));
       const name = String(operation.name || '').trim();
       if (!name) {
         throw new Error('Folder name is required.');
       }
       const relativeTarget = path.join(parent.relativePath, name).split(path.sep).join('/');
-      hostIgnoredOperation = !this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, true);
+      if (!isHost) {
+        if (!this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, true)) {
+          throw new Error('Cannot create folders in ignored paths.');
+        }
+      } else {
+        hostIgnoredOperation = !this.isSharedPath(parent.relativePath, true) || !this.isSharedPath(relativeTarget, true);
+      }
       await fs.mkdir(path.join(parent.absolutePath, name));
-    } else if (type === 'delete') {
+      broadcastOperation = {
+        type,
+        targetPath: relativeTarget,
+        isDirectory: true
+      };
+    };
+
+    const deleteEntry = async (isHost) => {
       const target = this.resolveRelativePath(String(operation.targetPath || ''));
       const stat = await fs.stat(target.absolutePath);
-      hostIgnoredOperation = !this.isSharedPath(target.relativePath, stat.isDirectory());
+      if (!isHost) {
+        if (!this.isSharedPath(target.relativePath, stat.isDirectory())) {
+          throw new Error('Cannot modify ignored paths.');
+        }
+      } else {
+        hostIgnoredOperation = !this.isSharedPath(target.relativePath, stat.isDirectory());
+      }
       if (stat.isDirectory()) {
         await fs.rm(target.absolutePath, { recursive: true, force: false });
       } else {
         await fs.unlink(target.absolutePath);
       }
-    } else if (type === 'rename') {
+      broadcastOperation = {
+        type,
+        targetPath: target.relativePath,
+        isDirectory: stat.isDirectory()
+      };
+    };
+
+    const renameEntry = async (isHost) => {
       const target = this.resolveRelativePath(String(operation.targetPath || ''));
       const newName = String(operation.newName || '').trim();
       if (!newName) {
@@ -872,19 +863,90 @@ class CollaborationHostServer {
       }
       const stat = await fs.stat(target.absolutePath);
       const destinationRelativePath = path.join(path.dirname(target.relativePath), newName).split(path.sep).join('/');
-      hostIgnoredOperation = !this.isSharedPath(target.relativePath, stat.isDirectory()) || !this.isSharedPath(destinationRelativePath, stat.isDirectory());
+      if (!isHost) {
+        if (!this.isSharedPath(target.relativePath, stat.isDirectory()) || !this.isSharedPath(destinationRelativePath, stat.isDirectory())) {
+          throw new Error('Cannot rename ignored paths.');
+        }
+      } else {
+        hostIgnoredOperation = !this.isSharedPath(target.relativePath, stat.isDirectory()) || !this.isSharedPath(destinationRelativePath, stat.isDirectory());
+      }
       const destination = path.join(path.dirname(target.absolutePath), newName);
       await fs.rename(target.absolutePath, destination);
+      broadcastOperation = {
+        type,
+        targetPath: target.relativePath,
+        destinationPath: destinationRelativePath,
+        isDirectory: stat.isDirectory()
+      };
+    };
+
+    const moveEntry = async (isHost) => {
+      const target = this.resolveRelativePath(String(operation.sourcePath || operation.targetPath || ''));
+      const destinationDir = this.resolveRelativePath(String(operation.destinationDir || ''));
+      const stat = await fs.stat(target.absolutePath);
+      const destinationRelativePath = path.join(destinationDir.relativePath, path.basename(target.relativePath)).split(path.sep).join('/');
+      if (!isHost) {
+        if (!this.isSharedPath(target.relativePath, stat.isDirectory()) || !this.isSharedPath(destinationDir.relativePath, true) || !this.isSharedPath(destinationRelativePath, stat.isDirectory())) {
+          throw new Error('Cannot move ignored paths.');
+        }
+      } else {
+        hostIgnoredOperation = !this.isSharedPath(target.relativePath, stat.isDirectory()) || !this.isSharedPath(destinationDir.relativePath, true) || !this.isSharedPath(destinationRelativePath, stat.isDirectory());
+      }
+      const destination = path.join(destinationDir.absolutePath, path.basename(target.absolutePath));
+      await fs.rename(target.absolutePath, destination);
+      broadcastOperation = {
+        type,
+        sourcePath: target.relativePath,
+        destinationPath: destinationRelativePath,
+        isDirectory: stat.isDirectory()
+      };
+    };
+
+    if (!client.isHostClient) {
+      if (type === 'create-file') {
+        await createFile(false);
+      } else if (type === 'create-folder') {
+        await createFolder(false);
+      } else if (type === 'delete') {
+        await deleteEntry(false);
+      } else if (type === 'rename') {
+        await renameEntry(false);
+      } else if (type === 'move') {
+        await moveEntry(false);
+      } else {
+        return;
+      }
+    } else if (type === 'create-file') {
+      await createFile(true);
+    } else if (type === 'create-folder') {
+      await createFolder(true);
+    } else if (type === 'delete') {
+      await deleteEntry(true);
+    } else if (type === 'rename') {
+      await renameEntry(true);
+    } else if (type === 'move') {
+      await moveEntry(true);
     } else {
       return;
     }
 
+    const responsePath = broadcastOperation && (broadcastOperation.destinationPath || broadcastOperation.targetPath || broadcastOperation.sourcePath) || null;
+
     if (hostIgnoredOperation) {
       this.send(socket, 'file:operation:ok', {
         requestId: packet.requestId || null,
-        type
+        type,
+        path: responsePath
       });
       return;
+    }
+
+    if (broadcastOperation) {
+      this.broadcast('file:operation', {
+        actorClientId: client.clientId,
+        actorName: client.name,
+        operation: broadcastOperation
+      }, socket);
     }
 
     const snapshot = await this.buildSnapshotPayload();
@@ -901,7 +963,8 @@ class CollaborationHostServer {
 
     this.send(socket, 'file:operation:ok', {
       requestId: packet.requestId || null,
-      type
+      type,
+      path: responsePath
     });
   }
 }

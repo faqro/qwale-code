@@ -135,6 +135,7 @@ let confirmTitle = null;
 let confirmMessage = null;
 let confirmCancelBtn = null;
 let confirmPrimaryBtn = null;
+let confirmActionsContainer = null;
 let confirmResolver = null;
 let unsavedOverlay = null;
 let unsavedTitle = null;
@@ -1197,6 +1198,123 @@ function isPathWithinFolderPath(filePath, folderPath) {
   return target === folder || target.startsWith(`${folder}/`);
 }
 
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function collectOpenTabsForPathChange(sourcePath, isDirectory) {
+  const sourceNormalized = normalizeExplorerPath(sourcePath);
+  const openTabPaths = [];
+
+  for (const filePath of openFiles.keys()) {
+    const normalizedFilePath = normalizeExplorerPath(filePath);
+    const matches = isDirectory
+      ? isPathWithinFolderPath(normalizedFilePath, sourceNormalized)
+      : normalizedFilePath === sourceNormalized;
+
+    if (matches) {
+      openTabPaths.push(filePath);
+    }
+  }
+
+  return openTabPaths;
+}
+
+function remapOpenFilesForPathChange(sourcePath, destinationPath, isDirectory) {
+  const rawDestinationPath = String(destinationPath || '').replace(/[\\/]+$/, '');
+  const sourceNormalized = normalizeExplorerPath(sourcePath).replace(/\/+$/, '');
+  const destinationNormalized = normalizeExplorerPath(rawDestinationPath);
+  if (!sourceNormalized || !destinationNormalized) {
+    return;
+  }
+
+  const useForwardSlashes = rawDestinationPath.includes('/') && !rawDestinationPath.includes('\\');
+  const separator = useForwardSlashes ? '/' : '\\';
+
+  const nextEntries = [];
+  let currentPathChanged = null;
+  let previewPathChanged = null;
+
+  for (const [filePath, fileState] of openFiles.entries()) {
+    const normalizedFilePath = normalizeExplorerPath(filePath);
+    let nextPath = filePath;
+
+    if (isDirectory) {
+      if (isPathWithinFolderPath(normalizedFilePath, sourceNormalized)) {
+        const suffix = normalizedFilePath.slice(sourceNormalized.length).replace(/^\//, '');
+        const normalizedSuffix = suffix.replace(/[\\/]+/g, separator);
+        nextPath = normalizedSuffix ? `${rawDestinationPath}${separator}${normalizedSuffix}` : rawDestinationPath;
+      }
+    } else if (normalizedFilePath === sourceNormalized) {
+      nextPath = rawDestinationPath;
+    }
+
+    nextEntries.push([nextPath, fileState]);
+
+    if (filePath === currentFilePath) {
+      currentPathChanged = nextPath;
+    }
+    if (filePath === previewFilePath) {
+      previewPathChanged = nextPath;
+    }
+  }
+
+  openFiles.clear();
+  for (const [filePath, fileState] of nextEntries) {
+    openFiles.set(filePath, fileState);
+  }
+
+  if (currentPathChanged) {
+    currentFilePath = currentPathChanged;
+  }
+  if (previewPathChanged) {
+    previewFilePath = previewPathChanged;
+  }
+
+  updateEditorStatusBar();
+  updateEditorTitle();
+  renderTabs();
+}
+
+function showCollaborativeFileChangeDialog(changeType, actorName, sourcePath, destinationPath, affectedCount, isDirectory) {
+  const actorLabel = escapeHtml(actorName || 'A collaborator');
+  const subjectLabel = isDirectory ? 'folder' : 'file';
+  const sourceLabel = escapeHtml(getFileName(sourcePath) || sourcePath);
+  const destinationLabel = destinationPath ? escapeHtml(getFileName(destinationPath) || destinationPath) : '';
+  const itemCountLabel = affectedCount === 1 ? '1 open tab was closed.' : `${affectedCount} open tabs were closed.`;
+  let description = '';
+
+  if (changeType === 'delete') {
+    description = `${actorLabel} deleted the ${subjectLabel} ${sourceLabel}. ${itemCountLabel}`;
+  } else if (changeType === 'move') {
+    description = `${actorLabel} moved the ${subjectLabel} ${sourceLabel}${destinationLabel ? ` to ${destinationLabel}` : ''}. ${itemCountLabel}`;
+  } else {
+    description = `${actorLabel} renamed the ${subjectLabel} ${sourceLabel}${destinationLabel ? ` to ${destinationLabel}` : ''}. ${itemCountLabel}`;
+  }
+
+  openHelpDialog('Collaborative file change', `<p>${description}</p>`);
+}
+
+async function closeOpenTabsForCollaborativeChange(changeType, actorName, sourcePath, destinationPath, isDirectory) {
+  const affectedPaths = collectOpenTabsForPathChange(sourcePath, isDirectory);
+  if (!affectedPaths.length) {
+    return;
+  }
+
+  for (const filePath of affectedPaths) {
+    if (openFiles.has(filePath)) {
+      await closeTab(filePath);
+    }
+  }
+
+  showCollaborativeFileChangeDialog(changeType, actorName, sourcePath, destinationPath, affectedPaths.length, isDirectory);
+}
+
 function getExplorerVisiblePaths() {
   if (!treeRoot) {
     return [];
@@ -1607,8 +1725,17 @@ function getDragEntriesForNode(node) {
   return compactExplorerEntries(entries);
 }
 
+function normalizeMoveFolderPath(targetPath) {
+  return normalizeExplorerPath(targetPath).replace(/^\/+|\/+$/g, '');
+}
+
 function getParentFolderPath(targetPath) {
-  return String(targetPath || '').replace(/[\\/][^\\/]+$/, '');
+  const normalized = normalizeMoveFolderPath(targetPath);
+  const separatorIndex = normalized.lastIndexOf('/');
+  if (separatorIndex < 0) {
+    return '';
+  }
+  return normalized.slice(0, separatorIndex);
 }
 
 function canMoveEntriesToDestination(entries, destinationPath) {
@@ -1616,18 +1743,18 @@ function canMoveEntriesToDestination(entries, destinationPath) {
     return false;
   }
 
-  const destinationNormalized = normalizeExplorerPath(destinationPath);
+  const destinationNormalized = normalizeMoveFolderPath(destinationPath);
   for (const entry of entries) {
-    const sourceNormalized = normalizeExplorerPath(entry.path);
+    const sourceNormalized = normalizeMoveFolderPath(entry.path);
     if (!sourceNormalized || sourceNormalized === destinationNormalized) {
       return false;
     }
 
-    if (entry.type === 'folder' && isPathWithinFolderPath(destinationPath, entry.path)) {
+    if (entry.type === 'folder' && isPathWithinFolderPath(destinationNormalized, sourceNormalized)) {
       return false;
     }
 
-    if (normalizeExplorerPath(getParentFolderPath(entry.path)) === destinationNormalized) {
+    if (getParentFolderPath(entry.path) === destinationNormalized) {
       return false;
     }
   }
@@ -1641,13 +1768,34 @@ async function moveExplorerEntries(entries, destinationPath) {
     return;
   }
 
-  if (collabConnected && collabMode === 'remote') {
-    alert('Move is not available yet in remote collaboration mode.');
-    return;
-  }
+  const movedEntries = [];
 
   for (const entry of compacted) {
-    await api.movePath({ sourcePath: entry.path, destinationDir: destinationPath });
+    const operation = {
+      type: 'move',
+      sourcePath: projectPathToCollabPath(entry.path),
+      destinationDir: projectPathToCollabPath(destinationPath)
+    };
+
+    let movedPath = null;
+    if (collabConnected && collabMode === 'remote') {
+      const response = await sendCollabRequest('file:operation', { operation });
+      movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
+    } else if (collabConnected) {
+      const response = await sendCollabRequest('file:operation', { operation });
+      movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
+    } else {
+      const result = await api.movePath({ sourcePath: entry.path, destinationDir: destinationPath });
+      movedPath = result && result.path ? result.path : null;
+    }
+
+    if (movedPath) {
+      movedEntries.push({ sourcePath: entry.path, destinationPath: movedPath, isDirectory: entry.type === 'folder' });
+    }
+  }
+
+  for (const entry of movedEntries) {
+    remapOpenFilesForPathChange(entry.sourcePath, entry.destinationPath, entry.isDirectory);
   }
 
   setExplorerSingleSelection(destinationPath);
@@ -1689,16 +1837,15 @@ async function deleteExplorerEntries(entries) {
           targetPath: projectPathToCollabPath(entry.path)
         }
       });
+    } else if (collabConnected) {
+      await sendCollabRequest('file:operation', {
+        operation: {
+          type: 'delete',
+          targetPath: projectPathToCollabPath(entry.path)
+        }
+      });
     } else {
       await api.deletePath({ targetPath: entry.path });
-      if (collabConnected) {
-        sendCollabPacket('file:operation', {
-          operation: {
-            type: 'delete',
-            targetPath: projectPathToCollabPath(entry.path)
-          }
-        });
-      }
     }
   }
 
@@ -4474,10 +4621,15 @@ async function commitInlineEdit(name) {
     return;
   }
 
+  if (state.mode === 'rename' && trimmed === getFileName(state.targetPath)) {
+    renderTree();
+    return;
+  }
+
   if (state.mode === 'rename') {
     let renamedPath = null;
     if (collabConnected && collabMode === 'remote') {
-      await sendCollabRequest('file:operation', {
+      const response = await sendCollabRequest('file:operation', {
         operation: {
           type: 'rename',
           targetPath: projectPathToCollabPath(state.targetPath),
@@ -4485,35 +4637,33 @@ async function commitInlineEdit(name) {
         }
       });
 
-      const parent = state.targetPath.replace(/[\\/][^\\/]+$/, '');
-      renamedPath = `${parent}/${trimmed}`.replace(/\\/g, '/');
+      renamedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
+      if (!renamedPath) {
+        const parent = state.targetPath.replace(/[\\/][^\\/]+$/, '');
+        renamedPath = `${parent}/${trimmed}`.replace(/\\/g, '/');
+      }
+    } else if (collabConnected) {
+      const response = await sendCollabRequest('file:operation', {
+        operation: {
+          type: 'rename',
+          targetPath: projectPathToCollabPath(state.targetPath),
+          newName: trimmed
+        }
+      });
+
+      renamedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
+      if (!renamedPath) {
+        const parent = state.targetPath.replace(/[\\/][^\\/]+$/, '');
+        const separator = state.targetPath.includes('\\') ? '\\' : '/';
+        renamedPath = `${parent}${separator}${trimmed}`;
+      }
     } else {
       const result = await api.renamePath({ targetPath: state.targetPath, newName: trimmed });
       renamedPath = result && result.path ? result.path : null;
-      if (collabConnected) {
-        sendCollabPacket('file:operation', {
-          operation: {
-            type: 'rename',
-            targetPath: projectPathToCollabPath(state.targetPath),
-            newName: trimmed
-          }
-        });
-      }
     }
 
-    if (renamedPath && openFiles.has(state.targetPath)) {
-      const fileState = openFiles.get(state.targetPath);
-      openFiles.delete(state.targetPath);
-      openFiles.set(renamedPath, fileState);
-      if (currentFilePath === state.targetPath) {
-        currentFilePath = renamedPath;
-      }
-      if (previewFilePath === state.targetPath) {
-        previewFilePath = renamedPath;
-      }
-      updateEditorStatusBar();
-      updateEditorTitle();
-      renderTabs();
+    if (renamedPath) {
+      remapOpenFilesForPathChange(state.targetPath, renamedPath, state.targetType === 'folder');
     }
   } else if (state.mode === 'create') {
     if (state.targetType === 'folder') {
@@ -4525,17 +4675,16 @@ async function commitInlineEdit(name) {
             name: trimmed
           }
         });
+      } else if (collabConnected) {
+        await sendCollabRequest('file:operation', {
+          operation: {
+            type: 'create-folder',
+            parentPath: projectPathToCollabPath(state.parentPath),
+            name: trimmed
+          }
+        });
       } else {
         await api.createFolder({ parentPath: state.parentPath, name: trimmed });
-        if (collabConnected) {
-          sendCollabPacket('file:operation', {
-            operation: {
-              type: 'create-folder',
-              parentPath: projectPathToCollabPath(state.parentPath),
-              name: trimmed
-            }
-          });
-        }
       }
     } else {
       if (collabConnected && collabMode === 'remote') {
@@ -4546,17 +4695,16 @@ async function commitInlineEdit(name) {
             name: trimmed
           }
         });
+      } else if (collabConnected) {
+        await sendCollabRequest('file:operation', {
+          operation: {
+            type: 'create-file',
+            parentPath: projectPathToCollabPath(state.parentPath),
+            name: trimmed
+          }
+        });
       } else {
         await api.createFile({ parentPath: state.parentPath, name: trimmed });
-        if (collabConnected) {
-          sendCollabPacket('file:operation', {
-            operation: {
-              type: 'create-file',
-              parentPath: projectPathToCollabPath(state.parentPath),
-              name: trimmed
-            }
-          });
-        }
       }
     }
   }
@@ -4574,6 +4722,8 @@ async function pasteIntoPath(destinationPath) {
     ? explorerClipboard.items
     : [{ sourcePath: explorerClipboard.sourcePath, type: explorerClipboard.type }];
 
+  const movedEntries = [];
+  let didMutate = false;
   for (const item of items) {
     if (!item || !item.sourcePath) {
       continue;
@@ -4581,21 +4731,58 @@ async function pasteIntoPath(destinationPath) {
 
     if (mode === 'copy') {
       await api.copyPath({ sourcePath: item.sourcePath, destinationDir: destinationPath });
+      didMutate = true;
     } else {
-      await api.movePath({ sourcePath: item.sourcePath, destinationDir: destinationPath });
+      const sourceParent = getParentFolderPath(item.sourcePath);
+      const destinationNormalized = normalizeMoveFolderPath(destinationPath);
+      if (sourceParent === destinationNormalized) {
+        continue;
+      }
+
+      const operation = {
+        type: 'move',
+        sourcePath: projectPathToCollabPath(item.sourcePath),
+        destinationDir: projectPathToCollabPath(destinationPath)
+      };
+
+      let movedPath = null;
+      if (collabConnected && collabMode === 'remote') {
+        const response = await sendCollabRequest('file:operation', { operation });
+        movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
+      } else if (collabConnected) {
+        const response = await sendCollabRequest('file:operation', { operation });
+        movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
+      } else {
+        const result = await api.movePath({ sourcePath: item.sourcePath, destinationDir: destinationPath });
+        movedPath = result && result.path ? result.path : null;
+      }
+
+      if (movedPath) {
+        movedEntries.push({ sourcePath: item.sourcePath, destinationPath: movedPath, isDirectory: item.type === 'folder' });
+        didMutate = true;
+      }
     }
   }
 
-  if (mode === 'cut') {
+  if (mode === 'cut' && didMutate) {
     explorerClipboard = null;
   }
 
-  await refreshProjectTree();
+  for (const entry of movedEntries) {
+    remapOpenFilesForPathChange(entry.sourcePath, entry.destinationPath, entry.isDirectory);
+  }
+
+  if (didMutate) {
+    await refreshProjectTree();
+  }
 }
 
 function getFileTypeIconClass(filePath) {
   const ext = (filePath.match(/\.([^.\\/]+)$/) || [])[1]?.toLowerCase() || '';
 
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'tiff', 'tif'].includes(ext)) {
+    return 'ft-image';
+  }
   if (['js', 'mjs', 'cjs', 'jsx'].includes(ext)) {
     return 'ft-js';
   }
@@ -5046,7 +5233,7 @@ function ensureConfirmDialog() {
   closeBtn.type = 'button';
   closeBtn.className = 'help-close';
   closeBtn.setAttribute('aria-label', 'Close confirmation dialog');
-  closeBtn.addEventListener('click', () => resolveConfirm(false));
+  closeBtn.addEventListener('click', () => resolveConfirm(null));
 
   header.appendChild(confirmTitle);
   header.appendChild(closeBtn);
@@ -5057,32 +5244,17 @@ function ensureConfirmDialog() {
   confirmMessage.className = 'confirm-message';
   body.appendChild(confirmMessage);
 
-  const actions = document.createElement('div');
-  actions.className = 'confirm-actions';
-
-  confirmCancelBtn = document.createElement('button');
-  confirmCancelBtn.type = 'button';
-  confirmCancelBtn.className = 'confirm-btn secondary';
-  confirmCancelBtn.textContent = 'Cancel';
-  confirmCancelBtn.addEventListener('click', () => resolveConfirm(false));
-
-  confirmPrimaryBtn = document.createElement('button');
-  confirmPrimaryBtn.type = 'button';
-  confirmPrimaryBtn.className = 'confirm-btn danger';
-  confirmPrimaryBtn.textContent = 'Close';
-  confirmPrimaryBtn.addEventListener('click', () => resolveConfirm(true));
-
-  actions.appendChild(confirmCancelBtn);
-  actions.appendChild(confirmPrimaryBtn);
+  confirmActionsContainer = document.createElement('div');
+  confirmActionsContainer.className = 'confirm-actions';
 
   dialog.appendChild(header);
   dialog.appendChild(body);
-  dialog.appendChild(actions);
+  dialog.appendChild(confirmActionsContainer);
   confirmOverlay.appendChild(dialog);
 
   confirmOverlay.addEventListener('click', (event) => {
     if (event.target === confirmOverlay) {
-      resolveConfirm(false);
+      resolveConfirm(null);
     }
   });
 
@@ -5090,7 +5262,7 @@ function ensureConfirmDialog() {
 
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && confirmOverlay && !confirmOverlay.classList.contains('hidden')) {
-      resolveConfirm(false);
+      resolveConfirm(null);
     }
   });
 }
@@ -5107,19 +5279,49 @@ function resolveConfirm(result) {
   }
 }
 
-function showConfirmDialog({ title, message, confirmLabel = 'Close', confirmStyle = 'danger' }) {
+function showConfirmDialog({ title, message, confirmLabel = 'Close', confirmStyle = 'danger', buttons = null, cancelLabel = 'Cancel' }) {
   ensureConfirmDialog();
 
   confirmTitle.textContent = title;
   confirmMessage.textContent = message;
-  confirmPrimaryBtn.textContent = confirmLabel;
-  confirmPrimaryBtn.classList.remove('danger', 'primary');
-  confirmPrimaryBtn.classList.add(confirmStyle === 'primary' ? 'primary' : 'danger');
+  confirmActionsContainer.innerHTML = '';
+
+  if (buttons && Array.isArray(buttons)) {
+    // Use custom buttons
+    for (const btn of buttons) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `confirm-btn ${btn.style || 'primary'}`;
+      button.textContent = btn.label;
+      button.addEventListener('click', () => resolveConfirm(btn.value));
+      confirmActionsContainer.appendChild(button);
+    }
+  } else {
+    // Default two-button layout
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'confirm-btn secondary';
+    cancelBtn.textContent = cancelLabel;
+    cancelBtn.addEventListener('click', () => resolveConfirm(null));
+
+    const primaryBtn = document.createElement('button');
+    primaryBtn.type = 'button';
+    primaryBtn.className = `confirm-btn ${confirmStyle === 'primary' ? 'primary' : confirmStyle === 'danger' ? 'danger' : 'primary'}`;
+    primaryBtn.textContent = confirmLabel;
+    primaryBtn.addEventListener('click', () => resolveConfirm(true));
+
+    confirmActionsContainer.appendChild(cancelBtn);
+    confirmActionsContainer.appendChild(primaryBtn);
+  }
+
   confirmOverlay.classList.remove('hidden');
 
   return new Promise((resolve) => {
     confirmResolver = resolve;
-    requestAnimationFrame(() => confirmPrimaryBtn.focus());
+    requestAnimationFrame(() => {
+      const firstBtn = confirmActionsContainer.querySelector('button');
+      if (firstBtn) firstBtn.focus();
+    });
   });
 }
 
@@ -5567,7 +5769,13 @@ function initMonacoEditor() {
         minimap: { enabled: false },
         fontSize: 14,
         fontFamily: 'Consolas, monospace',
-        wordWrap: 'off'
+        wordWrap: 'off',
+        scrollbar: {
+          vertical: 'visible',
+          horizontal: 'auto',
+          verticalScrollbarSize: 12,
+          horizontalScrollbarSize: 12
+        }
       });
 
       monacoEditor.onDidChangeModelContent((event) => {
@@ -6734,15 +6942,22 @@ function updateRemoteCursorDecoration(clientId, name, filePath, position, select
     const column = Math.max(1, Number(position.column) || 1);
     const safeLine = Math.min(line, model.getLineCount());
     const safeColumn = Math.min(column, model.getLineMaxColumn(safeLine));
+    const visiblePosition = monacoEditor.getScrolledVisiblePosition(
+      new window.monaco.Position(safeLine, safeColumn)
+    );
+    const placeLabelBelow = Boolean(visiblePosition && Number(visiblePosition.top) <= 22);
     const cursorClassName = selectionRange
       ? `${classSuffix} remote-cursor-mark`
       : `${classSuffix} remote-cursor-mark remote-cursor-blink`;
+    const labelClassName = placeLabelBelow
+      ? `${classSuffix}-label remote-cursor-label remote-cursor-label-below`
+      : `${classSuffix}-label remote-cursor-label`;
 
     nextDecorations.push({
-      range: new window.monaco.Range(safeLine, safeColumn, safeLine, safeColumn + 1),
+      range: new window.monaco.Range(safeLine, safeColumn, safeLine, safeColumn),
       options: {
-        className: cursorClassName,
-        afterContentClassName: `${classSuffix}-label remote-cursor-label`
+        beforeContentClassName: cursorClassName,
+        afterContentClassName: labelClassName
       }
     });
   }
@@ -6778,7 +6993,7 @@ async function writeFileWithCollabSupport(filePath, content) {
   await sendCollabRequest('file:get', { filePath: collabPath });
 }
 
-function handleCollabPacket(packet) {
+async function handleCollabPacket(packet) {
   if (!packet || typeof packet.type !== 'string') {
     return;
   }
@@ -6894,6 +7109,33 @@ function handleCollabPacket(packet) {
     return;
   }
 
+  if (packet.type === 'file:operation') {
+    if (packet.actorClientId && packet.actorClientId === collabClientId) {
+      return;
+    }
+
+    const operation = packet.operation && typeof packet.operation === 'object' ? packet.operation : null;
+    const changeType = String(operation && operation.type ? operation.type : '').toLowerCase();
+    if (changeType !== 'delete' && changeType !== 'rename' && changeType !== 'move') {
+      return;
+    }
+
+    const sourcePath = collabFilePathToProjectPath(operation.sourcePath || operation.targetPath || '');
+    const destinationPath = collabFilePathToProjectPath(operation.destinationPath || '');
+    if (!sourcePath) {
+      return;
+    }
+
+    await closeOpenTabsForCollaborativeChange(
+      changeType,
+      packet.actorName || 'A collaborator',
+      sourcePath,
+      destinationPath,
+      Boolean(operation.isDirectory)
+    );
+    return;
+  }
+
   if (packet.type === 'file:ops') {
     const projectPath = collabFilePathToProjectPath(packet.filePath || '');
     applyRemoteOperationBatchToModel(projectPath, packet.ops || [], packet.toVersion);
@@ -6918,13 +7160,16 @@ function handleCollabPacket(packet) {
   }
 
   if (packet.type === 'tree:update') {
-    if (!(collabConnected && collabMode === 'remote')) {
-      refreshProjectTree().catch(() => {});
+    if (collabMode !== 'remote') {
+      refreshProjectTree().catch((error) => console.warn('Tree refresh failed:', error));
       return;
     }
 
     project.tree = Array.isArray(packet.tree) ? packet.tree : [];
     project.rootName = packet.rootName || project.rootName;
+    projectInfo.textContent = `${project.rootName}  |  shared`;
+    refreshFileSearchIndex();
+    syncAiChatControls();
     renderTree();
     return;
   }
@@ -6998,7 +7243,7 @@ function connectCollabSocket(serverUrl, code, name, mode) {
         }
       })();
 
-      handleCollabPacket(packet);
+      void handleCollabPacket(packet).catch(() => {});
     });
 
     socket.addEventListener('close', () => {
@@ -7135,6 +7380,32 @@ function scheduleCursorBroadcast() {
 async function openFile(filePath, options = {}) {
   const mode = options.mode || 'permanent';
   const openAsPreview = mode === 'preview';
+
+  // Check if we need to prompt for unsaved changes in non-collaborative mode
+  const isInCollabMode = collabConnected && (collabMode === 'remote' || collabMode === 'host');
+  if (!isInCollabMode && currentFilePath && currentFilePath !== filePath) {
+    const currentState = openFiles.get(currentFilePath);
+    if (currentState && currentState.kind === 'text' && currentState.model.getValue() !== currentState.savedContent) {
+      const response = await showConfirmDialog({
+        title: 'Unsaved Changes',
+        message: `${getFileName(currentFilePath)} has unsaved changes. Do you want to save them before opening a different file?`,
+        buttons: [
+          { label: 'Save', value: 'save', style: 'primary' },
+          { label: "Don't Save", value: 'dont-save', style: 'danger' },
+          { label: 'Cancel', value: 'cancel', style: 'secondary' }
+        ]
+      });
+
+      if (response === 'save') {
+        // User clicked Save
+        await saveCurrentFile();
+      } else if (response === 'cancel' || response === null) {
+        // User clicked Cancel or closed the dialog - don't open the new file
+        return;
+      }
+      // If response === 'dont-save', user clicked Don't Save - proceed with opening
+    }
+  }
 
   if (openFiles.has(filePath)) {
     if (mode === 'permanent') {
@@ -7991,7 +8262,7 @@ if (api.onCollabEvent) {
       type: event.type,
       ...(event.payload && typeof event.payload === 'object' ? event.payload : {})
     };
-    handleCollabPacket(packet);
+    void handleCollabPacket(packet).catch(() => {});
   });
 }
 
@@ -8078,11 +8349,13 @@ aiResizeHandle.addEventListener('mousedown', (event) => {
 
 aiPanelToggleBtn.addEventListener('click', () => {
   aiPanelOpen = false;
+  localStorage.setItem('ai-panel-open', 'false');
   updateWorkspaceColumns();
 });
 
 aiPanelOpenBtn.addEventListener('click', () => {
   aiPanelOpen = true;
+  localStorage.setItem('ai-panel-open', 'true');
   updateWorkspaceColumns();
 });
 
@@ -8271,7 +8544,8 @@ Promise.all([refreshProjectTree(), initMonacoEditor(), refreshRecentProjectsCach
   .then(() => {
     updateHttpBodyState();
     applyTheme(localStorage.getItem('qwale-theme') || 'dark');
-    aiPanelOpen = true;
+    const savedAiPanelState = localStorage.getItem('ai-panel-open');
+    aiPanelOpen = savedAiPanelState !== null ? savedAiPanelState === 'true' : true;
     setAiAuthState();
     updateWorkspaceColumns();
     renderMenuBar();
