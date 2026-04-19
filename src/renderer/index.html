@@ -251,7 +251,13 @@
         <img id="imagePreviewImg" alt="" />
       </div>
       <div id="editorStatusBar" class="editor-status-bar">
-        <span id="statusPosition">Ln -, Col -</span>
+        <div class="status-position-wrap">
+          <span id="statusPosition">Ln -, Col -</span>
+          <div id="imageZoomControls" class="image-zoom-controls hidden" aria-label="Image zoom controls">
+            <button id="imageZoomInBtn" class="image-zoom-btn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+            <button id="imageZoomOutBtn" class="image-zoom-btn" type="button" title="Zoom out" aria-label="Zoom out">-</button>
+          </div>
+        </div>
         <span id="statusEncoding">UTF-8</span>
       </div>
     </section>

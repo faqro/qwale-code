@@ -54,7 +54,11 @@ const editorPlayMenu = document.getElementById('editorPlayMenu');
 const editor = document.getElementById('editor');
 const imagePreview = document.getElementById('imagePreview');
 const imagePreviewImg = document.getElementById('imagePreviewImg');
+imagePreviewImg.draggable = false;
 const statusPosition = document.getElementById('statusPosition');
+const imageZoomControls = document.getElementById('imageZoomControls');
+const imageZoomInBtn = document.getElementById('imageZoomInBtn');
+const imageZoomOutBtn = document.getElementById('imageZoomOutBtn');
 const statusEncoding = document.getElementById('statusEncoding');
 const scmBranchInfo = document.getElementById('scmBranchInfo');
 const scmSetupSection = document.getElementById('scmSetupSection');
@@ -194,15 +198,124 @@ let collabRequestSeq = 1;
 let collabCursorBroadcastTimer = null;
 let collabDisconnectNotice = '';
 let collabRemoteTeardownInProgress = false;
+let imagePanState = null;
+
+const IMAGE_PREVIEW_MIN_ZOOM = 0.2;
+const IMAGE_PREVIEW_MAX_ZOOM = 8;
 
 imagePreviewImg.addEventListener('load', () => {
   updateImagePreviewDimensions();
+});
+
+imagePreviewImg.addEventListener('dragstart', (event) => {
+  event.preventDefault();
+});
+
+function adjustImageZoom(deltaY, options = {}) {
+  const state = currentFilePath ? openFiles.get(currentFilePath) : null;
+  if (!state || state.kind !== 'image' || !state.imageDimensions) {
+    return false;
+  }
+
+  const view = ensureImageViewState(state);
+  const zoomFactor = Math.exp(-deltaY * 0.0015);
+  const nextZoom = Math.max(IMAGE_PREVIEW_MIN_ZOOM, Math.min(IMAGE_PREVIEW_MAX_ZOOM, view.zoom * zoomFactor));
+  if (Math.abs(nextZoom - view.zoom) < 0.0001) {
+    return false;
+  }
+
+  view.zoom = nextZoom;
+  const rect = imagePreview.getBoundingClientRect();
+  const anchorClientX = Number.isFinite(options.anchorClientX) ? options.anchorClientX : rect.left + rect.width / 2;
+  const anchorClientY = Number.isFinite(options.anchorClientY) ? options.anchorClientY : rect.top + rect.height / 2;
+
+  applyImagePreviewViewport({
+    preserveAnchor: true,
+    anchorClientX,
+    anchorClientY
+  });
+
+  return true;
+}
+
+imagePreview.addEventListener('wheel', (event) => {
+  const state = currentFilePath ? openFiles.get(currentFilePath) : null;
+  if (!state || state.kind !== 'image' || !state.imageDimensions) {
+    return;
+  }
+
+  event.preventDefault();
+  const viewportHeight = Math.max(1, imagePreview.clientHeight || 1);
+  const deltaY = event.deltaMode === 1
+    ? event.deltaY * 16
+    : event.deltaMode === 2
+      ? event.deltaY * viewportHeight
+      : event.deltaY;
+  adjustImageZoom(deltaY, {
+    anchorClientX: event.clientX,
+    anchorClientY: event.clientY
+  });
+});
+
+imageZoomInBtn.addEventListener('click', () => {
+  adjustImageZoom(-120);
+});
+
+imageZoomOutBtn.addEventListener('click', () => {
+  adjustImageZoom(120);
+});
+
+imagePreview.addEventListener('mousedown', (event) => {
+  if (event.button !== 0 || !imagePreview.classList.contains('can-pan')) {
+    return;
+  }
+
+  const state = currentFilePath ? openFiles.get(currentFilePath) : null;
+  if (!state || state.kind !== 'image') {
+    return;
+  }
+
+  imagePanState = {
+    startX: event.clientX,
+    startY: event.clientY,
+    startScrollLeft: imagePreview.scrollLeft,
+    startScrollTop: imagePreview.scrollTop
+  };
+  imagePreview.classList.add('panning');
+  event.preventDefault();
+});
+
+imagePreview.addEventListener('dblclick', (event) => {
+  const state = currentFilePath ? openFiles.get(currentFilePath) : null;
+  if (!state || state.kind !== 'image') {
+    return;
+  }
+
+  const view = ensureImageViewState(state);
+  view.zoom = 1;
+  view.scrollLeft = 0;
+  view.scrollTop = 0;
+  stopImagePan();
+  applyImagePreviewViewport();
+  event.preventDefault();
+});
+
+imagePreview.addEventListener('scroll', () => {
+  const state = currentFilePath ? openFiles.get(currentFilePath) : null;
+  if (!state || state.kind !== 'image') {
+    return;
+  }
+
+  const view = ensureImageViewState(state);
+  view.scrollLeft = imagePreview.scrollLeft;
+  view.scrollTop = imagePreview.scrollTop;
 });
 
 imagePreviewImg.addEventListener('error', () => {
   const state = currentFilePath ? openFiles.get(currentFilePath) : null;
   if (state && state.kind === 'image') {
     state.imageDimensions = null;
+    resetImagePreviewViewport();
     updateEditorStatusBar();
   }
 });
@@ -4848,6 +4961,7 @@ function inferEncodingFromText(content) {
 
 function updateEditorStatusBar() {
   if (!currentFilePath) {
+    imageZoomControls.classList.add('hidden');
     statusPosition.textContent = 'Ln -, Col -';
     statusEncoding.textContent = '-';
     return;
@@ -4855,22 +4969,27 @@ function updateEditorStatusBar() {
 
   const state = openFiles.get(currentFilePath);
   if (!state) {
+    imageZoomControls.classList.add('hidden');
     statusPosition.textContent = 'Ln -, Col -';
     statusEncoding.textContent = '-';
     return;
   }
 
   if (state.kind === 'image') {
+    imageZoomControls.classList.remove('hidden');
+    const view = ensureImageViewState(state);
+    const zoomPercent = Math.max(1, Math.round(view.zoom * 100));
     const dimensions = state.imageDimensions;
     if (dimensions && dimensions.width && dimensions.height) {
-      statusPosition.textContent = `${dimensions.width} × ${dimensions.height}`;
+      statusPosition.textContent = `${dimensions.width} x ${dimensions.height}, ${zoomPercent}%`;
     } else {
-      statusPosition.textContent = 'Image';
+      statusPosition.textContent = `Image, ${zoomPercent}%`;
     }
     statusEncoding.textContent = state.encoding || 'Image';
     return;
   }
 
+  imageZoomControls.classList.add('hidden');
   if (!monacoEditor || !monacoEditor.getModel()) {
     statusPosition.textContent = 'Ln -, Col -';
     statusEncoding.textContent = '-';
@@ -5563,10 +5682,146 @@ function toFileUrl(filePath) {
 }
 
 function showTextEditor() {
+  stopImagePan();
   editor.classList.remove('hidden');
   imagePreview.classList.add('hidden');
+  resetImagePreviewViewport();
   imagePreviewImg.removeAttribute('src');
   imagePreviewImg.alt = '';
+}
+
+function stopImagePan() {
+  imagePanState = null;
+  imagePreview.classList.remove('panning');
+}
+
+function resetImagePreviewViewport() {
+  imagePreview.classList.remove('can-pan');
+  imagePreview.classList.remove('can-pan-x');
+  imagePreview.classList.remove('can-pan-y');
+  imagePreview.classList.remove('panning');
+  imagePreview.scrollLeft = 0;
+  imagePreview.scrollTop = 0;
+  imagePreviewImg.style.width = '';
+  imagePreviewImg.style.height = '';
+  delete imagePreviewImg.dataset.displayWidth;
+  delete imagePreviewImg.dataset.displayHeight;
+}
+
+function ensureImageViewState(state) {
+  if (!state.imageView) {
+    state.imageView = {
+      zoom: 1,
+      scrollLeft: 0,
+      scrollTop: 0
+    };
+  }
+
+  if (!Number.isFinite(state.imageView.zoom) || state.imageView.zoom <= 0) {
+    state.imageView.zoom = 1;
+  }
+
+  state.imageView.scrollLeft = Math.max(0, Number(state.imageView.scrollLeft) || 0);
+  state.imageView.scrollTop = Math.max(0, Number(state.imageView.scrollTop) || 0);
+  return state.imageView;
+}
+
+function getImagePreviewFitMetrics(dimensions) {
+  const viewportWidth = Math.max(1, imagePreview.clientWidth || 1);
+  const viewportHeight = Math.max(1, imagePreview.clientHeight || 1);
+  const width = Math.max(1, Number(dimensions.width) || 1);
+  const height = Math.max(1, Number(dimensions.height) || 1);
+  const fitScale = Math.min(1, viewportWidth / width, viewportHeight / height);
+
+  return {
+    viewportWidth,
+    viewportHeight,
+    fitWidth: Math.max(1, Math.round(width * fitScale)),
+    fitHeight: Math.max(1, Math.round(height * fitScale))
+  };
+}
+
+function applyImagePreviewViewport(options = {}) {
+  const state = currentFilePath ? openFiles.get(currentFilePath) : null;
+  if (!state || state.kind !== 'image' || !state.imageDimensions) {
+    resetImagePreviewViewport();
+    updateEditorStatusBar();
+    return;
+  }
+
+  const view = ensureImageViewState(state);
+  view.zoom = Math.max(IMAGE_PREVIEW_MIN_ZOOM, Math.min(IMAGE_PREVIEW_MAX_ZOOM, view.zoom));
+
+  const previousDisplayWidth = Number(imagePreviewImg.dataset.displayWidth) || 0;
+  const previousDisplayHeight = Number(imagePreviewImg.dataset.displayHeight) || 0;
+
+  let anchorContentX = null;
+  let anchorContentY = null;
+  let anchorOffsetX = null;
+  let anchorOffsetY = null;
+
+  if (options.preserveAnchor && previousDisplayWidth > 0 && previousDisplayHeight > 0) {
+    const rect = imagePreview.getBoundingClientRect();
+    anchorOffsetX = Math.max(0, Math.min(rect.width, Number(options.anchorClientX) - rect.left));
+    anchorOffsetY = Math.max(0, Math.min(rect.height, Number(options.anchorClientY) - rect.top));
+    anchorContentX = imagePreview.scrollLeft + anchorOffsetX;
+    anchorContentY = imagePreview.scrollTop + anchorOffsetY;
+  }
+
+  const metrics = getImagePreviewFitMetrics(state.imageDimensions);
+  const displayWidth = Math.max(1, Math.round(metrics.fitWidth * view.zoom));
+  const displayHeight = Math.max(1, Math.round(metrics.fitHeight * view.zoom));
+
+  imagePreviewImg.style.width = `${displayWidth}px`;
+  imagePreviewImg.style.height = `${displayHeight}px`;
+  imagePreviewImg.dataset.displayWidth = String(displayWidth);
+  imagePreviewImg.dataset.displayHeight = String(displayHeight);
+
+  const canPanX = displayWidth > metrics.viewportWidth + 1;
+  const canPanY = displayHeight > metrics.viewportHeight + 1;
+  const canPan = canPanX || canPanY;
+  imagePreview.classList.toggle('can-pan', canPan);
+  imagePreview.classList.toggle('can-pan-x', canPanX);
+  imagePreview.classList.toggle('can-pan-y', canPanY);
+
+  if (!canPan) {
+    view.scrollLeft = 0;
+    view.scrollTop = 0;
+    imagePreview.scrollLeft = 0;
+    imagePreview.scrollTop = 0;
+    stopImagePan();
+    updateEditorStatusBar();
+    return;
+  }
+
+  const maxScrollLeft = Math.max(0, displayWidth - metrics.viewportWidth);
+  const maxScrollTop = Math.max(0, displayHeight - metrics.viewportHeight);
+
+  let nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, view.scrollLeft));
+  let nextScrollTop = Math.max(0, Math.min(maxScrollTop, view.scrollTop));
+
+  if (
+    anchorContentX !== null &&
+    anchorContentY !== null &&
+    anchorOffsetX !== null &&
+    anchorOffsetY !== null &&
+    previousDisplayWidth > 0 &&
+    previousDisplayHeight > 0
+  ) {
+    const anchorRatioX = anchorContentX / previousDisplayWidth;
+    const anchorRatioY = anchorContentY / previousDisplayHeight;
+    nextScrollLeft = anchorRatioX * displayWidth - anchorOffsetX;
+    nextScrollTop = anchorRatioY * displayHeight - anchorOffsetY;
+  }
+
+  nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, nextScrollLeft));
+  nextScrollTop = Math.max(0, Math.min(maxScrollTop, nextScrollTop));
+
+  imagePreview.scrollLeft = nextScrollLeft;
+  imagePreview.scrollTop = nextScrollTop;
+  view.scrollLeft = nextScrollLeft;
+  view.scrollTop = nextScrollTop;
+  updateEditorStatusBar();
 }
 
 function updateImagePreviewDimensions() {
@@ -5586,19 +5841,33 @@ function updateImagePreviewDimensions() {
   }
 
   state.imageDimensions = { width, height };
+  applyImagePreviewViewport();
   updateEditorStatusBar();
 }
 
 function showImagePreview(filePath, imageSrc = '') {
+  stopImagePan();
   if (monacoEditor) {
     monacoEditor.setModel(null);
   }
+
+  const state = openFiles.get(filePath);
+  if (state && state.kind === 'image') {
+    ensureImageViewState(state);
+  }
+
   editor.classList.add('hidden');
   imagePreview.classList.remove('hidden');
   imagePreviewImg.src = imageSrc || `${toFileUrl(filePath)}?t=${Date.now()}`;
   imagePreviewImg.alt = getFileName(filePath);
 
-  if (imagePreviewImg.complete) {
+  if (state && state.kind === 'image' && state.imageDimensions) {
+    applyImagePreviewViewport();
+  } else {
+    resetImagePreviewViewport();
+  }
+
+  if (imagePreviewImg.complete && imagePreviewImg.naturalWidth && imagePreviewImg.naturalHeight) {
     updateImagePreviewDimensions();
   }
 }
@@ -7453,7 +7722,12 @@ async function openFile(filePath, options = {}) {
       preview: openAsPreview,
       encoding,
       imageSrc,
-      imageDimensions: null
+      imageDimensions: null,
+      imageView: {
+        zoom: 1,
+        scrollLeft: 0,
+        scrollTop: 0
+      }
     });
   } else {
     let content = '';
@@ -8464,6 +8738,20 @@ terminalResizeHandle.addEventListener('mousedown', (event) => {
 });
 
 document.addEventListener('mousemove', (event) => {
+  if (imagePanState) {
+    const deltaX = event.clientX - imagePanState.startX;
+    const deltaY = event.clientY - imagePanState.startY;
+    imagePreview.scrollLeft = imagePanState.startScrollLeft - deltaX;
+    imagePreview.scrollTop = imagePanState.startScrollTop - deltaY;
+
+    const state = currentFilePath ? openFiles.get(currentFilePath) : null;
+    if (state && state.kind === 'image') {
+      const view = ensureImageViewState(state);
+      view.scrollLeft = imagePreview.scrollLeft;
+      view.scrollTop = imagePreview.scrollTop;
+    }
+  }
+
   if (sidebarResizeState) {
     const deltaX = event.clientX - sidebarResizeState.startX;
     applySidebarWidth(sidebarResizeState.startWidth + deltaX);
@@ -8497,16 +8785,25 @@ document.addEventListener('mousemove', (event) => {
 });
 
 document.addEventListener('mouseup', () => {
+  stopImagePan();
   clearResizeState();
 });
 
 window.addEventListener('blur', () => {
+  stopImagePan();
   clearResizeState();
 });
 
 window.addEventListener('resize', () => {
   applySidebarWidth(leftSidebarWidth);
   updateWorkspaceColumns();
+
+  if (currentFilePath) {
+    const state = openFiles.get(currentFilePath);
+    if (state && state.kind === 'image' && !imagePreview.classList.contains('hidden')) {
+      applyImagePreviewViewport();
+    }
+  }
 
   if (monacoEditor) {
     monacoEditor.layout();
