@@ -9,6 +9,7 @@ const { spawnSync } = require('child_process');
 const { execFile } = require('child_process');
 const { networkInterfaces } = require('os');
 const { CollaborationHostServer } = require('./collab/server');
+const { updateElectronApp, UpdateSourceType } = require('update-electron-app');
 
 if (require('electron-squirrel-startup')) { //prevent duplicate startups from electron squirrel setup
   app.quit();
@@ -179,6 +180,35 @@ function configureChromiumStoragePaths() {
 }
 
 configureChromiumStoragePaths();
+
+function initAutoUpdates() {
+  if (!app.isPackaged) {
+    return;
+  }
+
+  try {
+    const updaterLogger = {
+      log: (...args) => console.log('[auto-update]', ...args)
+    };
+
+    updateElectronApp({
+      updateSource: {
+        type: UpdateSourceType.ElectronPublicUpdateService,
+        repo: 'faqro/qwale-code',
+        host: 'https://update.electronjs.org'
+      },
+      updateInterval: '10 minutes',
+      notifyUser: true,
+      logger: updaterLogger
+    });
+
+    console.log('[auto-update] updateElectronApp initialized');
+  } catch (error) {
+    // App should still run if updater initialization fails.
+    console.error('Auto-update initialization failed:', error);
+  }
+}
+initAutoUpdates();
 
 function simplifyResponseData(value, depth = 0) {
   if (depth > 8 || value == null) {

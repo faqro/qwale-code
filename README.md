@@ -112,6 +112,31 @@ npm start
 ## Scripts
 
 - `npm start` - Launch QwaleCode in Electron
+- `npm run make` - Build distributables with Electron Forge
+- `npm run publish -- --platform win32` - Publish Windows release assets to GitHub Releases
+
+## Releases and Auto Updates
+
+QwaleCode can publish Squirrel.Windows releases directly to GitHub and auto-update packaged installs through `update.electronjs.org`.
+
+### Release workflow
+
+- Workflow file: `.github/workflows/release-windows.yml`
+- Trigger: push a tag matching `v*` (example: `v1.1.1`)
+- Publish target: GitHub Releases for `faqro/qwale-code`
+- Auth: uses `GITHUB_TOKEN` with `contents: write`
+
+Release command used in CI:
+
+```bash
+npm run publish -- --platform win32
+```
+
+### Auto-update behavior
+
+- The app uses `update-electron-app` with `update.electronjs.org` as the update source.
+- Update checks are initialized only when the app is packaged (`app.isPackaged === true`).
+- Development runs (`npm start` / `npm run dev`) do not run updater initialization.
 
 ## Notes
 
