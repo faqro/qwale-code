@@ -2,6 +2,28 @@ const path = require('path');
 const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 
+// electron-winstaller currently calls resetSignTool() even when windowsSign
+// is not configured, which triggers DEP0187 on newer Node versions.
+// For unsigned Squirrel builds, this reset step is unnecessary.
+(() => {
+  try {
+    const sign = require('electron-winstaller/lib/sign');
+    if (!sign || typeof sign.resetSignTool !== 'function') {
+      return;
+    }
+
+    if (sign.resetSignTool.__qwaleNoopPatched) {
+      return;
+    }
+
+    const noop = async () => {};
+    noop.__qwaleNoopPatched = true;
+    sign.resetSignTool = noop;
+  } catch {
+    // Ignore if internals change in future electron-winstaller versions.
+  }
+})();
+
 module.exports = {
   packagerConfig: {
     asar: true,
