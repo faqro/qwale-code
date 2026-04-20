@@ -8,7 +8,7 @@ QwaleCode is an Electron-based desktop IDE focused on a compact, VS Code-style w
 
 The application is organized into three main areas:
 
-- Explorer and Source Control on the left 📁🎛️
+- Explorer/Source Control/Collaborate on the left 📁🎛️
 - Code editor in the center ✍️
 - AI Code panel on the right 🤖
 
