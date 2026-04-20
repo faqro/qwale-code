@@ -15,6 +15,19 @@ if (require('electron-squirrel-startup')) { //prevent duplicate startups from el
   app.quit();
 }
 
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+}
+
+app.on('second-instance', () => {
+  const targetWindow = getTargetWindow() || createWindow();
+  if (targetWindow.isMinimized()) {
+    targetWindow.restore();
+  }
+  targetWindow.focus();
+});
+
 let mainWindow = null;
 const terminals = new Map();
 let recentProjects = [];
@@ -22,6 +35,7 @@ const windowProjectState = new Map();
 const projectWatchers = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
 let collaborationHostServer = null;
+const filteredDevtoolsContents = new WeakSet();
 
 function getServerHostCandidates() {
   const hosts = new Set(['127.0.0.1', 'localhost']);
@@ -441,6 +455,58 @@ function createAppMenu() {
   Menu.setApplicationMenu(menu);
 }
 
+function isIgnorableDevtoolsConsoleWarning(message, sourceId) {
+  if (!sourceId || !String(sourceId).startsWith('devtools://')) {
+    return false;
+  }
+
+  const text = String(message || '');
+  return (
+    text.includes('Autofill.enable')
+    || text.includes('Autofill.setAddresses')
+  ) && text.includes("wasn't found");
+}
+
+function attachDevtoolsConsoleFilter(win) {
+  if (!win || win.isDestroyed() || !win.webContents) {
+    return;
+  }
+
+  const devtoolsContents = win.webContents.devToolsWebContents;
+  if (!devtoolsContents || devtoolsContents.isDestroyed() || filteredDevtoolsContents.has(devtoolsContents)) {
+    return;
+  }
+
+  devtoolsContents.on('console-message', (event, _level, message, _line, sourceId) => {
+    if (!isIgnorableDevtoolsConsoleWarning(message, sourceId)) {
+      return;
+    }
+
+    if (event && typeof event.preventDefault === 'function') {
+      event.preventDefault();
+    }
+  });
+
+  filteredDevtoolsContents.add(devtoolsContents);
+}
+
+function toggleDevtoolsWithFilter(win) {
+  if (!win || win.isDestroyed()) {
+    return;
+  }
+
+  if (win.webContents.isDevToolsOpened()) {
+    win.webContents.closeDevTools();
+    return;
+  }
+
+  win.webContents.once('devtools-opened', () => {
+    attachDevtoolsConsoleFilter(win);
+  });
+
+  win.webContents.openDevTools();
+}
+
 function createWindow(initialProjectPath = null) {
   const isWindows = process.platform === 'win32';
 
@@ -471,6 +537,10 @@ function createWindow(initialProjectPath = null) {
   });
 
   const createdWebContentsId = createdWindow.webContents.id;
+
+  createdWindow.webContents.on('devtools-opened', () => {
+    attachDevtoolsConsoleFilter(createdWindow);
+  });
 
   if (!mainWindow || mainWindow.isDestroyed()) {
     mainWindow = createdWindow;
@@ -764,7 +834,6 @@ ipcMain.handle('collab:openJoinWindow', async (_event, payload = {}) => {
 
 ipcMain.handle('project:open', async (event) => {
   const senderWindow = BrowserWindow.fromWebContents(event.sender);
-  const existingProjectPath = getProjectPathForSender(event.sender);
 
   const result = await dialog.showOpenDialog(senderWindow || undefined, {
     properties: ['openDirectory']
@@ -776,11 +845,6 @@ ipcMain.handle('project:open', async (event) => {
 
   const selectedProjectPath = path.resolve(result.filePaths[0]);
   await rememberRecentProject(selectedProjectPath);
-
-  if (existingProjectPath) {
-    createWindow(selectedProjectPath);
-    return { canceled: false, openedInNewWindow: true };
-  }
 
   windowProjectState.set(event.sender.id, selectedProjectPath);
   startProjectWatcherForWebContents(event.sender.id, selectedProjectPath);
@@ -800,8 +864,6 @@ ipcMain.handle('project:open', async (event) => {
 });
 
 ipcMain.handle('project:openPath', async (event, folderPath) => {
-  const existingProjectPath = getProjectPathForSender(event.sender);
-
   if (!folderPath) {
     throw new Error('Invalid folder path.');
   }
@@ -813,11 +875,6 @@ ipcMain.handle('project:openPath', async (event, folderPath) => {
   }
 
   await rememberRecentProject(resolved);
-
-  if (existingProjectPath) {
-    createWindow(resolved);
-    return { canceled: false, openedInNewWindow: true };
-  }
 
   windowProjectState.set(event.sender.id, resolved);
   startProjectWatcherForWebContents(event.sender.id, resolved);
@@ -1099,7 +1156,7 @@ ipcMain.handle('app:command', (event, command) => {
   if (command === 'view:reload') {
     win.webContents.reload();
   } else if (command === 'view:toggleDevTools') {
-    win.webContents.toggleDevTools();
+    toggleDevtoolsWithFilter(win);
   } else if (command === 'view:toggleFullscreen') {
     win.setFullScreen(!win.isFullScreen());
   } else if (command === 'view:zoomIn') {
@@ -1546,7 +1603,9 @@ ipcMain.handle('terminal:create', (event, { cwd, shellType }) => {
   const senderProjectPath = getProjectPathForSender(event.sender);
   const senderWebContentsId = event.sender.id;
   const termId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const projectCwd = cwd && fs.existsSync(cwd) ? cwd : senderProjectPath || app.getPath('home');
+  const normalizedCwd = typeof cwd === 'string' ? cwd.trim() : '';
+  const hasValidCwd = Boolean(normalizedCwd) && fs.existsSync(normalizedCwd);
+  const projectCwd = hasValidCwd ? normalizedCwd : senderProjectPath || app.getPath('home');
   const requestedShellType = typeof shellType === 'string' ? shellType : 'powershell';
 
   if (requestedShellType === 'wsl' && !isWslAvailable()) {

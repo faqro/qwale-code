@@ -1390,7 +1390,6 @@ function remapOpenFilesForPathChange(sourcePath, destinationPath, isDirectory) {
   }
 
   updateEditorStatusBar();
-  updateEditorTitle();
   renderTabs();
 }
 
@@ -5597,7 +5596,6 @@ async function handleWindowCloseWithUnsavedPrompts() {
       }
     }
 
-    updateEditorTitle();
     renderTabs();
     renderTree();
     return true;
@@ -5632,10 +5630,6 @@ async function showAboutDialog() {
   `;
 
   openHelpDialog('About QwaleCode', html);
-}
-
-function updateEditorTitle() {
-  // File identity/dirty state is represented in tabs, so no separate title bar is used.
 }
 
 function detectMonacoLanguage(filePath) {
@@ -5964,7 +5958,6 @@ function switchToFile(filePath) {
   }
 
   updateEditorStatusBar();
-  updateEditorTitle();
   renderTabs();
 }
 
@@ -6010,7 +6003,6 @@ async function closeTab(filePath) {
     }
   }
 
-  updateEditorTitle();
   renderTabs();
 }
 
@@ -6022,9 +6014,11 @@ function initMonacoEditor() {
     }
 
     window.require.config({ paths: { vs: '../../node_modules/monaco-editor/min/vs' } });
+    const monacoBaseUrl = new URL('../../node_modules/monaco-editor/min/', window.location.href).toString();
+    const workerMainUrl = new URL('vs/base/worker/workerMain.js', monacoBaseUrl).toString();
     window.MonacoEnvironment = {
       getWorkerUrl: () => {
-        const code = `self.MonacoEnvironment = { baseUrl: '../../node_modules/monaco-editor/min/' }; importScripts('../../node_modules/monaco-editor/min/vs/base/worker/workerMain.js');`;
+        const code = `self.MonacoEnvironment = { baseUrl: ${JSON.stringify(monacoBaseUrl)} }; importScripts(${JSON.stringify(workerMainUrl)});`;
         return `data:text/javascript;charset=utf-8,${encodeURIComponent(code)}`;
       }
     };
@@ -6084,7 +6078,6 @@ function initMonacoEditor() {
         }
 
         updateEditorStatusBar();
-        updateEditorTitle();
         renderTabs();
         renderTree();
       });
@@ -7031,7 +7024,6 @@ async function resetWorkspaceToNoProjectState() {
   expandedFolders.clear();
   clearExplorerDragVisualState();
   updateEditorStatusBar();
-  updateEditorTitle();
   renderTabs();
   renderTree();
   refreshFileSearchIndex();
@@ -7157,7 +7149,6 @@ function applyRemoteOperationBatchToModel(filePath, ops, nextVersion) {
   state.encoding = inferEncodingFromText(state.savedContent);
   collabFileVersions.set(projectPathToCollabPath(filePath), Math.max(0, Number(nextVersion) || 0));
   updateEditorStatusBar();
-  updateEditorTitle();
   renderTabs();
   renderTree();
 }
@@ -7789,7 +7780,6 @@ async function saveCurrentFile() {
   fileState.savedContent = content;
   fileState.encoding = inferEncodingFromText(content);
   updateEditorStatusBar();
-  updateEditorTitle();
   renderTabs();
   renderTree();
 }
@@ -7826,7 +7816,6 @@ async function saveCurrentFileAs() {
     fileState.savedContent = content;
     fileState.encoding = inferEncodingFromText(content);
     updateEditorStatusBar();
-    updateEditorTitle();
     renderTabs();
     renderTree();
     await refreshProjectTree();
@@ -7903,7 +7892,6 @@ async function saveAllFiles() {
   }
 
   updateEditorStatusBar();
-  updateEditorTitle();
   renderTabs();
   renderTree();
   if (savedCount > 0) {
@@ -7989,7 +7977,6 @@ async function applyOpenedProject(opened) {
     monacoEditor.setModel(null);
   }
   updateEditorStatusBar();
-  updateEditorTitle();
   renderTabs();
 
   project = opened;
@@ -8064,7 +8051,6 @@ async function closeFolder() {
   applyScmState('no-project');
   clearAiConversationHistory();
   await loadLaunchConfigFromDisk();
-  updateEditorTitle();
   renderTabs();
 
   killAllTerminalSessions();
