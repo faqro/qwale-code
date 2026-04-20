@@ -6553,6 +6553,10 @@ function renderTree() {
       alert(error.message || String(error));
     }
   };
+
+  if (collabChatTranscript) {
+    renderCollabChatTranscript();
+  }
 }
 
 async function refreshProjectTree() {
@@ -6776,6 +6780,150 @@ function getLockedMentionValuesForText(text, validMentions) {
   }
 
   return [...lockedMentionValues];
+}
+
+function getCurrentCollabChatLineNumber() {
+  if (!monacoEditor || !monacoEditor.getModel()) {
+    return null;
+  }
+
+  const position = monacoEditor.getPosition();
+  if (!position || !Number.isFinite(Number(position.lineNumber))) {
+    return null;
+  }
+
+  return Math.max(1, Number(position.lineNumber) || 1);
+}
+
+function getCanonicalCollabRelativePath(filePath) {
+  const rawPath = normalizeExplorerPath(filePath).replace(/^\/+/, '');
+  if (!rawPath) {
+    return '';
+  }
+
+  const normalizedRoot = normalizeExplorerPath(project.rootPath || '').replace(/\/+$/, '');
+  if (normalizedRoot) {
+    const rawLower = rawPath.toLowerCase();
+    const rootLower = normalizedRoot.toLowerCase();
+    if (rawLower === rootLower) {
+      return '';
+    }
+    if (rawLower.startsWith(`${rootLower}/`)) {
+      return rawPath.slice(normalizedRoot.length + 1);
+    }
+  }
+
+  return projectPathToCollabPath(filePath).replace(/^\/+/, '');
+}
+
+function getHereFileMentionReplacement() {
+  if (!currentFilePath) {
+    return null;
+  }
+
+  const relativePath = getCanonicalCollabRelativePath(currentFilePath);
+
+  if (!relativePath) {
+    return null;
+  }
+
+  const lineNumber = getCurrentCollabChatLineNumber();
+  return lineNumber ? `#${relativePath}:${lineNumber}` : `#${relativePath}`;
+}
+
+function replaceHereFileMentions(text) {
+  const value = String(text || '');
+  const replacement = getHereFileMentionReplacement();
+  if (!replacement) {
+    return value;
+  }
+
+  return value.replace(/#here\b/gi, replacement);
+}
+
+function parseFileMentionToken(token) {
+  const rawToken = String(token || '').trim();
+  if (!rawToken || rawToken.charAt(0) !== '#') {
+    return null;
+  }
+
+  if (rawToken.toLowerCase() === '#here') {
+    const replacement = getHereFileMentionReplacement();
+    if (!replacement) {
+      return {
+        relativePath: 'here',
+        lineNumber: null,
+        isHereLiteral: true
+      };
+    }
+    return parseFileMentionToken(replacement);
+  }
+
+  let relativePath = rawToken.slice(1);
+  let lineNumber = null;
+  const lineMatch = relativePath.match(/:(\d+)$/);
+  if (lineMatch) {
+    lineNumber = Math.max(1, Number(lineMatch[1]) || 1);
+    relativePath = relativePath.slice(0, -lineMatch[0].length);
+  }
+
+  relativePath = relativePath.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/^\/+/, '').trim();
+  if (!relativePath) {
+    return null;
+  }
+
+  return {
+    relativePath,
+    lineNumber
+  };
+}
+
+function findProjectFileByRelativePath(relativePath) {
+  const target = normalizeExplorerPath(relativePath).replace(/^\.\/+/, '').replace(/^\/+/, '').toLowerCase();
+  if (!target) {
+    return null;
+  }
+
+  const files = collectProjectFiles(project.tree, []);
+  return files.find((entry) => {
+    const canonicalRelative = getCanonicalCollabRelativePath(entry.path).toLowerCase();
+    return canonicalRelative === target;
+  }) || null;
+}
+
+function resolveProjectFilePath(relativePath) {
+  const match = findProjectFileByRelativePath(relativePath);
+  return match ? match.path : null;
+}
+
+function isFileMentionBlockedByDisconnect() {
+  return collabMode === 'remote' && !collabConnected && !collabIsSessionHost;
+}
+
+async function openFileMention(relativePath, lineNumber = null) {
+  const targetPath = resolveProjectFilePath(relativePath);
+  if (!targetPath) {
+    return false;
+  }
+
+  try {
+    await openFile(targetPath, { mode: 'permanent' });
+  } catch (error) {
+    alert(error.message || String(error));
+    return false;
+  }
+
+  if (lineNumber === null || lineNumber === undefined || !monacoEditor || !monacoEditor.getModel() || currentFilePath !== targetPath) {
+    return true;
+  }
+
+  const model = monacoEditor.getModel();
+  const safeLine = Math.max(1, Math.min(model.getLineCount(), Number(lineNumber) || 1));
+  const safeColumn = Math.max(1, Math.min(model.getLineMaxColumn(safeLine), 1));
+  monacoEditor.setPosition({ lineNumber: safeLine, column: safeColumn });
+  monacoEditor.revealPositionInCenter({ lineNumber: safeLine, column: safeColumn });
+  monacoEditor.focus();
+  return true;
 }
 
 function getMentionContext(text, cursorIndex) {
@@ -7096,14 +7244,17 @@ function handleMentionMenuKeydown(event) {
 
 function appendCollabMentionRichText(container, text, options = {}) {
   const value = String(text || '');
-  const mentionPattern = /@[A-Za-z0-9._-]+/g;
+  const mentionPattern = /(@[A-Za-z0-9._-]+|#here\b|#[A-Za-z0-9._/\\-]+(?::\d+)?)/g;
   let lastIndex = 0;
   let match;
   const interactiveMentions = Boolean(options.interactiveMentions);
   const onMentionClick = typeof options.onMentionClick === 'function' ? options.onMentionClick : null;
+  const onFileMentionClick = typeof options.onFileMentionClick === 'function' ? options.onFileMentionClick : null;
   const mentionClassName = String(options.mentionClassName || 'collab-mention-text').trim() || 'collab-mention-text';
+  const fileMentionClassName = String(options.fileMentionClassName || 'collab-file-mention').trim() || 'collab-file-mention';
   const plainTextClassName = String(options.plainTextClassName || '').trim();
   const validateMention = typeof options.validateMention === 'function' ? options.validateMention : null;
+  const validateFileMention = typeof options.validateFileMention === 'function' ? options.validateFileMention : null;
 
   const appendPlainText = (plainText) => {
     if (!plainText) {
@@ -7126,42 +7277,91 @@ function appendCollabMentionRichText(container, text, options = {}) {
       appendPlainText(value.slice(lastIndex, match.index));
     }
 
-    const mentionText = match[0];
-    if (validateMention && !validateMention(mentionText)) {
-      appendPlainText(mentionText);
-      lastIndex = match.index + match[0].length;
-      continue;
+    const tokenText = match[0];
+    if (tokenText.charAt(0) === '@') {
+      if (validateMention && !validateMention(tokenText)) {
+        appendPlainText(tokenText);
+        lastIndex = match.index + match[0].length;
+        continue;
+      }
+
+      const mentionSpan = document.createElement('span');
+      mentionSpan.className = mentionClassName;
+      mentionSpan.textContent = tokenText;
+
+      if (interactiveMentions) {
+        mentionSpan.classList.add('is-clickable');
+        mentionSpan.setAttribute('role', 'button');
+        mentionSpan.setAttribute('tabindex', '0');
+        mentionSpan.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (onMentionClick) {
+            onMentionClick(tokenText);
+          }
+        });
+        mentionSpan.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') {
+            return;
+          }
+
+          event.preventDefault();
+          event.stopPropagation();
+          if (onMentionClick) {
+            onMentionClick(tokenText);
+          }
+        });
+      }
+
+      container.appendChild(mentionSpan);
+    } else {
+      const fileMention = parseFileMentionToken(tokenText);
+      if (!fileMention) {
+        appendPlainText(tokenText);
+        lastIndex = match.index + match[0].length;
+        continue;
+      }
+
+      const filePath = resolveProjectFilePath(fileMention.relativePath);
+      const isValidFile = Boolean(filePath) && !isFileMentionBlockedByDisconnect();
+      const nextFileMention = validateFileMention
+        ? Boolean(validateFileMention(tokenText, fileMention, filePath, isValidFile))
+        : isValidFile;
+
+      const fileSpan = document.createElement('span');
+      fileSpan.className = fileMentionClassName;
+      fileSpan.textContent = tokenText;
+      fileSpan.classList.toggle('is-invalid', !nextFileMention);
+
+      if (nextFileMention && (interactiveMentions || onFileMentionClick)) {
+        fileSpan.classList.add('is-clickable');
+        fileSpan.setAttribute('role', 'button');
+        fileSpan.setAttribute('tabindex', '0');
+        fileSpan.setAttribute('aria-label', `Open file ${fileMention.relativePath}${fileMention.lineNumber ? ` at line ${fileMention.lineNumber}` : ''}`);
+        fileSpan.setAttribute('title', `Open file ${fileMention.relativePath}${fileMention.lineNumber ? ` at line ${fileMention.lineNumber}` : ''}`);
+        fileSpan.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (onFileMentionClick) {
+            onFileMentionClick(fileMention);
+          }
+        });
+        fileSpan.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') {
+            return;
+          }
+
+          event.preventDefault();
+          event.stopPropagation();
+          if (onFileMentionClick) {
+            onFileMentionClick(fileMention);
+          }
+        });
+      }
+
+      container.appendChild(fileSpan);
     }
 
-    const mentionSpan = document.createElement('span');
-    mentionSpan.className = mentionClassName;
-    mentionSpan.textContent = mentionText;
-
-    if (interactiveMentions) {
-      mentionSpan.classList.add('is-clickable');
-      mentionSpan.setAttribute('role', 'button');
-      mentionSpan.setAttribute('tabindex', '0');
-      mentionSpan.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        if (onMentionClick) {
-          onMentionClick(mentionText);
-        }
-      });
-      mentionSpan.addEventListener('keydown', (event) => {
-        if (event.key !== 'Enter' && event.key !== ' ') {
-          return;
-        }
-
-        event.preventDefault();
-        event.stopPropagation();
-        if (onMentionClick) {
-          onMentionClick(mentionText);
-        }
-      });
-    }
-
-    container.appendChild(mentionSpan);
     lastIndex = match.index + match[0].length;
   }
 
@@ -7175,7 +7375,7 @@ function renderCollabChatInputMirror() {
     return;
   }
 
-  const value = String(collabChatInput.value || '');
+  const value = replaceHereFileMentions(String(collabChatInput.value || ''));
   collabChatInputMirror.innerHTML = '';
 
   if (!value) {
@@ -7237,6 +7437,19 @@ function renderCollabChatTranscript() {
         const avatarName = String(entry.name || collabParticipantName || 'Collaborator');
         const avatarColor = getCollabColorById(entry.clientId);
         const avatar = createCollabAvatarNode(avatarName, avatarColor, 'collab-chat-avatar');
+        avatar.style.cursor = 'pointer';
+        avatar.title = `Add @${avatarName} to chat`;
+        avatar.setAttribute('role', 'button');
+        avatar.setAttribute('tabindex', '0');
+        avatar.addEventListener('click', () => {
+          insertMentionIntoCollabChat(avatarName);
+        });
+        avatar.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            insertMentionIntoCollabChat(avatarName);
+          }
+        });
         row.appendChild(avatar);
       } else if (shouldRenderAvatarSpacer) {
         const spacer = document.createElement('span');
@@ -7289,6 +7502,9 @@ function renderCollabChatTranscript() {
           }
 
           insertMentionIntoCollabChat(mentionText.slice(1));
+        },
+        onFileMentionClick: (fileMention) => {
+          openFileMention(fileMention.relativePath, fileMention.lineNumber);
         }
       });
 
@@ -7366,6 +7582,7 @@ function updateCollabChatPanel() {
   if (!isInSession) {
     closeMentionMenu();
   }
+  renderCollabChatTranscript();
 }
 
 function getCollabColorById(clientId) {
@@ -7739,7 +7956,7 @@ async function sendCollabChatMessage() {
     return;
   }
 
-  const message = String(collabChatInput.value || '').trim();
+  const message = replaceHereFileMentions(String(collabChatInput.value || '')).trim();
   if (!message) {
     return;
   }
