@@ -1,14 +1,15 @@
 {
   "name": "qwalecode",
   "productName": "QwaleCode",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Lightweight Electron IDE and Code Platform",
   "main": "src/main.js",
   "scripts": {
     "dev": "electron .",
     "start": "electron-forge start",
     "package": "electron-forge package",
-    "make": "electron-forge make"
+    "make": "electron-forge make",
+    "publish": "electron-forge publish"
   },
   "keywords": [
     "electron",
@@ -17,6 +18,10 @@
   ],
   "author": "Faraaz Jan",
   "license": "CC BY-NC-ND 4.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/faqro/qwale-code.git"
+  },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
@@ -25,6 +30,7 @@
     "monaco-editor": "^0.52.2",
     "node-pty": "^1.0.0",
     "sharp": "^0.34.5",
+    "update-electron-app": "^3.1.1",
     "ws": "^8.18.3"
   },
   "devDependencies": {
@@ -35,7 +41,9 @@
     "@electron-forge/maker-zip": "^7.11.1",
     "@electron-forge/plugin-auto-unpack-natives": "^7.11.1",
     "@electron-forge/plugin-fuses": "^7.11.1",
+    "@electron-forge/publisher-github": "^7.11.1",
     "@electron/fuses": "^1.8.0",
+    "dotenv": "^17.4.2",
     "electron": "^31.7.7"
   }
 }
