@@ -456,6 +456,11 @@ class CollaborationHostServer {
       return;
     }
 
+    if (packet.type === 'chat:message') {
+      this.handleChatMessage(socket, packet, client);
+      return;
+    }
+
     if (packet.type === 'presence:file') {
       const nextFilePath = String(packet.filePath || '');
       client.currentFile = this.isSharedPath(nextFilePath, false) ? nextFilePath : '';
@@ -511,6 +516,23 @@ class CollaborationHostServer {
     }, EDIT_ACTIVITY_IDLE_MS);
 
     this.editActivityTimers.set(key, timer);
+  }
+
+  handleChatMessage(socket, packet, client) {
+    const message = String(packet && packet.message ? packet.message : '').trim();
+    if (!message) {
+      this.send(socket, 'error', {
+        message: 'Chat message cannot be empty.'
+      });
+      return;
+    }
+
+    this.broadcast('chat:message', {
+      clientId: client.clientId,
+      name: client.name,
+      message: message.slice(0, 500),
+      at: Date.now()
+    });
   }
 
   async handleJoin(socket, packet) {

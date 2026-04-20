@@ -5,11 +5,13 @@ const sidebarTabExplorer = document.getElementById('sidebarTabExplorer');
 const sidebarTabRunDebug = document.getElementById('sidebarTabRunDebug');
 const sidebarTabSourceControl = document.getElementById('sidebarTabSourceControl');
 const sidebarTabCollaborate = document.getElementById('sidebarTabCollaborate');
+const sidebarTabCollaborateChat = document.getElementById('sidebarTabCollaborateChat');
 const sidebarTabHttp = document.getElementById('sidebarTabHttp');
 const explorerPanelView = document.getElementById('explorerPanelView');
 const runDebugPanelView = document.getElementById('runDebugPanelView');
 const sourceControlPanelView = document.getElementById('sourceControlPanelView');
 const collaboratePanelView = document.getElementById('collaboratePanelView');
+const collaborateChatPanelView = document.getElementById('collaborateChatPanelView');
 const httpPanelView = document.getElementById('httpPanelView');
 const workspace = document.querySelector('.workspace');
 const explorerResizeHandle = document.getElementById('explorerResizeHandle');
@@ -39,12 +41,22 @@ const collabNameInput = document.getElementById('collabNameInput');
 const collabInfo = document.getElementById('collabInfo');
 const collabPresenceList = document.getElementById('collabPresenceList');
 const collabActivityList = document.getElementById('collabActivityList');
+const collabChatNotice = document.getElementById('collabChatNotice');
+const collabChatNoticeText = document.getElementById('collabChatNoticeText');
+const collabChatTranscript = document.getElementById('collabChatTranscript');
+const collabMentionWrap = document.getElementById('collabMentionWrap');
+const collabChatInputMirror = document.getElementById('collabChatInputMirror');
+const collabMentionMenu = document.getElementById('collabMentionMenu');
+const collabChatInput = document.getElementById('collabChatInput');
+const collabChatSendBtn = document.getElementById('collabChatSendBtn');
+const collabChatGoToCollaborateBtn = document.getElementById('collabChatGoToCollaborateBtn');
 const treeRoot = document.getElementById('treeRoot');
 const scmTabBadge = document.getElementById('scmTabBadge');
 const editorTabs = document.getElementById('editorTabs');
 const collabQuickWrap = document.getElementById('collabQuickWrap');
 const collabQuickBtn = document.getElementById('collabQuickBtn');
 const collabQuickMenu = document.getElementById('collabQuickMenu');
+const collabChatTabBadge = document.getElementById('collabChatTabBadge');
 const editorPlayWrap = document.querySelector('.editor-play-wrap');
 const editorPlayMenuBtn = document.getElementById('editorPlayMenuBtn');
 const editorPlayBtn = document.getElementById('editorPlayBtn');
@@ -198,6 +210,16 @@ let collabRequestSeq = 1;
 let collabCursorBroadcastTimer = null;
 let collabDisconnectNotice = '';
 let collabRemoteTeardownInProgress = false;
+let collabChatHistory = [];
+let collabChatUnreadCount = 0;
+let collabMentionState = {
+  active: false,
+  token: '',
+  startIndex: -1,
+  cursorIndex: -1,
+  selectedIndex: -1,
+  candidates: []
+};
 let imagePanState = null;
 
 const IMAGE_PREVIEW_MIN_ZOOM = 0.2;
@@ -1977,17 +1999,20 @@ function setSidebarPanel(panelName) {
   const isRunDebug = panelName === 'run-debug';
   const isSourceControl = panelName === 'source-control';
   const isCollaborate = panelName === 'collaborate';
+  const isCollaborateChat = panelName === 'collaborate-chat';
   const isHttp = panelName === 'http';
 
   sidebarTabExplorer.classList.toggle('active', isExplorer);
   sidebarTabRunDebug.classList.toggle('active', isRunDebug);
   sidebarTabSourceControl.classList.toggle('active', isSourceControl);
   sidebarTabCollaborate.classList.toggle('active', isCollaborate);
+  sidebarTabCollaborateChat.classList.toggle('active', isCollaborateChat);
   sidebarTabHttp.classList.toggle('active', isHttp);
   explorerPanelView.classList.toggle('active', isExplorer);
   runDebugPanelView.classList.toggle('active', isRunDebug);
   sourceControlPanelView.classList.toggle('active', isSourceControl);
   collaboratePanelView.classList.toggle('active', isCollaborate);
+  collaborateChatPanelView.classList.toggle('active', isCollaborateChat);
   httpPanelView.classList.toggle('active', isHttp);
 
   if (isRunDebug) {
@@ -2005,6 +2030,13 @@ function setSidebarPanel(panelName) {
 
   if (panelName !== 'explorer') {
     setExplorerPanelFocus(false);
+  }
+
+  if (isCollaborateChat) {
+    collabChatUnreadCount = 0;
+    updateCollabChatBadge();
+    updateCollabChatPanel();
+    renderCollabChatTranscript();
   }
 }
 
@@ -4166,6 +4198,21 @@ function updateScmBadge(count, visible) {
 
   scmTabBadge.textContent = count > 99 ? '99+' : String(count);
   scmTabBadge.classList.remove('hidden');
+}
+
+function updateCollabChatBadge() {
+  if (!collabChatTabBadge) {
+    return;
+  }
+
+  if (collabChatUnreadCount === 0 || activeSidebarPanel === 'collaborate-chat') {
+    collabChatTabBadge.textContent = '';
+    collabChatTabBadge.classList.add('hidden');
+    return;
+  }
+
+  collabChatTabBadge.textContent = collabChatUnreadCount > 99 ? '99+' : String(collabChatUnreadCount);
+  collabChatTabBadge.classList.remove('hidden');
 }
 
 function getHostCreateRepoUrl(hostId) {
@@ -6596,6 +6643,731 @@ function addCollabActivity(message) {
   }
 }
 
+function isActiveCollabSession() {
+  return collabConnected && (collabMode === 'remote' || collabMode === 'host');
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getMentionableCollaboratorEntries() {
+  const collaborators = [];
+  const seenClientIds = new Set();
+  let hasEveryoneName = false;
+
+  for (const presence of collabPresenceById.values()) {
+    const clientId = String(presence && presence.clientId ? presence.clientId : '').trim();
+    const name = String(presence && presence.name ? presence.name : '').trim();
+
+    if (!clientId || !name || seenClientIds.has(clientId)) {
+      continue;
+    }
+
+    seenClientIds.add(clientId);
+    hasEveryoneName = hasEveryoneName || name.toLowerCase() === 'everyone';
+    collaborators.push({
+      clientId,
+      name,
+      color: getCollabColorById(clientId)
+    });
+  }
+
+  const sortedCollaborators = collaborators.sort((left, right) => {
+    const nameOrder = left.name.localeCompare(right.name);
+    return nameOrder || left.clientId.localeCompare(right.clientId);
+  });
+
+  if (!hasEveryoneName) {
+    sortedCollaborators.unshift({
+      clientId: '__everyone__',
+      name: 'everyone',
+      mentionValue: 'everyone',
+      isEveryone: true
+    });
+  }
+
+  return sortedCollaborators;
+}
+
+function getMentionableCollaboratorNames() {
+  return getMentionableCollaboratorEntries().map((entry) => String(entry.mentionValue || entry.name));
+}
+
+function getValidMentionValuesSet() {
+  const validMentions = new Set(['everyone']);
+  if (!isActiveCollabSession()) {
+    return validMentions;
+  }
+
+  for (const presence of collabPresenceById.values()) {
+    const name = String(presence && presence.name ? presence.name : '').trim().toLowerCase();
+    if (!name) {
+      continue;
+    }
+
+    validMentions.add(name);
+  }
+
+  return validMentions;
+}
+
+function isValidMentionToken(mentionText, validMentions) {
+  const token = String(mentionText || '').trim();
+  if (!token.startsWith('@')) {
+    return false;
+  }
+
+  const mentionValue = token.slice(1).trim().toLowerCase();
+  if (!mentionValue) {
+    return false;
+  }
+
+  return validMentions.has(mentionValue);
+}
+
+function getTargetedMentionValuesSet() {
+  const targetedMentions = new Set(['everyone']);
+  const localName = String(collabParticipantName || '').trim().toLowerCase();
+  if (localName) {
+    targetedMentions.add(localName);
+  }
+
+  const localPresence = collabClientId ? collabPresenceById.get(collabClientId) : null;
+  const localPresenceName = String(localPresence && localPresence.name ? localPresence.name : '').trim().toLowerCase();
+  if (localPresenceName) {
+    targetedMentions.add(localPresenceName);
+  }
+
+  return targetedMentions;
+}
+
+function messageTargetsLocalCollaborator(text) {
+  const value = String(text || '');
+  if (!value) {
+    return false;
+  }
+
+  const targetedMentions = getTargetedMentionValuesSet();
+  const mentionPattern = /@[A-Za-z0-9._-]+/g;
+  let match;
+
+  while ((match = mentionPattern.exec(value)) !== null) {
+    const mentionValue = String(match[0] || '').slice(1).trim().toLowerCase();
+    if (mentionValue && targetedMentions.has(mentionValue)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function getLockedMentionValuesForText(text, validMentions) {
+  const value = String(text || '');
+  const mentionPattern = /@[A-Za-z0-9._-]+/g;
+  const lockedMentionValues = new Set();
+  let match;
+
+  while ((match = mentionPattern.exec(value)) !== null) {
+    const mentionValue = String(match[0] || '').slice(1).trim().toLowerCase();
+    if (mentionValue && validMentions.has(mentionValue)) {
+      lockedMentionValues.add(mentionValue);
+    }
+  }
+
+  return [...lockedMentionValues];
+}
+
+function getMentionContext(text, cursorIndex) {
+  const value = String(text || '');
+  const safeCursorIndex = Math.max(0, Math.min(Number(cursorIndex) || 0, value.length));
+  const textBeforeCursor = value.slice(0, safeCursorIndex);
+  const atIndex = textBeforeCursor.lastIndexOf('@');
+  if (atIndex < 0) {
+    return null;
+  }
+
+  if (atIndex > 0) {
+    const charBeforeAt = textBeforeCursor.charAt(atIndex - 1);
+    if (/[A-Za-z0-9._-]/.test(charBeforeAt)) {
+      return null;
+    }
+  }
+
+  const token = textBeforeCursor.slice(atIndex + 1);
+  if (/\s/.test(token)) {
+    return null;
+  }
+
+  return {
+    startIndex: atIndex,
+    token
+  };
+}
+
+function closeMentionMenu() {
+  collabMentionState.active = false;
+  collabMentionState.token = '';
+  collabMentionState.startIndex = -1;
+  collabMentionState.cursorIndex = -1;
+  collabMentionState.selectedIndex = -1;
+  collabMentionState.candidates = [];
+  if (collabMentionMenu) {
+    collabMentionMenu.innerHTML = '';
+    collabMentionMenu.classList.add('hidden');
+  }
+}
+
+function renderMentionMenu() {
+  if (!collabMentionMenu) {
+    return;
+  }
+
+  collabMentionMenu.innerHTML = '';
+  const fragment = document.createDocumentFragment();
+  for (let index = 0; index < collabMentionState.candidates.length; index += 1) {
+    const candidate = collabMentionState.candidates[index];
+    const isLocalCandidate = Boolean(candidate && collabClientId && candidate.clientId === collabClientId);
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'collab-mention-item';
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(index === collabMentionState.selectedIndex));
+
+    const avatar = candidate.isEveryone
+      ? (() => {
+        const everyoneIcon = document.createElement('span');
+        everyoneIcon.className = 'collab-mention-item-avatar collab-mention-item-avatar-everyone';
+        everyoneIcon.setAttribute('aria-hidden', 'true');
+        return everyoneIcon;
+      })()
+      : createCollabAvatarNode(candidate.name, candidate.color, 'collab-mention-item-avatar');
+    const label = document.createElement('span');
+    label.className = 'collab-mention-item-label';
+    label.textContent = candidate.name;
+
+    item.appendChild(avatar);
+    item.appendChild(label);
+
+    if (isLocalCandidate) {
+      const selfBadge = document.createElement('span');
+      selfBadge.className = 'collab-mention-item-self-badge';
+      selfBadge.textContent = 'YOU';
+      item.appendChild(selfBadge);
+    }
+
+    if (index === collabMentionState.selectedIndex) {
+      item.classList.add('is-selected');
+    }
+    item.addEventListener('mousedown', (event) => {
+      // Preserve textarea focus/caret and commit mention before focus shifts.
+      event.preventDefault();
+      collabMentionState.selectedIndex = index;
+      insertMentionAtIndex(collabMentionState.selectedIndex);
+    });
+    item.addEventListener('mouseenter', () => {
+      collabMentionState.selectedIndex = index;
+      const menuItems = collabMentionMenu ? collabMentionMenu.querySelectorAll('.collab-mention-item') : [];
+      for (let itemIndex = 0; itemIndex < menuItems.length; itemIndex += 1) {
+        const menuItem = menuItems[itemIndex];
+        const isSelected = itemIndex === index;
+        menuItem.classList.toggle('is-selected', isSelected);
+        menuItem.setAttribute('aria-selected', String(isSelected));
+      }
+    });
+    fragment.appendChild(item);
+  }
+
+  collabMentionMenu.appendChild(fragment);
+}
+
+function openMentionMenu() {
+  if (!collabMentionMenu) {
+    return;
+  }
+
+  collabMentionState.active = true;
+  collabMentionMenu.classList.remove('hidden');
+}
+
+function insertMentionAtIndex(candidateIndex) {
+  const candidate = collabMentionState.candidates[candidateIndex];
+  if (!candidate || !collabChatInput) {
+    return;
+  }
+
+  if (!isActiveCollabSession() || collabChatInput.disabled) {
+    closeMentionMenu();
+    return;
+  }
+
+  const value = String(collabChatInput.value || '');
+  const liveCursorIndex = Number.isFinite(collabChatInput.selectionStart) ? collabChatInput.selectionStart : value.length;
+  const cursorIndex = collabMentionState.active && Number.isFinite(collabMentionState.cursorIndex) && collabMentionState.cursorIndex >= 0
+    ? Math.min(collabMentionState.cursorIndex, value.length)
+    : liveCursorIndex;
+  const mentionStart = collabMentionState.startIndex;
+  const mentionValue = String(candidate.mentionValue || candidate.name || '').trim();
+  if (!mentionValue) {
+    return;
+  }
+  const shouldReplaceMention = collabMentionState.active && mentionStart >= 0 && mentionStart <= cursorIndex;
+  const nextValue = shouldReplaceMention
+    ? `${value.slice(0, mentionStart)}@${mentionValue} ${value.slice(cursorIndex)}`
+    : `${value.slice(0, cursorIndex)}@${mentionValue} ${value.slice(cursorIndex)}`;
+  const nextCursor = shouldReplaceMention
+    ? mentionStart + mentionValue.length + 2
+    : cursorIndex + mentionValue.length + 2;
+
+  collabChatInput.value = nextValue;
+  collabChatInput.setSelectionRange(nextCursor, nextCursor);
+  renderCollabChatInputMirror();
+  closeMentionMenu();
+  collabChatInput.focus();
+  updateMentionMenu();
+}
+
+function insertMentionIntoCollabChat(name) {
+  const cleanedName = String(name || '').trim();
+  if (!cleanedName || !collabChatInput) {
+    return;
+  }
+
+  if (!isActiveCollabSession() || collabChatInput.disabled) {
+    closeMentionMenu();
+    return;
+  }
+
+  const value = String(collabChatInput.value || '');
+  const selectionStart = Number.isFinite(collabChatInput.selectionStart) ? collabChatInput.selectionStart : value.length;
+  const selectionEnd = Number.isFinite(collabChatInput.selectionEnd) ? collabChatInput.selectionEnd : selectionStart;
+  const shouldReplaceMention = collabMentionState.active && collabMentionState.startIndex >= 0 && collabMentionState.startIndex <= selectionStart;
+
+  const nextValue = shouldReplaceMention
+    ? `${value.slice(0, collabMentionState.startIndex)}@${cleanedName} ${value.slice(selectionStart)}`
+    : `${value.slice(0, selectionStart)}@${cleanedName} ${value.slice(selectionEnd)}`;
+  const nextCursor = shouldReplaceMention
+    ? collabMentionState.startIndex + cleanedName.length + 2
+    : selectionStart + cleanedName.length + 2;
+
+  collabChatInput.value = nextValue;
+  collabChatInput.setSelectionRange(nextCursor, nextCursor);
+  renderCollabChatInputMirror();
+  collabChatInput.focus();
+  updateMentionMenu();
+}
+
+function openCollabChatWithMention(name) {
+  const cleanedName = String(name || '').trim();
+  if (!cleanedName) {
+    return;
+  }
+
+  setSidebarPanel('collaborate-chat');
+
+  if (!collabChatInput) {
+    return;
+  }
+
+  if (!isActiveCollabSession() || collabChatInput.disabled) {
+    return;
+  }
+
+  closeMentionMenu();
+  collabChatInput.focus();
+  const endIndex = String(collabChatInput.value || '').length;
+  collabChatInput.setSelectionRange(endIndex, endIndex);
+  insertMentionIntoCollabChat(cleanedName);
+}
+
+function createCollabMentionActionIcon(name, onActivate) {
+  const cleanedName = String(name || '').trim() || 'Collaborator';
+  const icon = document.createElement('span');
+  icon.className = 'collab-mention-action-icon';
+  icon.setAttribute('role', 'button');
+  icon.setAttribute('tabindex', '0');
+  icon.setAttribute('aria-label', `Mention ${cleanedName} in Collaborate Chat`);
+  icon.setAttribute('title', `Mention ${cleanedName} in Collaborate Chat`);
+
+  icon.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof onActivate === 'function') {
+      onActivate(event);
+    }
+  });
+
+  icon.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof onActivate === 'function') {
+      onActivate(event);
+    }
+  });
+
+  return icon;
+}
+
+function updateMentionMenu() {
+  if (!collabChatInput || !collabMentionMenu || !isActiveCollabSession()) {
+    closeMentionMenu();
+    return;
+  }
+
+  const context = getMentionContext(collabChatInput.value, collabChatInput.selectionStart);
+  if (!context) {
+    closeMentionMenu();
+    return;
+  }
+
+  const token = context.token.trim();
+  const availableNames = getMentionableCollaboratorEntries();
+  const normalizedToken = token.toLowerCase();
+  const candidates = availableNames.filter((entry) => {
+    const normalizedName = entry.name.toLowerCase();
+    return !normalizedToken || normalizedName.startsWith(normalizedToken);
+  });
+
+  if (!candidates.length) {
+    closeMentionMenu();
+    return;
+  }
+
+  collabMentionState.active = true;
+  collabMentionState.token = token;
+  collabMentionState.startIndex = context.startIndex;
+  collabMentionState.cursorIndex = Math.max(0, Math.min(Number(collabChatInput.selectionStart) || 0, String(collabChatInput.value || '').length));
+  collabMentionState.candidates = candidates;
+
+  if (collabMentionState.selectedIndex < 0 || collabMentionState.selectedIndex >= candidates.length) {
+    collabMentionState.selectedIndex = 0;
+  }
+
+  renderMentionMenu();
+  openMentionMenu();
+}
+
+function hasActiveMentionSelection() {
+  return Boolean(collabMentionState.active && collabMentionState.candidates.length && collabMentionState.selectedIndex >= 0);
+}
+
+function handleMentionMenuKeydown(event) {
+  if (!collabMentionState.active) {
+    return false;
+  }
+
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    const nextIndex = Math.min(collabMentionState.selectedIndex + 1, collabMentionState.candidates.length - 1);
+    collabMentionState.selectedIndex = nextIndex;
+    renderMentionMenu();
+    return true;
+  }
+
+  if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    const nextIndex = Math.max(collabMentionState.selectedIndex - 1, 0);
+    collabMentionState.selectedIndex = nextIndex;
+    renderMentionMenu();
+    return true;
+  }
+
+  if (event.key === 'Enter' || event.key === 'Tab') {
+    event.preventDefault();
+    if (collabMentionState.selectedIndex < 0) {
+      collabMentionState.selectedIndex = 0;
+    }
+    insertMentionAtIndex(collabMentionState.selectedIndex);
+    return true;
+  }
+
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeMentionMenu();
+    return true;
+  }
+
+  return false;
+}
+
+function appendCollabMentionRichText(container, text, options = {}) {
+  const value = String(text || '');
+  const mentionPattern = /@[A-Za-z0-9._-]+/g;
+  let lastIndex = 0;
+  let match;
+  const interactiveMentions = Boolean(options.interactiveMentions);
+  const onMentionClick = typeof options.onMentionClick === 'function' ? options.onMentionClick : null;
+  const mentionClassName = String(options.mentionClassName || 'collab-mention-text').trim() || 'collab-mention-text';
+  const plainTextClassName = String(options.plainTextClassName || '').trim();
+  const validateMention = typeof options.validateMention === 'function' ? options.validateMention : null;
+
+  const appendPlainText = (plainText) => {
+    if (!plainText) {
+      return;
+    }
+
+    if (!plainTextClassName) {
+      container.appendChild(document.createTextNode(plainText));
+      return;
+    }
+
+    const plainSpan = document.createElement('span');
+    plainSpan.className = plainTextClassName;
+    plainSpan.textContent = plainText;
+    container.appendChild(plainSpan);
+  };
+
+  while ((match = mentionPattern.exec(value)) !== null) {
+    if (match.index > lastIndex) {
+      appendPlainText(value.slice(lastIndex, match.index));
+    }
+
+    const mentionText = match[0];
+    if (validateMention && !validateMention(mentionText)) {
+      appendPlainText(mentionText);
+      lastIndex = match.index + match[0].length;
+      continue;
+    }
+
+    const mentionSpan = document.createElement('span');
+    mentionSpan.className = mentionClassName;
+    mentionSpan.textContent = mentionText;
+
+    if (interactiveMentions) {
+      mentionSpan.classList.add('is-clickable');
+      mentionSpan.setAttribute('role', 'button');
+      mentionSpan.setAttribute('tabindex', '0');
+      mentionSpan.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (onMentionClick) {
+          onMentionClick(mentionText);
+        }
+      });
+      mentionSpan.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (onMentionClick) {
+          onMentionClick(mentionText);
+        }
+      });
+    }
+
+    container.appendChild(mentionSpan);
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < value.length) {
+    appendPlainText(value.slice(lastIndex));
+  }
+}
+
+function renderCollabChatInputMirror() {
+  if (!collabChatInputMirror || !collabChatInput) {
+    return;
+  }
+
+  const value = String(collabChatInput.value || '');
+  collabChatInputMirror.innerHTML = '';
+
+  if (!value) {
+    collabChatInputMirror.scrollTop = 0;
+    collabChatInputMirror.scrollLeft = 0;
+    return;
+  }
+
+  const validMentions = getValidMentionValuesSet();
+
+  appendCollabMentionRichText(collabChatInputMirror, value, {
+    mentionClassName: 'collab-mention-text-input',
+    plainTextClassName: 'collab-chat-input-mirror-plain',
+    validateMention: (mentionText) => isValidMentionToken(mentionText, validMentions)
+  });
+  collabChatInputMirror.scrollTop = collabChatInput.scrollTop;
+  collabChatInputMirror.scrollLeft = collabChatInput.scrollLeft;
+}
+
+function syncCollabChatInputMirrorScroll() {
+  if (!collabChatInputMirror || !collabChatInput) {
+    return;
+  }
+
+  collabChatInputMirror.scrollTop = collabChatInput.scrollTop;
+  collabChatInputMirror.scrollLeft = collabChatInput.scrollLeft;
+}
+
+function renderCollabChatTranscript() {
+  if (!collabChatTranscript) {
+    return;
+  }
+
+  const shouldStickToBottom = collabChatTranscript.scrollHeight - collabChatTranscript.scrollTop - collabChatTranscript.clientHeight < 24;
+  collabChatTranscript.innerHTML = '';
+
+  if (!collabChatHistory.length) {
+    const emptyState = document.createElement('div');
+    emptyState.className = 'collab-chat-empty';
+    emptyState.textContent = 'Chat history will appear here.';
+    collabChatTranscript.appendChild(emptyState);
+  } else {
+    for (let index = 0; index < collabChatHistory.length; index += 1) {
+      const entry = collabChatHistory[index];
+      const previousEntry = index > 0 ? collabChatHistory[index - 1] : null;
+      const item = document.createElement('div');
+      item.className = `collab-chat-item collab-chat-item-${entry.kind}`;
+
+      const row = document.createElement('div');
+      row.className = 'collab-chat-row';
+
+      const shouldRenderAvatar = entry.kind === 'message'
+        && Boolean(entry.clientId)
+        && (!previousEntry || previousEntry.kind !== 'message' || previousEntry.clientId !== entry.clientId);
+
+      const shouldRenderAvatarSpacer = entry.kind === 'message' && !shouldRenderAvatar;
+
+      if (shouldRenderAvatar) {
+        const avatarName = String(entry.name || collabParticipantName || 'Collaborator');
+        const avatarColor = getCollabColorById(entry.clientId);
+        const avatar = createCollabAvatarNode(avatarName, avatarColor, 'collab-chat-avatar');
+        row.appendChild(avatar);
+      } else if (shouldRenderAvatarSpacer) {
+        const spacer = document.createElement('span');
+        spacer.className = 'collab-chat-avatar-spacer';
+        spacer.setAttribute('aria-hidden', 'true');
+        row.appendChild(spacer);
+      }
+
+      const meta = document.createElement('div');
+      meta.className = 'collab-chat-item-meta';
+
+      const isOwnMessage = entry.kind === 'message' && entry.clientId === collabClientId;
+      const isTargetedMention = entry.kind === 'message'
+        && messageTargetsLocalCollaborator(entry.text);
+
+      if (isTargetedMention) {
+        item.classList.add('collab-chat-item-mentioned');
+      }
+
+      const author = document.createElement('span');
+      author.className = 'collab-chat-item-author';
+      author.textContent = entry.kind === 'message'
+        ? String(entry.name || collabParticipantName || 'Collaborator')
+        : 'System';
+      meta.appendChild(author);
+
+      if (entry.kind === 'message' && entry.clientId) {
+        const badge = document.createElement('span');
+        badge.className = 'collab-chat-item-badge';
+        badge.textContent = isOwnMessage ? 'You' : 'Participant';
+        meta.appendChild(badge);
+      }
+
+      const message = document.createElement('div');
+      message.className = 'collab-chat-item-message';
+      const lockedMentionValues = new Set(
+        Array.isArray(entry.mentionValues)
+          ? entry.mentionValues.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
+          : []
+      );
+      appendCollabMentionRichText(message, entry.text, {
+        interactiveMentions: true,
+        validateMention: (mentionText) => {
+          const mentionValue = String(mentionText || '').slice(1).trim().toLowerCase();
+          return Boolean(mentionValue && lockedMentionValues.has(mentionValue));
+        },
+        onMentionClick: (mentionText) => {
+          if (!isActiveCollabSession() || collabChatInput.disabled) {
+            return;
+          }
+
+          insertMentionIntoCollabChat(mentionText.slice(1));
+        }
+      });
+
+      item.appendChild(meta);
+      item.appendChild(message);
+      row.appendChild(item);
+      collabChatTranscript.appendChild(row);
+    }
+  }
+
+  if (shouldStickToBottom) {
+    collabChatTranscript.scrollTop = collabChatTranscript.scrollHeight;
+  }
+}
+
+function addCollabChatEntry(entry) {
+  const validMentionValues = getValidMentionValuesSet();
+  const normalizedMentionValues = Array.isArray(entry && entry.mentionValues)
+    ? entry.mentionValues
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean)
+    : null;
+
+  const normalizedEntry = {
+    kind: entry && entry.kind === 'message' ? 'message' : 'system',
+    text: String(entry && entry.text ? entry.text : '').trim(),
+    clientId: entry && entry.clientId ? String(entry.clientId) : null,
+    name: entry && entry.name ? String(entry.name) : null,
+    at: Number(entry && entry.at) || Date.now(),
+    mentionValues: normalizedMentionValues || []
+  };
+
+  if (!normalizedEntry.text) {
+    return;
+  }
+
+  if (normalizedEntry.kind === 'message' && !normalizedMentionValues) {
+    normalizedEntry.mentionValues = getLockedMentionValuesForText(normalizedEntry.text, validMentionValues);
+  }
+
+  collabChatHistory.push(normalizedEntry);
+  while (collabChatHistory.length > 200) {
+    collabChatHistory.shift();
+  }
+
+  // Increment unread count for real messages if chat tab is not active
+  if (normalizedEntry.kind === 'message' && activeSidebarPanel !== 'collaborate-chat') {
+    collabChatUnreadCount++;
+    updateCollabChatBadge();
+  }
+
+  renderCollabChatTranscript();
+}
+
+function addCollabChatSystemMessage(text) {
+  addCollabChatEntry({
+    kind: 'system',
+    text
+  });
+}
+
+function updateCollabChatPanel() {
+  if (!collabChatNotice || !collabChatTranscript) {
+    return;
+  }
+
+  const isInSession = isActiveCollabSession();
+  collabChatNotice.classList.toggle('hidden', isInSession);
+  collabChatNoticeText.textContent = isInSession
+    ? ''
+    : 'Join a collaboration session to chat with participants.';
+  collabChatInput.disabled = !isInSession;
+  collabChatSendBtn.disabled = !isInSession;
+  renderCollabChatInputMirror();
+  if (!isInSession) {
+    closeMentionMenu();
+  }
+}
+
 function getCollabColorById(clientId) {
   const palette = ['#45d483', '#31baf2', '#f3b04f', '#ea6f6f', '#8f79ff', '#57d3bf', '#ff7a59', '#73d13d', '#36cfc9', '#597ef7'];
   const normalizedId = String(clientId || '').trim();
@@ -6758,6 +7530,12 @@ function showCollabQuickMenu() {
     }
 
     row.appendChild(textWrap);
+    const mentionIcon = createCollabMentionActionIcon(entry.name, () => {
+      closeCollabQuickMenu();
+      openCollabChatWithMention(entry.name || 'Collaborator');
+    });
+    row.appendChild(mentionIcon);
+
     if (!canJumpToCollaborator) {
       row.disabled = true;
       row.classList.add('is-disabled');
@@ -6897,8 +7675,22 @@ function renderCollabPresence() {
     const suffix = entry.currentFile ? ` - ${entry.currentFile}` : '';
     label.textContent = `${entry.name}${entry.clientId === collabClientId ? ' (you)' : ''}${suffix}`;
 
+    const showHostBadge = Boolean(entry.isHostClient || (entry.clientId === collabClientId && collabIsSessionHost));
+
     item.appendChild(avatar);
     item.appendChild(label);
+
+    if (showHostBadge) {
+      const hostBadge = document.createElement('span');
+      hostBadge.className = 'collab-presence-host-badge';
+      hostBadge.textContent = 'Host';
+      item.appendChild(hostBadge);
+    }
+
+    const mentionIcon = createCollabMentionActionIcon(entry.name, () => {
+      openCollabChatWithMention(entry.name || 'Collaborator');
+    });
+    item.appendChild(mentionIcon);
 
     const canKick = collabIsSessionHost && collabConnected && entry.clientId !== collabClientId;
     if (canKick) {
@@ -6939,11 +7731,38 @@ function updateCollabButtons() {
   collabCodeInput.disabled = collabConnected;
   collabNameInput.disabled = collabConnected;
   renderCollabQuickButton();
+  updateCollabChatPanel();
+}
+
+async function sendCollabChatMessage() {
+  if (!isActiveCollabSession()) {
+    return;
+  }
+
+  const message = String(collabChatInput.value || '').trim();
+  if (!message) {
+    return;
+  }
+
+  sendCollabPacket('chat:message', { message });
+  collabChatInput.value = '';
+  renderCollabChatInputMirror();
+  closeMentionMenu();
+}
+
+function sanitizeCollabDisplayName(name) {
+  return String(name || '').trim().replace(/\s+/g, '-');
 }
 
 function getRequestedCollabName() {
-  const inputName = String(collabNameInput.value || '').trim();
-  return inputName || collabParticipantName;
+  const rawInputName = String(collabNameInput.value || '');
+  const sanitizedInputName = sanitizeCollabDisplayName(rawInputName);
+  if (rawInputName.trim()) {
+    collabNameInput.value = sanitizedInputName;
+    return sanitizedInputName;
+  }
+
+  return sanitizeCollabDisplayName(collabParticipantName) || collabParticipantName;
 }
 
 function resetHttpPanelState() {
@@ -7266,10 +8085,12 @@ async function handleCollabPacket(packet) {
     collabPresenceById.set(packet.clientId, {
       clientId: packet.clientId,
       name: packet.name || 'Collaborator',
-      currentFile: null
+      currentFile: null,
+      isHostClient: Boolean(packet.isHostClient)
     });
     renderCollabPresence();
     addCollabActivity(`${packet.name || 'Collaborator'} joined`);
+    addCollabChatSystemMessage(`${packet.name || 'Collaborator'} joined the session`);
     return;
   }
 
@@ -7280,6 +8101,7 @@ async function handleCollabPacket(packet) {
     collabPresenceById.delete(packet.clientId);
     renderCollabPresence();
     addCollabActivity(`${packet.name || 'Collaborator'} left`);
+    addCollabChatSystemMessage(`${packet.name || 'Collaborator'} left the session`);
     return;
   }
 
@@ -7302,6 +8124,9 @@ async function handleCollabPacket(packet) {
       name: packet.name || 'Collaborator'
     };
     existing.currentFile = packet.currentFile || null;
+    if (typeof packet.isHostClient === 'boolean') {
+      existing.isHostClient = packet.isHostClient;
+    }
     collabPresenceById.set(packet.clientId, existing);
     const existingLocation = collabPeerLocations.get(packet.clientId);
     if (existingLocation) {
@@ -7314,6 +8139,23 @@ async function handleCollabPacket(packet) {
 
   if (packet.type === 'activity:add') {
     addCollabActivity(packet.message || 'Activity');
+    return;
+  }
+
+  if (packet.type === 'chat:message') {
+    const authorName = String(packet.name || 'Collaborator');
+    const text = String(packet.message || '').trim();
+    if (!text) {
+      return;
+    }
+
+    addCollabChatEntry({
+      kind: 'message',
+      text,
+      clientId: packet.clientId || null,
+      name: authorName,
+      at: packet.at || Date.now()
+    });
     return;
   }
 
@@ -7456,6 +8298,7 @@ function connectCollabSocket(serverUrl, code, name, mode) {
         collabMode = mode;
         collabParticipantName = String(joinResponse.name || collabParticipantName);
         collabNameInput.value = collabParticipantName;
+        closeMentionMenu();
         collabPresenceById.clear();
 
         const participants = Array.isArray(joinResponse.presence) ? joinResponse.presence : [];
@@ -7463,7 +8306,8 @@ function connectCollabSocket(serverUrl, code, name, mode) {
           collabPresenceById.set(peer.clientId, {
             clientId: peer.clientId,
             name: peer.name || 'Collaborator',
-            currentFile: peer.currentFile || null
+            currentFile: peer.currentFile || null,
+            isHostClient: Boolean(peer.isHostClient)
           });
         }
 
@@ -7485,6 +8329,7 @@ function connectCollabSocket(serverUrl, code, name, mode) {
         updateCollabButtons();
         setCollabInfo(`Connected - Code ${joinResponse.code}`);
         addCollabActivity(`Joined session ${joinResponse.code}`);
+        addCollabChatSystemMessage(`You joined session ${joinResponse.code}`);
 
         settled = true;
         resolve(joinResponse);
@@ -7512,6 +8357,7 @@ function connectCollabSocket(serverUrl, code, name, mode) {
       collabDisconnectNotice = '';
       collabSocket = null;
       clearCollabSessionState();
+      addCollabChatSystemMessage(disconnectNotice);
       if (wasRemoteSession) {
         teardownRemoteCollaborationWorkspace(disconnectNotice).catch((error) => {
           setCollabInfo(error && error.message ? error.message : 'Collaboration offline');
@@ -7549,6 +8395,7 @@ async function startCollaborationAsHost() {
 
   setCollabInfo(`Sharing on ${shareUrl} - Code ${info.code}`);
   addCollabActivity(`Sharing started. Code: ${info.code}`);
+  addCollabChatSystemMessage(`Sharing started. Code: ${info.code}`);
 }
 
 async function joinCollaborationAsClient() {
@@ -7577,8 +8424,10 @@ async function joinCollaborationAsClient() {
 async function stopCollaborationSession() {
   const wasRemoteSession = collabMode === 'remote';
   const wasHostSession = collabMode === 'host';
-  const stopNotice = collabDisconnectNotice || 'Collaboration offline';
-  collabDisconnectNotice = '';
+  collabDisconnectNotice = wasHostSession
+    ? 'You stopped sharing the session.'
+    : 'You disconnected from the session.';
+  const stopNotice = collabDisconnectNotice;
 
   if (collabSocket) {
     try {
@@ -8074,6 +8923,10 @@ sidebarTabCollaborate.addEventListener('click', () => {
   setSidebarPanel('collaborate');
 });
 
+sidebarTabCollaborateChat.addEventListener('click', () => {
+  setSidebarPanel('collaborate-chat');
+});
+
 sidebarTabHttp.addEventListener('click', () => {
   setSidebarPanel('http');
 });
@@ -8401,7 +9254,13 @@ collabJoinBtn.addEventListener('click', async () => {
   try {
     await joinCollaborationAsClient();
   } catch (error) {
-    alert(error.message || String(error));
+    await showConfirmDialog({
+      title: 'Collaboration Error',
+      message: error && error.message ? error.message : String(error),
+      buttons: [
+        { label: 'Close', value: true, style: 'primary' }
+      ]
+    });
   }
 });
 
@@ -8413,9 +9272,61 @@ collabStopBtn.addEventListener('click', async () => {
   }
 });
 
+collabChatGoToCollaborateBtn.addEventListener('click', () => {
+  setSidebarPanel('collaborate');
+});
+
+collabChatSendBtn.addEventListener('click', async () => {
+  try {
+    await sendCollabChatMessage();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
+collabChatInput.addEventListener('input', () => {
+  updateMentionMenu();
+  renderCollabChatInputMirror();
+});
+
+collabChatInput.addEventListener('click', () => {
+  updateMentionMenu();
+  renderCollabChatInputMirror();
+});
+
+collabChatInput.addEventListener('mouseup', () => {
+  updateMentionMenu();
+  renderCollabChatInputMirror();
+});
+
+collabChatInput.addEventListener('scroll', () => {
+  syncCollabChatInputMirrorScroll();
+});
+
+collabChatInput.addEventListener('keydown', async (event) => {
+  if (handleMentionMenuKeydown(event)) {
+    return;
+  }
+
+  if (event.key !== 'Enter' || event.shiftKey) {
+    return;
+  }
+
+  event.preventDefault();
+  try {
+    await sendCollabChatMessage();
+  } catch (error) {
+    alert(error.message || String(error));
+  }
+});
+
 document.addEventListener('click', (event) => {
   if (!terminalActions.contains(event.target)) {
     closeTerminalTypeMenu();
+  }
+
+  if (collabMentionWrap && !collabMentionWrap.contains(event.target)) {
+    closeMentionMenu();
   }
 });
 

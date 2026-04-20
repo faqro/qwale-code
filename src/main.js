@@ -15,18 +15,21 @@ if (require('electron-squirrel-startup')) { //prevent duplicate startups from el
   app.quit();
 }
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
-if (!gotSingleInstanceLock) {
-  app.quit();
-}
-
-app.on('second-instance', () => {
-  const targetWindow = getTargetWindow() || createWindow();
-  if (targetWindow.isMinimized()) {
-    targetWindow.restore();
+const enforceSingleInstance = app.isPackaged;
+if (enforceSingleInstance) {
+  const gotSingleInstanceLock = app.requestSingleInstanceLock();
+  if (!gotSingleInstanceLock) {
+    app.quit();
   }
-  targetWindow.focus();
-});
+
+  app.on('second-instance', () => {
+    const targetWindow = getTargetWindow() || createWindow();
+    if (targetWindow.isMinimized()) {
+      targetWindow.restore();
+    }
+    targetWindow.focus();
+  });
+}
 
 let mainWindow = null;
 const terminals = new Map();

@@ -8,7 +8,7 @@ QwaleCode is an Electron-based desktop IDE focused on a compact, VS Code-style w
 
 The application is organized into three main areas:
 
-- Explorer/Source Control/Collaborate on the left 📁🎛️
+- Explorer/Source Control/Collaborate/Collaborate Chat on the left 📁🎛️
 - Code editor in the center ✍️
 - AI Code panel on the right 🤖
 
@@ -23,6 +23,7 @@ It also includes a bottom terminal panel with multiple terminal sessions, file s
 - Save, Save As, and Save All support
 - Integrated terminal with multiple sessions
 - Git source control panel with commit, push, fetch, pull, branch switching, and branch creation
+- Collaborative chat with session join/leave notices and a chat-only tab for active collaboration sessions
 - AI Code panel for coding assistance, file edits, and command execution
 - Light and dark themes
 - Recent project history
@@ -82,6 +83,12 @@ npm start
 - Switch to the Version Control panel using the left sidebar icon
 - Initialize a Git repository if the folder is not already one
 - Commit changes, push, fetch, pull, and switch branches
+
+### Collaborate Chat
+
+- Open the Collaborate Chat panel from the left sidebar under Collaborate
+- Chat messages can only be sent while you are in an active collaboration session
+- Join and leave notices, plus disconnect messages, stay visible in the chat transcript until the window is closed
 
 ### AI Code panel
 
