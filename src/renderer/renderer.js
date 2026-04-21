@@ -7307,6 +7307,7 @@ function handleMentionMenuKeydown(event) {
     const nextIndex = Math.min(collabMentionState.selectedIndex + 1, collabMentionState.candidates.length - 1);
     collabMentionState.selectedIndex = nextIndex;
     renderMentionMenu();
+    collabMentionMenu?.querySelector('.collab-mention-item.is-selected')?.scrollIntoView({ block: 'nearest' });
     return true;
   }
 
@@ -7315,6 +7316,7 @@ function handleMentionMenuKeydown(event) {
     const nextIndex = Math.max(collabMentionState.selectedIndex - 1, 0);
     collabMentionState.selectedIndex = nextIndex;
     renderMentionMenu();
+    collabMentionMenu?.querySelector('.collab-mention-item.is-selected')?.scrollIntoView({ block: 'nearest' });
     return true;
   }
 
@@ -9141,6 +9143,7 @@ async function applyOpenedProject(opened) {
   renderTabs();
 
   project = opened;
+  updateSaveMenuItemsState();
   projectInfo.textContent = `${project.rootName}  |  ${project.rootPath}`;
   expandedFolders.clear();
   expandedFolders.add(project.rootPath);
@@ -10047,7 +10050,7 @@ window.addEventListener('beforeunload', (event) => {
 });
 
 Promise.all([refreshProjectTree(), initMonacoEditor(), refreshRecentProjectsCache()])
-  .then(() => {
+  .then(async () => {
     updateHttpBodyState();
     applyTheme(localStorage.getItem('qwale-theme') || 'dark');
     const savedAiPanelState = localStorage.getItem('ai-panel-open');
@@ -10055,6 +10058,10 @@ Promise.all([refreshProjectTree(), initMonacoEditor(), refreshRecentProjectsCach
     setAiAuthState();
     updateWorkspaceColumns();
     renderMenuBar();
+    const initialProject = await api.getInitialProject();
+    if (initialProject) {
+      await applyOpenedProject(initialProject);
+    }
     return initTerminalSystem();
   })
   .catch((error) => {

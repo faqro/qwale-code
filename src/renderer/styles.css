@@ -2163,6 +2163,7 @@ body {
 .collab-presence-list,
 .collab-chat-transcript,
 .collab-activity-list,
+.collab-mention-menu,
 .terminal-container .xterm-viewport {
   scrollbar-width: thin;
   scrollbar-color: #3a5f86 #0f2032;
@@ -2177,6 +2178,7 @@ body {
 .collab-presence-list::-webkit-scrollbar,
 .collab-chat-transcript::-webkit-scrollbar,
 .collab-activity-list::-webkit-scrollbar,
+.collab-mention-menu::-webkit-scrollbar,
 .terminal-container .xterm-viewport::-webkit-scrollbar {
   width: 12px;
   height: 12px;
@@ -2191,6 +2193,7 @@ body {
 .collab-presence-list::-webkit-scrollbar-track,
 .collab-chat-transcript::-webkit-scrollbar-track,
 .collab-activity-list::-webkit-scrollbar-track,
+.collab-mention-menu::-webkit-scrollbar-track,
 .terminal-container .xterm-viewport::-webkit-scrollbar-track {
   background: #0f2032;
 }
@@ -2204,6 +2207,7 @@ body {
 .collab-presence-list::-webkit-scrollbar-thumb,
 .collab-chat-transcript::-webkit-scrollbar-thumb,
 .collab-activity-list::-webkit-scrollbar-thumb,
+.collab-mention-menu::-webkit-scrollbar-thumb,
 .terminal-container .xterm-viewport::-webkit-scrollbar-thumb {
   background: #3a5f86;
   border: 2px solid #0f2032;
@@ -2219,6 +2223,7 @@ body {
 .collab-presence-list::-webkit-scrollbar-thumb:hover,
 .collab-chat-transcript::-webkit-scrollbar-thumb:hover,
 .collab-activity-list::-webkit-scrollbar-thumb:hover,
+.collab-mention-menu::-webkit-scrollbar-thumb:hover,
 .terminal-container .xterm-viewport::-webkit-scrollbar-thumb:hover {
   background: #45d483;
 }
@@ -2232,6 +2237,7 @@ body {
 .collab-presence-list::-webkit-scrollbar-corner,
 .collab-chat-transcript::-webkit-scrollbar-corner,
 .collab-activity-list::-webkit-scrollbar-corner,
+.collab-mention-menu::-webkit-scrollbar-corner,
 .terminal-container .xterm-viewport::-webkit-scrollbar-corner {
   background: #0f2032;
 }
@@ -4285,6 +4291,7 @@ body.light-theme .scm-graph,
 body.light-theme .ai-messages,
 body.light-theme .image-preview,
 body.light-theme .collab-chat-transcript,
+body.light-theme .collab-mention-menu,
 body.light-theme .terminal-container .xterm-viewport {
   scrollbar-color: #8b83ff #edf1ff;
 }
@@ -4295,6 +4302,7 @@ body.light-theme .scm-graph::-webkit-scrollbar-track,
 body.light-theme .ai-messages::-webkit-scrollbar-track,
 body.light-theme .image-preview::-webkit-scrollbar-track,
 body.light-theme .collab-chat-transcript::-webkit-scrollbar-track,
+body.light-theme .collab-mention-menu::-webkit-scrollbar-track,
 body.light-theme .terminal-container .xterm-viewport::-webkit-scrollbar-track {
   background: #edf1ff;
 }
@@ -4305,6 +4313,7 @@ body.light-theme .scm-graph::-webkit-scrollbar-thumb,
 body.light-theme .ai-messages::-webkit-scrollbar-thumb,
 body.light-theme .image-preview::-webkit-scrollbar-thumb,
 body.light-theme .collab-chat-transcript::-webkit-scrollbar-thumb,
+body.light-theme .collab-mention-menu::-webkit-scrollbar-thumb,
 body.light-theme .terminal-container .xterm-viewport::-webkit-scrollbar-thumb {
   background: #8b83ff;
   border-color: #edf1ff;
@@ -4316,6 +4325,7 @@ body.light-theme .scm-graph::-webkit-scrollbar-thumb:hover,
 body.light-theme .ai-messages::-webkit-scrollbar-thumb:hover,
 body.light-theme .image-preview::-webkit-scrollbar-thumb:hover,
 body.light-theme .collab-chat-transcript::-webkit-scrollbar-thumb:hover,
+body.light-theme .collab-mention-menu::-webkit-scrollbar-thumb:hover,
 body.light-theme .terminal-container .xterm-viewport::-webkit-scrollbar-thumb:hover {
   background: #6f67ff;
 }
