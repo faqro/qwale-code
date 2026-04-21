@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   openProject: () => ipcRenderer.invoke('project:open'),
   openProjectByPath: (folderPath) => ipcRenderer.invoke('project:openPath', folderPath),
   getRecentProjects: () => ipcRenderer.invoke('project:getRecent'),
+  getInitialProject: () => ipcRenderer.invoke('project:getInitial'),
   closeProject: () => ipcRenderer.invoke('project:close'),
   clearRecentProjects: () => ipcRenderer.invoke('project:clearRecent'),
   refreshProject: () => ipcRenderer.invoke('project:refresh'),

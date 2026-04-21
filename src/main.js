@@ -15,23 +15,27 @@ if (require('electron-squirrel-startup')) { //prevent duplicate startups from el
   app.quit();
 }
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
-if (!gotSingleInstanceLock) {
-  app.quit();
-}
-
-app.on('second-instance', () => {
-  const targetWindow = getTargetWindow() || createWindow();
-  if (targetWindow.isMinimized()) {
-    targetWindow.restore();
+const enforceSingleInstance = app.isPackaged;
+if (enforceSingleInstance) {
+  const gotSingleInstanceLock = app.requestSingleInstanceLock();
+  if (!gotSingleInstanceLock) {
+    app.quit();
   }
-  targetWindow.focus();
-});
+
+  app.on('second-instance', () => {
+    const targetWindow = getTargetWindow() || createWindow();
+    if (targetWindow.isMinimized()) {
+      targetWindow.restore();
+    }
+    targetWindow.focus();
+  });
+}
 
 let mainWindow = null;
 const terminals = new Map();
 let recentProjects = [];
 const windowProjectState = new Map();
+const windowInitialProject = new Map();
 const projectWatchers = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
 let collaborationHostServer = null;
@@ -846,6 +850,12 @@ ipcMain.handle('project:open', async (event) => {
   const selectedProjectPath = path.resolve(result.filePaths[0]);
   await rememberRecentProject(selectedProjectPath);
 
+  if (windowProjectState.get(event.sender.id)) {
+    const newWindow = createWindow();
+    windowInitialProject.set(newWindow.webContents.id, selectedProjectPath);
+    return { openedInNewWindow: true };
+  }
+
   windowProjectState.set(event.sender.id, selectedProjectPath);
   startProjectWatcherForWebContents(event.sender.id, selectedProjectPath);
   const matcher = await createGitignoreMatcher(selectedProjectPath);
@@ -876,6 +886,12 @@ ipcMain.handle('project:openPath', async (event, folderPath) => {
 
   await rememberRecentProject(resolved);
 
+  if (windowProjectState.get(event.sender.id)) {
+    const newWindow = createWindow();
+    windowInitialProject.set(newWindow.webContents.id, resolved);
+    return { openedInNewWindow: true };
+  }
+
   windowProjectState.set(event.sender.id, resolved);
   startProjectWatcherForWebContents(event.sender.id, resolved);
   const matcher = await createGitignoreMatcher(resolved);
@@ -895,6 +911,30 @@ ipcMain.handle('project:openPath', async (event, folderPath) => {
 
 ipcMain.handle('project:getRecent', async () => {
   return recentProjects;
+});
+
+ipcMain.handle('project:getInitial', async (event) => {
+  const initialPath = windowInitialProject.get(event.sender.id);
+  if (!initialPath) {
+    return null;
+  }
+  windowInitialProject.delete(event.sender.id);
+
+  windowProjectState.set(event.sender.id, initialPath);
+  startProjectWatcherForWebContents(event.sender.id, initialPath);
+  const matcher = await createGitignoreMatcher(initialPath);
+  const [tree, searchableFiles] = await Promise.all([
+    buildTree(initialPath, initialPath, matcher, false),
+    buildSearchableFiles(initialPath, initialPath, matcher)
+  ]);
+
+  return {
+    canceled: false,
+    rootPath: initialPath,
+    rootName: path.basename(initialPath),
+    tree,
+    searchableFiles
+  };
 });
 
 ipcMain.handle('project:close', async (event) => {

@@ -28,6 +28,10 @@
           <button id="sidebarTabCollaborate" class="explorer-side-tab" type="button" title="Collaborate" aria-label="Collaborate">
             <span class="explorer-side-icon explorer-side-icon-collaborate" aria-hidden="true"></span>
           </button>
+          <button id="sidebarTabCollaborateChat" class="explorer-side-tab" type="button" title="Collaborate Chat" aria-label="Collaborate Chat">
+            <span class="explorer-side-icon explorer-side-icon-chat" aria-hidden="true"></span>
+            <span id="collabChatTabBadge" class="collab-chat-tab-badge hidden" aria-hidden="true"></span>
+          </button>
           <button id="sidebarTabHttp" class="explorer-side-tab" type="button" title="HTTP" aria-label="HTTP">
             <span class="explorer-side-icon explorer-side-icon-http" aria-hidden="true"></span>
           </button>
@@ -186,6 +190,28 @@
             <div class="collab-activity-wrap">
               <div class="collab-subtitle">Activity</div>
               <div id="collabActivityList" class="collab-activity-list"></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="collaborateChatPanelView" class="explorer-panel-view">
+          <div class="panel-title">Collaborate Chat</div>
+          <div class="collab-chat-panel">
+            <div id="collabChatNotice" class="collab-chat-notice">
+              <div id="collabChatNoticeText" class="collab-chat-notice-text">Join a collaboration session to chat with participants.</div>
+              <button id="collabChatGoToCollaborateBtn" class="collab-btn collab-chat-cta" type="button">Open Collaborate</button>
+            </div>
+            <div id="collabChatTranscript" class="collab-chat-transcript" aria-live="polite"></div>
+            <div class="collab-chat-composer">
+              <div id="collabMentionWrap" class="collab-mention-wrap">
+                <div id="collabChatInputMirror" class="collab-chat-input-mirror" aria-hidden="true"></div>
+                <textarea id="collabChatInput" class="collab-chat-input" rows="3" maxlength="500" placeholder="Type a chat message"></textarea>
+                <div id="collabMentionMenu" class="collab-mention-menu hidden" role="listbox" aria-label="Mention suggestions"></div>
+              </div>
+              <div class="collab-chat-actions">
+                <span id="collabChatHint" class="collab-chat-hint">Enter to send, Shift+Enter for a new line.</span>
+                <button id="collabChatSendBtn" class="collab-btn collab-chat-send-btn" type="button">Send</button>
+              </div>
             </div>
           </div>
         </div>
