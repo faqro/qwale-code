@@ -1,40 +1,34 @@
-# QwaleCode 🚀 💻
+# QwaleCode 🚀 💻 🤖 🧑‍🤝‍🧑
 
-Lightweight coding IDE built by Faraaz Jan.
+QwaleCode is a lightweight Electron-based IDE focused on providing a simple workflow for collaborating with people on projects, while integrating agentic AI features.
 
-QwaleCode is an Electron-based desktop IDE focused on a compact, VS Code-style workflow. It combines a project explorer, Monaco code editor, integrated terminal, source control tools, and an AI coding panel into a single app.
+QwaleCode builds on the Monaco code viewer, adding collaboration and AI features that turn it from a simple code editor into a powerful tool for managing complex workflows.
 
-## Overview
+## Collaborate 🤝
 
-The application is organized into three main areas:
+Add your colleagues, peers, or friends to your workspace to make collaborating on projects easier than ever - no Git required!
 
-- Explorer/Source Control/Collaborate/Collaborate Chat on the left 📁🎛️
-- Code editor in the center ✍️
-- AI Code panel on the right 🤖
+<img width="1360" height="816" alt="Collaborate" src="https://github.com/user-attachments/assets/254f05ce-3b8d-4637-a131-26c07db0fdaf" />
 
-It also includes a bottom terminal panel with multiple terminal sessions, file search, recent projects, theming, and menu-driven file/edit/window actions.
+## AI Code 🤖
 
-## Features
+Use agentic AI to help you build your projects, find bugs in your code, and provide program suggestions!*
 
-- Open and manage local folders as projects
-- Browse files and folders in a project explorer
-- Create, rename, move, copy, paste, and delete files and folders
-- Open files in tabs with Monaco syntax highlighting
-- Save, Save As, and Save All support
-- Integrated terminal with multiple sessions
-- Git source control panel with commit, push, fetch, pull, branch switching, and branch creation
-- Collaborative chat with session join/leave notices and a chat-only tab for active collaboration sessions
-- AI Code panel for coding assistance, file edits, and command execution
-- Light and dark themes
-- Recent project history
-- Search files by name
-- More coming soon
+<sub><sup>*Requires OpenAI API Key</sup></sub>
 
-## Requirements
+<img width="1360" height="816" alt="AI Code" src="https://github.com/user-attachments/assets/8b190312-213c-4976-8ed6-c1a056f58d0d" />
 
-- Windows, macOS, or Linux
-- Node.js installed locally
-- Git installed locally if you want to use Source Control features
+## Run/Debug Workflows 👷
+
+Define custom run/debug workflows, making testing, building, and production workflows faster than ever - easier to setup than Makefiles and npm scripts!
+
+<img width="1360" height="816" alt="Run Workflow" src="https://github.com/user-attachments/assets/276efcd4-3433-470c-828c-82d603669742" />
+
+## Git Integration ℹ️
+
+Pull/push, manage branches, and more for your repo, all from the comfort of your IDE!
+
+<img width="1360" height="816" alt="Git Feature" src="https://github.com/user-attachments/assets/88a0e603-1265-4ad2-8f3c-aa3fa95ab413" />
 
 ## Setup
 
@@ -51,105 +45,17 @@ npm install
 npm start
 ```
 
-## Usage
 
-### Opening a project
-
-- Use `File > Open Folder`
-- Or press `Ctrl+O`
-
-### Working with files
-
-- Single-click a file to preview it
-- Double-click a file to keep it open permanently
-- Use the tab close buttons to close files
-- Use `Ctrl+S` to save the current file
-- Use `Ctrl+Shift+S` to save as
-- Use `Ctrl+Alt+S` to save all open files
-
-### Explorer actions
-
-- Right-click files and folders for create, rename, copy, cut, paste, and delete actions
-- Use inline rename/create fields when prompted
-
-### Terminal
-
-- The terminal panel is docked at the bottom of the window
-- Use the `+` button to open new sessions
-- Use the terminal dropdown to choose different shell profiles when available
-
-### Source Control
-
-- Switch to the Version Control panel using the left sidebar icon
-- Initialize a Git repository if the folder is not already one
-- Commit changes, push, fetch, pull, and switch branches
-
-### Collaborate Chat
-
-- Open the Collaborate Chat panel from the left sidebar under Collaborate
-- Chat messages can only be sent while you are in an active collaboration session
-- Join and leave notices, plus disconnect messages, stay visible in the chat transcript until the window is closed
-
-### AI Code panel
-
-- The AI panel is available on the right side of the editor
-- Enter an OpenAI API key to use it
-- The AI can read and edit project files and run commands through built-in tool actions
-- User messages can be revisited with the rewind button beside each prompt
-
-## Keyboard Shortcuts
-
-- `Ctrl+O` - Open folder
-- `Ctrl+S` - Save file
-- `Ctrl+Shift+S` - Save file as
-- `Ctrl+Alt+S` - Save all files
-- `Ctrl+Shift+W` - Close folder
-- `Ctrl+Alt+L` - Toggle theme
-- `Ctrl+F` - Find in editor
-- `Ctrl+H` - Find and replace
-
-## Project Structure
-
-- `src/main.js` - Electron main process, windows, menus, file system, Git, terminal, and AI command handlers
-- `src/preload.js` - Secure renderer API bridge
-- `src/renderer/renderer.js` - UI behavior, editor orchestration, terminal handling, Git UI, and AI chat logic
-- `src/renderer/styles.css` - App styling and theme rules
-- `src/renderer/index.html` - UI layout
-
-## Scripts
-
-- `npm start` - Launch QwaleCode in Electron
-- `npm run make` - Build distributables with Electron Forge
-- `npm run publish -- --platform win32` - Publish Windows release assets to GitHub Releases
-
-## Releases and Auto Updates
-
-QwaleCode can publish Squirrel.Windows releases directly to GitHub and auto-update packaged installs through `update.electronjs.org`.
-
-### Release workflow
-
-- Workflow file: `.github/workflows/release-windows.yml`
-- Trigger: push a tag matching `v*` (example: `v1.1.1`)
-- Publish target: GitHub Releases for `faqro/qwale-code`
-- Auth: uses `GITHUB_TOKEN` with `contents: write`
-
-Release command used in CI:
+4. or, Build the app:
 
 ```bash
-npm run publish -- --platform win32
+npm build
 ```
 
 ### Auto-update behavior
 
 - The app uses `update-electron-app` with `update.electronjs.org` as the update source.
 - Update checks are initialized only when the app is packaged (`app.isPackaged === true`).
-- Development runs (`npm start` / `npm run dev`) do not run updater initialization.
-
-## Notes
-
-- The app uses local storage for some UI preferences and the OpenAI API key.
-- The AI panel starts visible by default in the current configuration, but it is not persisted across launches.
-- If the app cannot open a terminal shell, make sure the requested shell profile is installed and available on your system.
 
 ## License
 
