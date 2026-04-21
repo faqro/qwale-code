@@ -215,6 +215,7 @@ let collabChatUnreadCount = 0;
 let collabMentionState = {
   active: false,
   token: '',
+  trigger: '',
   startIndex: -1,
   cursorIndex: -1,
   selectedIndex: -1,
@@ -6436,6 +6437,17 @@ function buildTreeNode(node) {
     dirtyDot.title = 'Unsaved changes';
     row.appendChild(dirtyDot);
   }
+  const shareBtn = document.createElement('button');
+  shareBtn.type = 'button';
+  shareBtn.className = 'tree-share-btn';
+  shareBtn.title = 'Share in chat';
+  shareBtn.setAttribute('aria-label', 'Share in chat');
+  shareBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    event.preventDefault();
+    shareFileToCollabChat(node.path);
+  });
+  row.appendChild(shareBtn);
   return item;
 }
 
@@ -6931,31 +6943,71 @@ function getMentionContext(text, cursorIndex) {
   const safeCursorIndex = Math.max(0, Math.min(Number(cursorIndex) || 0, value.length));
   const textBeforeCursor = value.slice(0, safeCursorIndex);
   const atIndex = textBeforeCursor.lastIndexOf('@');
-  if (atIndex < 0) {
+  const hashIndex = textBeforeCursor.lastIndexOf('#');
+  const triggerIndex = Math.max(atIndex, hashIndex);
+  if (triggerIndex < 0) {
     return null;
   }
 
-  if (atIndex > 0) {
-    const charBeforeAt = textBeforeCursor.charAt(atIndex - 1);
-    if (/[A-Za-z0-9._-]/.test(charBeforeAt)) {
+  const trigger = textBeforeCursor.charAt(triggerIndex);
+
+  if (triggerIndex > 0) {
+    const charBeforeTrigger = textBeforeCursor.charAt(triggerIndex - 1);
+    if (/[A-Za-z0-9._/\-]/.test(charBeforeTrigger)) {
       return null;
     }
   }
 
-  const token = textBeforeCursor.slice(atIndex + 1);
+  const token = textBeforeCursor.slice(triggerIndex + 1);
   if (/\s/.test(token)) {
     return null;
   }
 
   return {
-    startIndex: atIndex,
-    token
+    startIndex: triggerIndex,
+    token,
+    trigger
   };
+}
+
+function getFileMentionMenuCandidates(token) {
+  const normalizedToken = String(token || '').toLowerCase().trim();
+  const pathToken = normalizedToken.split(':')[0].trim();
+  const entries = Array.isArray(fileSearchIndex) ? fileSearchIndex : [];
+  const matches = entries
+    .map((entry) => {
+      const normalizedRelative = normalizeExplorerPath(entry.relativePath).replace(/^\/+/, '');
+      return {
+        kind: 'file',
+        name: normalizedRelative,
+        mentionValue: normalizedRelative,
+        color: '#6aa7ff'
+      };
+    })
+    .filter((candidate, index) => {
+      const entry = entries[index] || {};
+      const relativePath = String(entry.relativePath || '').toLowerCase();
+      const name = String(entry.name || '').toLowerCase();
+      return !pathToken || relativePath.includes(pathToken) || name.includes(pathToken);
+    })
+    .sort((left, right) => left.name.localeCompare(right.name));
+
+  if (getHereFileMentionReplacement()) {
+    matches.unshift({
+      kind: 'here',
+      name: '#here',
+      mentionValue: 'here',
+      isHere: true
+    });
+  }
+
+  return matches.slice(0, 60);
 }
 
 function closeMentionMenu() {
   collabMentionState.active = false;
   collabMentionState.token = '';
+  collabMentionState.trigger = '';
   collabMentionState.startIndex = -1;
   collabMentionState.cursorIndex = -1;
   collabMentionState.selectedIndex = -1;
@@ -6989,7 +7041,21 @@ function renderMentionMenu() {
         everyoneIcon.setAttribute('aria-hidden', 'true');
         return everyoneIcon;
       })()
-      : createCollabAvatarNode(candidate.name, candidate.color, 'collab-mention-item-avatar');
+      : candidate.isHere
+        ? (() => {
+          const hereIcon = document.createElement('span');
+          hereIcon.className = 'collab-mention-item-avatar collab-mention-item-avatar-here';
+          hereIcon.setAttribute('aria-hidden', 'true');
+          return hereIcon;
+        })()
+        : candidate.kind === 'file'
+          ? (() => {
+            const fileIcon = document.createElement('span');
+            fileIcon.className = `collab-mention-item-avatar file-type-icon ${getFileTypeIconClass(candidate.mentionValue || candidate.name || 'file.txt')}`;
+            fileIcon.setAttribute('aria-hidden', 'true');
+            return fileIcon;
+          })()
+          : createCollabAvatarNode(candidate.name, candidate.color, 'collab-mention-item-avatar');
     const label = document.createElement('span');
     label.className = 'collab-mention-item-label';
     label.textContent = candidate.name;
@@ -6997,7 +7063,7 @@ function renderMentionMenu() {
     item.appendChild(avatar);
     item.appendChild(label);
 
-    if (isLocalCandidate) {
+    if (isLocalCandidate && candidate.kind !== 'file' && !candidate.isHere) {
       const selfBadge = document.createElement('span');
       selfBadge.className = 'collab-mention-item-self-badge';
       selfBadge.textContent = 'YOU';
@@ -7056,13 +7122,14 @@ function insertMentionAtIndex(candidateIndex) {
     : liveCursorIndex;
   const mentionStart = collabMentionState.startIndex;
   const mentionValue = String(candidate.mentionValue || candidate.name || '').trim();
+  const mentionPrefix = collabMentionState.trigger === '#' ? '#' : '@';
   if (!mentionValue) {
     return;
   }
   const shouldReplaceMention = collabMentionState.active && mentionStart >= 0 && mentionStart <= cursorIndex;
   const nextValue = shouldReplaceMention
-    ? `${value.slice(0, mentionStart)}@${mentionValue} ${value.slice(cursorIndex)}`
-    : `${value.slice(0, cursorIndex)}@${mentionValue} ${value.slice(cursorIndex)}`;
+    ? `${value.slice(0, mentionStart)}${mentionPrefix}${mentionValue} ${value.slice(cursorIndex)}`
+    : `${value.slice(0, cursorIndex)}${mentionPrefix}${mentionValue} ${value.slice(cursorIndex)}`;
   const nextCursor = shouldReplaceMention
     ? mentionStart + mentionValue.length + 2
     : cursorIndex + mentionValue.length + 2;
@@ -7100,6 +7167,24 @@ function insertMentionIntoCollabChat(name) {
 
   collabChatInput.value = nextValue;
   collabChatInput.setSelectionRange(nextCursor, nextCursor);
+  renderCollabChatInputMirror();
+  collabChatInput.focus();
+  updateMentionMenu();
+}
+
+function shareFileToCollabChat(filePath) {
+  const relativePath = getRelativeProjectPath(filePath);
+  const mentionValue = normalizeExplorerPath(relativePath).replace(/^\/+/, '');
+  setSidebarPanel('collaborate-chat');
+  if (!collabChatInput || !isActiveCollabSession() || collabChatInput.disabled) {
+    return;
+  }
+  closeMentionMenu();
+  const value = String(collabChatInput.value || '');
+  const prefix = value.length > 0 && !value.endsWith(' ') ? ' ' : '';
+  const nextValue = `${value}${prefix}#${mentionValue} `;
+  collabChatInput.value = nextValue;
+  collabChatInput.setSelectionRange(nextValue.length, nextValue.length);
   renderCollabChatInputMirror();
   collabChatInput.focus();
   updateMentionMenu();
@@ -7173,25 +7258,34 @@ function updateMentionMenu() {
   }
 
   const token = context.token.trim();
-  const availableNames = getMentionableCollaboratorEntries();
-  const normalizedToken = token.toLowerCase();
-  const candidates = availableNames.filter((entry) => {
-    const normalizedName = entry.name.toLowerCase();
-    return !normalizedToken || normalizedName.startsWith(normalizedToken);
-  });
+  let candidates = [];
+
+  if (context.trigger === '@') {
+    const availableNames = getMentionableCollaboratorEntries();
+    const normalizedToken = token.toLowerCase();
+    candidates = availableNames.filter((entry) => {
+      const normalizedName = entry.name.toLowerCase();
+      return !normalizedToken || normalizedName.startsWith(normalizedToken);
+    });
+  } else if (context.trigger === '#') {
+    candidates = getFileMentionMenuCandidates(token);
+  }
 
   if (!candidates.length) {
     closeMentionMenu();
     return;
   }
 
+  const triggerChanged = collabMentionState.trigger !== context.trigger;
+
   collabMentionState.active = true;
   collabMentionState.token = token;
+  collabMentionState.trigger = context.trigger;
   collabMentionState.startIndex = context.startIndex;
   collabMentionState.cursorIndex = Math.max(0, Math.min(Number(collabChatInput.selectionStart) || 0, String(collabChatInput.value || '').length));
   collabMentionState.candidates = candidates;
 
-  if (collabMentionState.selectedIndex < 0 || collabMentionState.selectedIndex >= candidates.length) {
+  if (triggerChanged || collabMentionState.selectedIndex < 0 || collabMentionState.selectedIndex >= candidates.length) {
     collabMentionState.selectedIndex = 0;
   }
 
@@ -7949,6 +8043,7 @@ function updateCollabButtons() {
   collabNameInput.disabled = collabConnected;
   renderCollabQuickButton();
   updateCollabChatPanel();
+  treeRoot.classList.toggle('collab-active', isActiveCollabSession());
 }
 
 async function sendCollabChatMessage() {
