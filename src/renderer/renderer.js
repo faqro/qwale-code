@@ -92,6 +92,8 @@ const scmBranchSelect = document.getElementById('scmBranchSelect');
 const scmSwitchBranchBtn = document.getElementById('scmSwitchBranchBtn');
 const scmNewBranchInput = document.getElementById('scmNewBranchInput');
 const scmCreateBranchBtn = document.getElementById('scmCreateBranchBtn');
+const scmMergeBtn = document.getElementById('scmMergeBtn');
+const scmRebaseBtn = document.getElementById('scmRebaseBtn');
 const scmChangedFiles = document.getElementById('scmChangedFiles');
 const scmGraph = document.getElementById('scmGraph');
 const httpMethodSelect = document.getElementById('httpMethodSelect');
@@ -3995,11 +3997,15 @@ function renderBranches(branches) {
     scmBranchSelect.appendChild(option);
     scmBranchSelect.disabled = true;
     scmSwitchBranchBtn.disabled = true;
+    scmMergeBtn.disabled = true;
+    scmRebaseBtn.disabled = true;
     return;
   }
 
   scmBranchSelect.disabled = false;
   scmSwitchBranchBtn.disabled = false;
+  scmMergeBtn.disabled = false;
+  scmRebaseBtn.disabled = false;
 
   for (const branch of branches) {
     const option = document.createElement('option');
@@ -4246,6 +4252,8 @@ function setScmInteractiveState(enabled) {
   scmCreateBranchBtn.disabled = !enabled;
   scmNewBranchInput.disabled = !enabled;
   scmBranchSelect.disabled = !enabled;
+  scmMergeBtn.disabled = !enabled;
+  scmRebaseBtn.disabled = !enabled;
 }
 
 function resetScmDataViews() {
@@ -9943,6 +9951,38 @@ scmCreateBranchBtn.addEventListener('click', async () => {
   try {
     await api.gitCreateBranch({ name });
     scmNewBranchInput.value = '';
+    await refreshSourceControlPanel();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmMergeBtn.addEventListener('click', async () => {
+  const branch = scmBranchSelect.value;
+  if (!branch) {
+    alert('Select a branch to merge.');
+    return;
+  }
+
+  try {
+    await api.gitMerge({ branch });
+    await refreshProjectTree();
+    await refreshSourceControlPanel();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+scmRebaseBtn.addEventListener('click', async () => {
+  const branch = scmBranchSelect.value;
+  if (!branch) {
+    alert('Select a branch to rebase onto.');
+    return;
+  }
+
+  try {
+    await api.gitRebase({ branch });
+    await refreshProjectTree();
     await refreshSourceControlPanel();
   } catch (error) {
     alert(error.message);
