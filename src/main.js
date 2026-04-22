@@ -1561,6 +1561,32 @@ ipcMain.handle('git:switchBranch', async (event, { name }) => {
   return { ok: true };
 });
 
+ipcMain.handle('git:merge', async (event, { branch }) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  await ensureGitRepository(projectPath);
+
+  const branchName = String(branch || '').trim();
+  if (!branchName) {
+    throw new Error('Branch name is required.');
+  }
+
+  const result = await runGit(projectPath, ['merge', branchName]);
+  return { ok: true, output: result.stdout || result.stderr || 'Merge complete.' };
+});
+
+ipcMain.handle('git:rebase', async (event, { branch }) => {
+  const projectPath = getProjectPathForSender(event.sender);
+  await ensureGitRepository(projectPath);
+
+  const branchName = String(branch || '').trim();
+  if (!branchName) {
+    throw new Error('Branch name is required.');
+  }
+
+  const result = await runGit(projectPath, ['rebase', branchName]);
+  return { ok: true, output: result.stdout || result.stderr || 'Rebase complete.' };
+});
+
 function isWslAvailable() {
   if (process.platform !== 'win32') {
     return false;

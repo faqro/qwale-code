@@ -158,6 +158,10 @@
                 <input id="scmNewBranchInput" class="scm-input" type="text" placeholder="new-branch-name" />
                 <button id="scmCreateBranchBtn" class="scm-btn" type="button">Create</button>
               </div>
+              <div class="scm-branch-row">
+                <button id="scmMergeBtn" class="scm-btn" type="button">Merge</button>
+                <button id="scmRebaseBtn" class="scm-btn" type="button">Rebase</button>
+              </div>
             </div>
 
             <div class="scm-section">
@@ -252,29 +256,51 @@
 
     <section class="editor-area">
       <div id="aiResizeHandle" class="ai-resize-handle"></div>
-      <div class="editor-tabs-bar">
-        <div id="editorTabs" class="editor-tabs"></div>
-        <div id="collabQuickWrap" class="collab-quick-wrap hidden">
-          <button id="collabQuickBtn" class="collab-quick-btn" type="button" title="Collaborators" aria-label="Collaborators"></button>
-          <div id="collabQuickMenu" class="collab-quick-menu hidden"></div>
+      <div class="editor-tabs-row">
+        <div class="editor-tabs-wrap" id="editorTabsBarLeft">
+          <div id="editorTabs" class="editor-tabs"></div>
         </div>
-        <div class="editor-play-wrap">
-          <button id="editorPlayBtn" class="editor-play-btn" type="button" title="Run default launch option">
-            <span id="editorPlayBtnIcon" class="editor-play-btn-icon editor-play-btn-icon-run" aria-hidden="true"></span>
-            <span id="editorPlayBtnLabel">Run/Debug</span>
-          </button>
-          <button id="editorPlayMenuBtn" class="editor-play-menu-btn" type="button" title="Show launch options" aria-label="Show launch options">
-            <span class="editor-play-chevron" aria-hidden="true"></span>
-          </button>
-          <div id="editorPlayMenu" class="editor-play-menu hidden"></div>
+        <div class="editor-pane-divider-spacer hidden" id="editorPaneDividerSpacer"></div>
+        <div class="editor-tabs-wrap editor-tabs-wrap-right hidden" id="editorTabsBarRight">
+          <div id="editorTabsRight" class="editor-tabs"></div>
         </div>
-        <button id="aiPanelOpenBtn" class="ai-panel-open-btn hidden" type="button" title="Open AI panel" aria-label="Open AI panel">
-          <span class="ai-panel-open-icon" aria-hidden="true"></span>
-        </button>
+        <div class="editor-tabs-controls">
+          <div id="collabQuickWrap" class="collab-quick-wrap hidden">
+            <button id="collabQuickBtn" class="collab-quick-btn" type="button" title="Collaborators" aria-label="Collaborators"></button>
+            <div id="collabQuickMenu" class="collab-quick-menu hidden"></div>
+          </div>
+          <div class="editor-play-wrap">
+            <button id="editorPlayBtn" class="editor-play-btn" type="button" title="Run default launch option">
+              <span id="editorPlayBtnIcon" class="editor-play-btn-icon editor-play-btn-icon-run" aria-hidden="true"></span>
+              <span id="editorPlayBtnLabel">Run/Debug</span>
+            </button>
+            <button id="editorPlayMenuBtn" class="editor-play-menu-btn" type="button" title="Show launch options" aria-label="Show launch options">
+              <span class="editor-play-chevron" aria-hidden="true"></span>
+            </button>
+            <div id="editorPlayMenu" class="editor-play-menu hidden"></div>
+          </div>
+          <button id="splitScreenBtn" class="editor-split-btn" type="button" title="Split editor" aria-label="Split editor">
+            <span class="editor-split-icon" aria-hidden="true"></span>
+          </button>
+          <button id="aiPanelOpenBtn" class="ai-panel-open-btn hidden" type="button" title="Open AI panel" aria-label="Open AI panel">
+            <span class="ai-panel-open-icon" aria-hidden="true"></span>
+          </button>
+        </div>
       </div>
-      <div id="editor"></div>
-      <div id="imagePreview" class="image-preview hidden">
-        <img id="imagePreviewImg" alt="" />
+      <div class="editor-panes" id="editorPanes">
+        <div class="editor-pane" id="editorPaneLeft">
+          <div id="editor" class="hidden"></div>
+          <div id="imagePreview" class="image-preview hidden">
+            <img id="imagePreviewImg" alt="" />
+          </div>
+        </div>
+        <div class="editor-pane-divider hidden" id="editorPaneDivider"></div>
+        <div class="editor-pane hidden" id="editorPaneRight">
+          <div id="editorRight"></div>
+          <div id="imagePreviewRight" class="image-preview hidden">
+            <img id="imagePreviewImgRight" alt="" />
+          </div>
+        </div>
       </div>
       <div id="editorStatusBar" class="editor-status-bar">
         <div class="status-position-wrap">
