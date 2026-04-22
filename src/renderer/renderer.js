@@ -222,6 +222,10 @@ let collabMentionState = {
   candidates: []
 };
 let imagePanState = null;
+let prefsOverlay = null;
+let prefsActiveCategory = 'editor';
+let prefsSearchQuery = '';
+let currentPrefs = null;
 
 const IMAGE_PREVIEW_MIN_ZOOM = 0.2;
 const IMAGE_PREVIEW_MAX_ZOOM = 8;
@@ -5130,7 +5134,9 @@ function renderMenuBar() {
         { divider: true },
         { id: 'file:save', label: 'Save File', shortcut: 'Ctrl+S', action: () => saveCurrentFile() },
         { id: 'file:saveAs', label: 'Save File As', shortcut: 'Ctrl+Shift+S', action: () => saveCurrentFileAs() },
-        { id: 'file:saveAll', label: 'Save All Files', shortcut: 'Ctrl+Alt+S', action: () => saveAllFiles() }
+        { id: 'file:saveAll', label: 'Save All Files', shortcut: 'Ctrl+Alt+S', action: () => saveAllFiles() },
+        { divider: true },
+        { label: 'Preferences', shortcut: 'Ctrl+,', action: () => openPrefsDialog() }
       ]
     },
     {
@@ -5154,7 +5160,6 @@ function renderMenuBar() {
       items: [
         { label: 'Reload', action: () => api.dispatchAppCommand('view:reload') },
         { label: 'Toggle Developer Tools', action: () => api.dispatchAppCommand('view:toggleDevTools') },
-        { label: themeMode === 'light' ? 'Switch to Dark Mode' : 'Switch to Light Mode', shortcut: 'Ctrl+Alt+L', action: () => toggleThemeMode() },
         { divider: true },
         { label: 'Zoom In', action: () => api.dispatchAppCommand('view:zoomIn') },
         { label: 'Zoom Out', action: () => api.dispatchAppCommand('view:zoomOut') },
@@ -5314,6 +5319,454 @@ function renderMenuBar() {
     });
     menuDocumentClickBound = true;
   }
+}
+
+const PREFS_SCHEMA = [
+  // ── Editor ──────────────────────────────────────────────────────────────
+  { id: 'editor.fontSize', label: 'Font Size', description: 'Controls the font size in pixels for the editor.', category: 'editor', type: 'number', default: 14, min: 8, max: 32, step: 1 },
+  { id: 'editor.fontFamily', label: 'Font Family', description: 'Controls the font family used in the editor.', category: 'editor', type: 'text', default: 'Consolas, monospace' },
+  { id: 'editor.tabSize', label: 'Tab Size', description: 'The number of spaces a tab is equal to.', category: 'editor', type: 'number', default: 4, min: 1, max: 8, step: 1 },
+  { id: 'editor.insertSpaces', label: 'Insert Spaces', description: 'Insert spaces when pressing Tab instead of a tab character.', category: 'editor', type: 'boolean', default: true },
+  { id: 'editor.wordWrap', label: 'Word Wrap', description: 'Controls how lines are wrapped in the editor.', category: 'editor', type: 'select', default: 'off', options: ['off', 'on', 'wordWrapColumn', 'bounded'] },
+  { id: 'editor.minimap', label: 'Minimap', description: 'Show a minimap overview of the file on the right side of the editor.', category: 'editor', type: 'boolean', default: false },
+  { id: 'editor.lineNumbers', label: 'Line Numbers', description: 'Controls the display of line numbers in the editor.', category: 'editor', type: 'select', default: 'on', options: ['on', 'off', 'relative'] },
+  { id: 'editor.renderWhitespace', label: 'Render Whitespace', description: 'Controls how whitespace characters are rendered in the editor.', category: 'editor', type: 'select', default: 'none', options: ['none', 'boundary', 'selection', 'trailing', 'all'] },
+  { id: 'editor.cursorStyle', label: 'Cursor Style', description: 'Controls the cursor appearance.', category: 'editor', type: 'select', default: 'line', options: ['line', 'block', 'underline', 'line-thin', 'block-outline', 'underline-thin'] },
+  { id: 'editor.cursorBlinking', label: 'Cursor Blinking', description: 'Controls the cursor animation style.', category: 'editor', type: 'select', default: 'blink', options: ['blink', 'smooth', 'phase', 'expand', 'solid'] },
+  { id: 'editor.scrollBeyondLastLine', label: 'Scroll Beyond Last Line', description: 'Enable scrolling beyond the last line of the file.', category: 'editor', type: 'boolean', default: true },
+  { id: 'editor.smoothScrolling', label: 'Smooth Scrolling', description: 'Controls whether the editor will animate scroll transitions.', category: 'editor', type: 'boolean', default: false },
+  { id: 'editor.autoClosingBrackets', label: 'Auto Closing Brackets', description: 'Controls whether the editor should auto-close brackets.', category: 'editor', type: 'select', default: 'languageDefined', options: ['always', 'languageDefined', 'beforeWhitespace', 'never'] },
+  { id: 'editor.autoClosingQuotes', label: 'Auto Closing Quotes', description: 'Controls whether the editor should auto-close quotes.', category: 'editor', type: 'select', default: 'languageDefined', options: ['always', 'languageDefined', 'beforeWhitespace', 'never'] },
+  { id: 'editor.bracketPairColorization', label: 'Bracket Pair Colorization', description: 'Enables bracket pair colorization.', category: 'editor', type: 'boolean', default: true },
+  { id: 'editor.formatOnSave', label: 'Format On Save', description: 'Format the file on save.', category: 'editor', type: 'boolean', default: false },
+  { id: 'editor.formatOnPaste', label: 'Format On Paste', description: 'Format pasted content.', category: 'editor', type: 'boolean', default: false },
+  { id: 'editor.glyphMargin', label: 'Glyph Margin', description: 'Enable the rendering of the glyph margin.', category: 'editor', type: 'boolean', default: true },
+  { id: 'editor.rulers', label: 'Rulers', description: 'Render vertical rulers at specific columns (comma-separated numbers).', category: 'editor', type: 'text', default: '' },
+  { id: 'editor.linkedEditing', label: 'Linked Editing', description: 'Enable linked editing (e.g. rename HTML tags together).', category: 'editor', type: 'boolean', default: false },
+  { id: 'editor.stickyScroll', label: 'Sticky Scroll', description: 'Show nested symbol scopes sticky at the top of the editor.', category: 'editor', type: 'boolean', default: false },
+  { id: 'editor.letterSpacing', label: 'Letter Spacing', description: 'Controls the letter spacing in pixels.', category: 'editor', type: 'number', default: 0, min: -5, max: 10, step: 0.5 },
+  { id: 'editor.lineHeight', label: 'Line Height', description: 'Controls the line height. 0 means auto-computed.', category: 'editor', type: 'number', default: 0, min: 0, max: 100, step: 1 },
+  // ── Appearance ────────────────────────────────────────────────────────
+  { id: 'appearance.theme', label: 'Color Theme', description: 'Selects the overall color theme for the IDE.', category: 'appearance', type: 'select', default: 'dark', options: ['dark', 'light'] },
+  { id: 'appearance.uiFontSize', label: 'UI Font Size', description: 'Controls the base font size for the IDE interface (px).', category: 'appearance', type: 'number', default: 13, min: 10, max: 20, step: 1 },
+  // ── Terminal ──────────────────────────────────────────────────────────
+  { id: 'terminal.fontSize', label: 'Font Size', description: 'Controls the font size in pixels for the integrated terminal.', category: 'terminal', type: 'number', default: 13, min: 8, max: 24, step: 1 },
+  { id: 'terminal.fontFamily', label: 'Font Family', description: 'Controls the font family used in the integrated terminal.', category: 'terminal', type: 'text', default: 'Consolas, monospace' },
+  { id: 'terminal.cursorBlink', label: 'Cursor Blink', description: 'Whether the terminal cursor blinks.', category: 'terminal', type: 'boolean', default: true },
+  { id: 'terminal.cursorStyle', label: 'Cursor Style', description: 'Controls the cursor appearance in the terminal.', category: 'terminal', type: 'select', default: 'block', options: ['block', 'underline', 'bar'] },
+  { id: 'terminal.scrollback', label: 'Scrollback', description: 'The number of rows to keep in the terminal scrollback buffer.', category: 'terminal', type: 'number', default: 1000, min: 100, max: 10000, step: 100 },
+  // ── AI ────────────────────────────────────────────────────────────────
+  { id: 'ai.model', label: 'Default Model', description: 'The AI model selected when the IDE starts. Can be changed at any time from the AI panel.', category: 'ai', type: 'select', default: 'gpt-5.4-mini', options: ['gpt-5.4-mini', 'gpt-5.4', 'gpt-4.1', 'gpt-4.1-mini'] },
+  { id: 'ai.apiKey', label: 'API Key', description: 'Your OpenAI API key. Stored locally in your browser.', category: 'ai', type: 'password', default: '' },
+  // ── Files ─────────────────────────────────────────────────────────────
+  { id: 'files.autoSave', label: 'Auto Save', description: 'Controls automatic saving of unsaved files.', category: 'files', type: 'select', default: 'off', options: ['off', 'afterDelay', 'onFocusChange'] },
+  { id: 'files.autoSaveDelay', label: 'Auto Save Delay', description: 'Delay in seconds before auto-saving (when Auto Save is set to afterDelay).', category: 'files', type: 'number', default: 1, min: 0.1, max: 60, step: 0.1 },
+  { id: 'files.trimTrailingWhitespace', label: 'Trim Trailing Whitespace', description: 'When enabled, remove trailing whitespace on file save.', category: 'files', type: 'boolean', default: false },
+  { id: 'files.insertFinalNewline', label: 'Insert Final Newline', description: 'When enabled, insert a final newline at the end of a file when saving.', category: 'files', type: 'boolean', default: false },
+  // ── Git ──────────────────────────────────────────────────────────────
+  { id: 'git.autofetch', label: 'Auto Fetch', description: 'Periodically fetch from remotes automatically.', category: 'git', type: 'boolean', default: false },
+  { id: 'git.confirmSync', label: 'Confirm Before Sync', description: 'Show a confirmation prompt before git push/pull operations.', category: 'git', type: 'boolean', default: true },
+  // ── Collaborate ───────────────────────────────────────────────────────
+  { id: 'collab.username', label: 'Default Username', description: 'Your default display name pre-filled in the Collaborate panel when the IDE starts.', category: 'collab', type: 'text', default: '' }
+];
+
+const PREFS_CATEGORIES = [
+  { id: 'editor', label: 'Editor' },
+  { id: 'appearance', label: 'Appearance' },
+  { id: 'terminal', label: 'Terminal' },
+  { id: 'ai', label: 'AI' },
+  { id: 'files', label: 'Files' },
+  { id: 'git', label: 'Git' },
+  { id: 'collab', label: 'Collaborate' }
+];
+
+function loadPrefs() {
+  const defaults = {};
+  for (const s of PREFS_SCHEMA) {
+    defaults[s.id] = s.default;
+  }
+  try {
+    const stored = JSON.parse(localStorage.getItem('qwale-prefs') || '{}');
+    return Object.assign({}, defaults, stored);
+  } catch {
+    return defaults;
+  }
+}
+
+function savePrefs(prefs) {
+  localStorage.setItem('qwale-prefs', JSON.stringify(prefs));
+}
+
+function applyPrefs(prefs) {
+  if (monacoEditor) {
+    const rulers = (prefs['editor.rulers'] || '').split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isFinite(n) && n > 0);
+    monacoEditor.updateOptions({
+      fontSize: prefs['editor.fontSize'],
+      fontFamily: prefs['editor.fontFamily'],
+      tabSize: prefs['editor.tabSize'],
+      insertSpaces: prefs['editor.insertSpaces'],
+      wordWrap: prefs['editor.wordWrap'],
+      minimap: { enabled: prefs['editor.minimap'] },
+      lineNumbers: prefs['editor.lineNumbers'],
+      renderWhitespace: prefs['editor.renderWhitespace'],
+      cursorStyle: prefs['editor.cursorStyle'],
+      cursorBlinking: prefs['editor.cursorBlinking'],
+      scrollBeyondLastLine: prefs['editor.scrollBeyondLastLine'],
+      smoothScrolling: prefs['editor.smoothScrolling'],
+      autoClosingBrackets: prefs['editor.autoClosingBrackets'],
+      autoClosingQuotes: prefs['editor.autoClosingQuotes'],
+      bracketPairColorization: { enabled: prefs['editor.bracketPairColorization'] },
+      formatOnPaste: prefs['editor.formatOnPaste'],
+      glyphMargin: prefs['editor.glyphMargin'],
+      rulers,
+      linkedEditing: prefs['editor.linkedEditing'],
+      stickyScroll: { enabled: prefs['editor.stickyScroll'] },
+      letterSpacing: prefs['editor.letterSpacing'],
+      lineHeight: prefs['editor.lineHeight']
+    });
+  }
+
+  if (prefs['appearance.theme'] && prefs['appearance.theme'] !== themeMode) {
+    applyTheme(prefs['appearance.theme']);
+  }
+
+  const uiFontSize = prefs['appearance.uiFontSize'] || 13;
+  document.documentElement.style.setProperty('--ui-font-size', `${uiFontSize}px`);
+
+  terminal.options.fontSize = prefs['terminal.fontSize'];
+  terminal.options.fontFamily = prefs['terminal.fontFamily'];
+  terminal.options.cursorBlink = prefs['terminal.cursorBlink'];
+  terminal.options.cursorStyle = prefs['terminal.cursorStyle'];
+  terminal.options.scrollback = prefs['terminal.scrollback'];
+
+  if (prefs['ai.model']) {
+    localStorage.setItem('openai-model', prefs['ai.model']);
+  }
+  if (prefs['ai.apiKey'] !== undefined && prefs['ai.apiKey'] !== '') {
+    localStorage.setItem('openai-api-key', prefs['ai.apiKey']);
+    setAiAuthState();
+  }
+
+  if (prefs['collab.username'] !== undefined && !collabNameInput.disabled) {
+    collabNameInput.value = prefs['collab.username'];
+  }
+
+  try {
+    if (fitAddon) {
+      fitAddon.fit();
+    }
+  } catch {
+    // Terminal may not be ready.
+  }
+}
+
+function buildPrefsControl(setting, prefs, onChange) {
+  const val = prefs[setting.id];
+
+  if (setting.type === 'boolean') {
+    const label = document.createElement('label');
+    label.className = 'prefs-toggle';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = !!val;
+    input.addEventListener('change', () => onChange(setting.id, input.checked));
+    const slider = document.createElement('span');
+    slider.className = 'prefs-toggle-slider';
+    label.appendChild(input);
+    label.appendChild(slider);
+    return label;
+  }
+
+  if (setting.type === 'select') {
+    const sel = document.createElement('select');
+    sel.className = 'prefs-select';
+    for (const opt of setting.options) {
+      const o = document.createElement('option');
+      o.value = opt;
+      o.textContent = opt;
+      if (opt === val) {
+        o.selected = true;
+      }
+      sel.appendChild(o);
+    }
+    sel.addEventListener('change', () => onChange(setting.id, sel.value));
+    return sel;
+  }
+
+  if (setting.type === 'number') {
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.className = 'prefs-input prefs-input-number';
+    input.value = val;
+    if (setting.min !== undefined) {
+      input.min = setting.min;
+    }
+    if (setting.max !== undefined) {
+      input.max = setting.max;
+    }
+    if (setting.step !== undefined) {
+      input.step = setting.step;
+    }
+    input.addEventListener('change', () => {
+      const n = parseFloat(input.value);
+      if (Number.isFinite(n)) {
+        onChange(setting.id, n);
+      }
+    });
+    return input;
+  }
+
+  if (setting.type === 'color') {
+    const wrap = document.createElement('div');
+    wrap.className = 'prefs-color-wrap';
+    const swatch = document.createElement('input');
+    swatch.type = 'color';
+    swatch.className = 'prefs-color-swatch';
+    swatch.value = val || setting.default;
+    const text = document.createElement('input');
+    text.type = 'text';
+    text.className = 'prefs-input';
+    text.value = val || setting.default;
+    text.style.width = '88px';
+    swatch.addEventListener('input', () => {
+      text.value = swatch.value;
+      onChange(setting.id, swatch.value);
+    });
+    text.addEventListener('change', () => {
+      swatch.value = text.value;
+      onChange(setting.id, text.value);
+    });
+    wrap.appendChild(swatch);
+    wrap.appendChild(text);
+    return wrap;
+  }
+
+  if (setting.type === 'password') {
+    const wrap = document.createElement('div');
+    wrap.className = 'prefs-password-wrap';
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.className = 'prefs-input';
+    input.value = val || '';
+    input.placeholder = 'sk-…';
+    input.style.width = '200px';
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'prefs-save-btn';
+    saveBtn.textContent = 'Save';
+    saveBtn.addEventListener('click', () => {
+      onChange(setting.id, input.value);
+      saveBtn.textContent = 'Saved';
+      saveBtn.classList.add('prefs-save-btn--saved');
+      setTimeout(() => {
+        saveBtn.textContent = 'Save';
+        saveBtn.classList.remove('prefs-save-btn--saved');
+      }, 1500);
+    });
+    input.addEventListener('input', () => {
+      saveBtn.textContent = 'Save';
+      saveBtn.classList.remove('prefs-save-btn--saved');
+    });
+    wrap.appendChild(input);
+    wrap.appendChild(saveBtn);
+    return wrap;
+  }
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'prefs-input';
+  input.value = val !== undefined ? String(val) : '';
+  input.style.width = '200px';
+  input.addEventListener('change', () => onChange(setting.id, input.value));
+  return input;
+}
+
+function renderPrefsPanel(prefs, container, activeCategory, searchQuery) {
+  container.innerHTML = '';
+
+  const onChange = (id, value) => {
+    prefs[id] = value;
+    savePrefs(prefs);
+    applyPrefs(prefs);
+    if (id === 'appearance.theme') {
+      renderMenuBar();
+    }
+  };
+
+  let settings;
+  if (searchQuery) {
+    const q = searchQuery.toLowerCase();
+    settings = PREFS_SCHEMA.filter(
+      (s) => s.label.toLowerCase().includes(q) || s.description.toLowerCase().includes(q) || s.id.toLowerCase().includes(q)
+    );
+  } else {
+    settings = PREFS_SCHEMA.filter((s) => s.category === activeCategory);
+  }
+
+  if (settings.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'prefs-empty';
+    empty.textContent = 'No settings match your search.';
+    container.appendChild(empty);
+    return;
+  }
+
+  let currentCat = null;
+  for (const setting of settings) {
+    if (searchQuery && setting.category !== currentCat) {
+      currentCat = setting.category;
+      const catLabel = PREFS_CATEGORIES.find((c) => c.id === currentCat);
+      const header = document.createElement('div');
+      header.className = 'prefs-category-header';
+      header.textContent = catLabel ? catLabel.label : currentCat;
+      container.appendChild(header);
+    }
+
+    const row = document.createElement('div');
+    row.className = 'prefs-row';
+
+    const labelCol = document.createElement('div');
+    labelCol.className = 'prefs-label';
+
+    const labelEl = document.createElement('span');
+    labelEl.className = 'prefs-label-text';
+    labelEl.textContent = setting.label;
+
+    const descEl = document.createElement('span');
+    descEl.className = 'prefs-label-desc';
+    descEl.textContent = setting.description;
+
+    labelCol.appendChild(labelEl);
+    labelCol.appendChild(descEl);
+
+    const controlCol = document.createElement('div');
+    controlCol.className = 'prefs-control';
+    controlCol.appendChild(buildPrefsControl(setting, prefs, onChange));
+
+    row.appendChild(labelCol);
+    row.appendChild(controlCol);
+    container.appendChild(row);
+  }
+}
+
+function ensurePrefsDialog() {
+  if (prefsOverlay) {
+    return;
+  }
+
+  prefsOverlay = document.createElement('div');
+  prefsOverlay.className = 'prefs-overlay hidden';
+
+  const dialog = document.createElement('div');
+  dialog.className = 'prefs-dialog';
+
+  // Header
+  const header = document.createElement('div');
+  header.className = 'prefs-header';
+
+  const title = document.createElement('h3');
+  title.className = 'prefs-title';
+  title.textContent = 'Preferences';
+
+  const searchWrap = document.createElement('div');
+  searchWrap.className = 'prefs-search';
+  const searchInput = document.createElement('input');
+  searchInput.type = 'text';
+  searchInput.placeholder = 'Search settings…';
+  searchInput.className = 'prefs-search-input';
+  searchWrap.appendChild(searchInput);
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'prefs-close';
+  closeBtn.setAttribute('aria-label', 'Close preferences');
+  closeBtn.addEventListener('click', closePrefsDialog);
+
+  header.appendChild(title);
+  header.appendChild(searchWrap);
+  header.appendChild(closeBtn);
+
+  // Body
+  const body = document.createElement('div');
+  body.className = 'prefs-body';
+
+  // Sidebar
+  const sidebar = document.createElement('div');
+  sidebar.className = 'prefs-sidebar';
+
+  for (const cat of PREFS_CATEGORIES) {
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = 'prefs-tab' + (cat.id === prefsActiveCategory ? ' active' : '');
+    tab.dataset.category = cat.id;
+    tab.textContent = cat.label;
+    tab.addEventListener('click', () => {
+      prefsActiveCategory = cat.id;
+      prefsSearchQuery = '';
+      searchInput.value = '';
+      sidebar.querySelectorAll('.prefs-tab').forEach((t) => t.classList.remove('active'));
+      tab.classList.add('active');
+      renderPrefsPanel(currentPrefs, content, prefsActiveCategory, '');
+    });
+    sidebar.appendChild(tab);
+  }
+
+  // Content area
+  const content = document.createElement('div');
+  content.className = 'prefs-content';
+
+  searchInput.addEventListener('input', () => {
+    prefsSearchQuery = searchInput.value.trim();
+    sidebar.querySelectorAll('.prefs-tab').forEach((t) => t.classList.remove('active'));
+    renderPrefsPanel(currentPrefs, content, prefsActiveCategory, prefsSearchQuery);
+  });
+
+  body.appendChild(sidebar);
+  body.appendChild(content);
+
+  dialog.appendChild(header);
+  dialog.appendChild(body);
+  prefsOverlay.appendChild(dialog);
+
+  prefsOverlay.addEventListener('click', (event) => {
+    if (event.target === prefsOverlay) {
+      closePrefsDialog();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && prefsOverlay && !prefsOverlay.classList.contains('hidden')) {
+      closePrefsDialog();
+    }
+  });
+
+  document.body.appendChild(prefsOverlay);
+}
+
+function openPrefsDialog() {
+  ensurePrefsDialog();
+  currentPrefs = loadPrefs();
+
+  const sidebar = prefsOverlay.querySelector('.prefs-sidebar');
+  sidebar.querySelectorAll('.prefs-tab').forEach((t) => {
+    t.classList.toggle('active', t.dataset.category === prefsActiveCategory);
+  });
+
+  const searchInput = prefsOverlay.querySelector('.prefs-search-input');
+  searchInput.value = prefsSearchQuery;
+
+  const content = prefsOverlay.querySelector('.prefs-content');
+  renderPrefsPanel(currentPrefs, content, prefsActiveCategory, prefsSearchQuery);
+
+  prefsOverlay.classList.remove('hidden');
+  searchInput.focus();
+}
+
+function closePrefsDialog() {
+  if (!prefsOverlay) {
+    return;
+  }
+  prefsOverlay.classList.add('hidden');
 }
 
 function ensureHelpDialog() {
@@ -9710,6 +10163,8 @@ if (api.onMenuAction) {
       } else if (action === 'project:recentCleared') {
         await refreshRecentProjectsCache();
         renderMenuBar();
+      } else if (action === 'app:preferences') {
+        openPrefsDialog();
       }
     } catch (error) {
       alert(error.message);
@@ -9863,11 +10318,12 @@ aiModelSelect.addEventListener('change', () => {
 });
 
 aiClearKeyBtn.addEventListener('click', () => {
-  if (aiAbortController) {
-    aiAbortController.abort();
-  }
   localStorage.removeItem('openai-api-key');
+  const prefs = loadPrefs();
+  prefs['ai.apiKey'] = '';
+  savePrefs(prefs);
   aiApiKeyInput.value = '';
+  clearAiConversationHistory();
   setAiAuthState();
 });
 
@@ -10052,7 +10508,9 @@ window.addEventListener('beforeunload', (event) => {
 Promise.all([refreshProjectTree(), initMonacoEditor(), refreshRecentProjectsCache()])
   .then(async () => {
     updateHttpBodyState();
-    applyTheme(localStorage.getItem('qwale-theme') || 'dark');
+    currentPrefs = loadPrefs();
+    applyTheme(currentPrefs['appearance.theme'] || localStorage.getItem('qwale-theme') || 'dark');
+    applyPrefs(currentPrefs);
     const savedAiPanelState = localStorage.getItem('ai-panel-open');
     aiPanelOpen = savedAiPanelState !== null ? savedAiPanelState === 'true' : true;
     setAiAuthState();

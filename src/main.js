@@ -396,6 +396,12 @@ function createAppMenu() {
           click: () => sendMenuAction('file:saveAll')
         },
         { type: 'separator' },
+        {
+          label: 'Preferences',
+          accelerator: 'CmdOrCtrl+,',
+          click: () => sendMenuAction('app:preferences')
+        },
+        { type: 'separator' },
         isMac ? { role: 'close' } : { role: 'quit' }
       ]
     },
@@ -435,11 +441,6 @@ function createAppMenu() {
         { role: 'reload' },
         { role: 'forceReload' },
         { role: 'toggleDevTools' },
-        {
-          label: 'Toggle Light Mode',
-          accelerator: 'CmdOrCtrl+Alt+L',
-          click: () => sendMenuAction('view:toggleTheme')
-        },
         { type: 'separator' },
         { role: 'resetZoom' },
         { role: 'zoomIn' },
