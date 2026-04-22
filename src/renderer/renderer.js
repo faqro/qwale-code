@@ -64,9 +64,22 @@ const editorPlayBtnIcon = document.getElementById('editorPlayBtnIcon');
 const editorPlayBtnLabel = document.getElementById('editorPlayBtnLabel');
 const editorPlayMenu = document.getElementById('editorPlayMenu');
 const editor = document.getElementById('editor');
+const editorPanes = document.getElementById('editorPanes');
+const editorPaneLeft = document.getElementById('editorPaneLeft');
+const editorPaneRight = document.getElementById('editorPaneRight');
+const editorPaneDivider = document.getElementById('editorPaneDivider');
+const editorTabsBarLeft = document.getElementById('editorTabsBarLeft');
+const editorTabsBarRight = document.getElementById('editorTabsBarRight');
+const editorPaneDividerSpacer = document.getElementById('editorPaneDividerSpacer');
+const editorTabsRight = document.getElementById('editorTabsRight');
+const editorRight = document.getElementById('editorRight');
 const imagePreview = document.getElementById('imagePreview');
 const imagePreviewImg = document.getElementById('imagePreviewImg');
 imagePreviewImg.draggable = false;
+const imagePreviewRight = document.getElementById('imagePreviewRight');
+const imagePreviewImgRight = document.getElementById('imagePreviewImgRight');
+imagePreviewImgRight.draggable = false;
+const splitScreenBtn = document.getElementById('splitScreenBtn');
 const statusPosition = document.getElementById('statusPosition');
 const imageZoomControls = document.getElementById('imageZoomControls');
 const imageZoomInBtn = document.getElementById('imageZoomInBtn');
@@ -136,8 +149,12 @@ let project = {
 };
 
 let monacoEditor = null;
+let monacoEditorRight = null;
 let currentFilePath = null;
+let rightFilePath = null;
 let previewFilePath = null;
+let splitEnabled = false;
+let activePaneId = 'left';
 let selectedNodePath = null;
 let activeTerminalId = null;
 let terminalSessionSeq = 1;
@@ -224,6 +241,7 @@ let collabMentionState = {
   candidates: []
 };
 let imagePanState = null;
+let imagePanStateRight = null;
 let prefsOverlay = null;
 let prefsActiveCategory = 'editor';
 let prefsSearchQuery = '';
@@ -234,6 +252,10 @@ const IMAGE_PREVIEW_MAX_ZOOM = 8;
 
 imagePreviewImg.addEventListener('load', () => {
   updateImagePreviewDimensions();
+});
+
+imagePreviewImgRight.addEventListener('load', () => {
+  updateImagePreviewDimensionsRight();
 });
 
 imagePreviewImg.addEventListener('dragstart', (event) => {
@@ -267,6 +289,12 @@ function adjustImageZoom(deltaY, options = {}) {
   return true;
 }
 
+imagePreview.addEventListener('mousedown', (event) => {
+  if (splitEnabled && activePaneId !== 'left') {
+    setActivePane('left');
+  }
+}, true);
+
 imagePreview.addEventListener('wheel', (event) => {
   const state = currentFilePath ? openFiles.get(currentFilePath) : null;
   if (!state || state.kind !== 'image' || !state.imageDimensions) {
@@ -287,11 +315,13 @@ imagePreview.addEventListener('wheel', (event) => {
 });
 
 imageZoomInBtn.addEventListener('click', () => {
-  adjustImageZoom(-120);
+  if (splitEnabled && activePaneId === 'right') adjustImageZoomRight(-120);
+  else adjustImageZoom(-120);
 });
 
 imageZoomOutBtn.addEventListener('click', () => {
-  adjustImageZoom(120);
+  if (splitEnabled && activePaneId === 'right') adjustImageZoomRight(120);
+  else adjustImageZoom(120);
 });
 
 imagePreview.addEventListener('mousedown', (event) => {
@@ -345,6 +375,68 @@ imagePreviewImg.addEventListener('error', () => {
   if (state && state.kind === 'image') {
     state.imageDimensions = null;
     resetImagePreviewViewport();
+    updateEditorStatusBar();
+  }
+});
+
+imagePreviewRight.addEventListener('mousedown', (event) => {
+  if (splitEnabled && activePaneId !== 'right') {
+    setActivePane('right');
+  }
+}, true);
+
+imagePreviewRight.addEventListener('wheel', (event) => {
+  const state = rightFilePath ? openFiles.get(rightFilePath) : null;
+  if (!state || state.kind !== 'image' || !state.imageDimensions) return;
+  event.preventDefault();
+  const viewportHeight = Math.max(1, imagePreviewRight.clientHeight || 1);
+  const deltaY = event.deltaMode === 1
+    ? event.deltaY * 16
+    : event.deltaMode === 2
+      ? event.deltaY * viewportHeight
+      : event.deltaY;
+  adjustImageZoomRight(deltaY, { anchorClientX: event.clientX, anchorClientY: event.clientY });
+}, { passive: false });
+
+imagePreviewRight.addEventListener('mousedown', (event) => {
+  if (event.button !== 0 || !imagePreviewRight.classList.contains('can-pan')) return;
+  const state = rightFilePath ? openFiles.get(rightFilePath) : null;
+  if (!state || state.kind !== 'image') return;
+  imagePanStateRight = {
+    startX: event.clientX,
+    startY: event.clientY,
+    startScrollLeft: imagePreviewRight.scrollLeft,
+    startScrollTop: imagePreviewRight.scrollTop
+  };
+  imagePreviewRight.classList.add('panning');
+  event.preventDefault();
+});
+
+imagePreviewRight.addEventListener('dblclick', (event) => {
+  const state = rightFilePath ? openFiles.get(rightFilePath) : null;
+  if (!state || state.kind !== 'image') return;
+  const view = ensureImageViewStateRight(state);
+  view.zoom = 1;
+  view.scrollLeft = 0;
+  view.scrollTop = 0;
+  stopImagePanRight();
+  applyImagePreviewViewportRight();
+  event.preventDefault();
+});
+
+imagePreviewRight.addEventListener('scroll', () => {
+  const state = rightFilePath ? openFiles.get(rightFilePath) : null;
+  if (!state || state.kind !== 'image') return;
+  const view = ensureImageViewStateRight(state);
+  view.scrollLeft = imagePreviewRight.scrollLeft;
+  view.scrollTop = imagePreviewRight.scrollTop;
+});
+
+imagePreviewImgRight.addEventListener('error', () => {
+  const state = rightFilePath ? openFiles.get(rightFilePath) : null;
+  if (state && state.kind === 'image') {
+    state.imageDimensions = null;
+    resetImagePreviewViewportRight();
     updateEditorStatusBar();
   }
 });
@@ -5019,14 +5111,17 @@ function inferEncodingFromText(content) {
 }
 
 function updateEditorStatusBar() {
-  if (!currentFilePath) {
+  const activeFilePath = splitEnabled && activePaneId === 'right' ? rightFilePath : currentFilePath;
+  const activeEditor = splitEnabled && activePaneId === 'right' ? monacoEditorRight : monacoEditor;
+
+  if (!activeFilePath) {
     imageZoomControls.classList.add('hidden');
     statusPosition.textContent = 'Ln -, Col -';
     statusEncoding.textContent = '-';
     return;
   }
 
-  const state = openFiles.get(currentFilePath);
+  const state = openFiles.get(activeFilePath);
   if (!state) {
     imageZoomControls.classList.add('hidden');
     statusPosition.textContent = 'Ln -, Col -';
@@ -5036,7 +5131,9 @@ function updateEditorStatusBar() {
 
   if (state.kind === 'image') {
     imageZoomControls.classList.remove('hidden');
-    const view = ensureImageViewState(state);
+    const view = (splitEnabled && activePaneId === 'right')
+      ? ensureImageViewStateRight(state)
+      : ensureImageViewState(state);
     const zoomPercent = Math.max(1, Math.round(view.zoom * 100));
     const dimensions = state.imageDimensions;
     if (dimensions && dimensions.width && dimensions.height) {
@@ -5049,13 +5146,13 @@ function updateEditorStatusBar() {
   }
 
   imageZoomControls.classList.add('hidden');
-  if (!monacoEditor || !monacoEditor.getModel()) {
+  if (!activeEditor || !activeEditor.getModel()) {
     statusPosition.textContent = 'Ln -, Col -';
     statusEncoding.textContent = '-';
     return;
   }
 
-  const pos = monacoEditor.getPosition();
+  const pos = activeEditor.getPosition();
   if (pos) {
     statusPosition.textContent = `Ln ${pos.lineNumber}, Col ${pos.column}`;
   } else {
@@ -5427,6 +5524,33 @@ function applyPrefs(prefs) {
       formatOnPaste: prefs['editor.formatOnPaste'],
       glyphMargin: prefs['editor.glyphMargin'],
       rulers,
+      linkedEditing: prefs['editor.linkedEditing'],
+      stickyScroll: { enabled: prefs['editor.stickyScroll'] },
+      letterSpacing: prefs['editor.letterSpacing'],
+      lineHeight: prefs['editor.lineHeight']
+    });
+  }
+
+  if (monacoEditorRight) {
+    monacoEditorRight.updateOptions({
+      fontSize: prefs['editor.fontSize'],
+      fontFamily: prefs['editor.fontFamily'],
+      tabSize: prefs['editor.tabSize'],
+      insertSpaces: prefs['editor.insertSpaces'],
+      wordWrap: prefs['editor.wordWrap'],
+      minimap: { enabled: prefs['editor.minimap'] },
+      lineNumbers: prefs['editor.lineNumbers'],
+      renderWhitespace: prefs['editor.renderWhitespace'],
+      cursorStyle: prefs['editor.cursorStyle'],
+      cursorBlinking: prefs['editor.cursorBlinking'],
+      scrollBeyondLastLine: prefs['editor.scrollBeyondLastLine'],
+      smoothScrolling: prefs['editor.smoothScrolling'],
+      autoClosingBrackets: prefs['editor.autoClosingBrackets'],
+      autoClosingQuotes: prefs['editor.autoClosingQuotes'],
+      bracketPairColorization: { enabled: prefs['editor.bracketPairColorization'] },
+      formatOnPaste: prefs['editor.formatOnPaste'],
+      glyphMargin: prefs['editor.glyphMargin'],
+      rulers: (prefs['editor.rulers'] || '').split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isFinite(n) && n > 0),
       linkedEditing: prefs['editor.linkedEditing'],
       stickyScroll: { enabled: prefs['editor.stickyScroll'] },
       letterSpacing: prefs['editor.letterSpacing'],
@@ -6348,6 +6472,129 @@ function updateImagePreviewDimensions() {
   updateEditorStatusBar();
 }
 
+function stopImagePanRight() {
+  imagePanStateRight = null;
+  imagePreviewRight.classList.remove('panning');
+}
+
+function ensureImageViewStateRight(state) {
+  if (!state.imageViewRight) {
+    state.imageViewRight = { zoom: 1, scrollLeft: 0, scrollTop: 0 };
+  }
+  if (!Number.isFinite(state.imageViewRight.zoom) || state.imageViewRight.zoom <= 0) {
+    state.imageViewRight.zoom = 1;
+  }
+  state.imageViewRight.scrollLeft = Math.max(0, Number(state.imageViewRight.scrollLeft) || 0);
+  state.imageViewRight.scrollTop = Math.max(0, Number(state.imageViewRight.scrollTop) || 0);
+  return state.imageViewRight;
+}
+
+function resetImagePreviewViewportRight() {
+  imagePreviewRight.classList.remove('can-pan', 'can-pan-x', 'can-pan-y', 'panning');
+  imagePreviewRight.scrollLeft = 0;
+  imagePreviewRight.scrollTop = 0;
+  imagePreviewImgRight.style.width = '';
+  imagePreviewImgRight.style.height = '';
+  delete imagePreviewImgRight.dataset.displayWidth;
+  delete imagePreviewImgRight.dataset.displayHeight;
+}
+
+function applyImagePreviewViewportRight(options = {}) {
+  if (!rightFilePath) return;
+  const state = openFiles.get(rightFilePath);
+  if (!state || state.kind !== 'image' || !state.imageDimensions) {
+    resetImagePreviewViewportRight();
+    return;
+  }
+
+  const view = ensureImageViewStateRight(state);
+  view.zoom = Math.max(IMAGE_PREVIEW_MIN_ZOOM, Math.min(IMAGE_PREVIEW_MAX_ZOOM, view.zoom));
+
+  const previousDisplayWidth = Number(imagePreviewImgRight.dataset.displayWidth) || 0;
+  const previousDisplayHeight = Number(imagePreviewImgRight.dataset.displayHeight) || 0;
+
+  let anchorContentX = null, anchorContentY = null, anchorOffsetX = null, anchorOffsetY = null;
+  if (options.preserveAnchor && previousDisplayWidth > 0 && previousDisplayHeight > 0) {
+    const rect = imagePreviewRight.getBoundingClientRect();
+    anchorOffsetX = Math.max(0, Math.min(rect.width, Number(options.anchorClientX) - rect.left));
+    anchorOffsetY = Math.max(0, Math.min(rect.height, Number(options.anchorClientY) - rect.top));
+    anchorContentX = imagePreviewRight.scrollLeft + anchorOffsetX;
+    anchorContentY = imagePreviewRight.scrollTop + anchorOffsetY;
+  }
+
+  const viewportWidth = Math.max(1, imagePreviewRight.clientWidth || 1);
+  const viewportHeight = Math.max(1, imagePreviewRight.clientHeight || 1);
+  const { width, height } = state.imageDimensions;
+  const fitScale = Math.min(1, viewportWidth / width, viewportHeight / height);
+  const displayWidth = Math.max(1, Math.round(fitScale * width * view.zoom));
+  const displayHeight = Math.max(1, Math.round(fitScale * height * view.zoom));
+
+  imagePreviewImgRight.style.width = `${displayWidth}px`;
+  imagePreviewImgRight.style.height = `${displayHeight}px`;
+  imagePreviewImgRight.dataset.displayWidth = String(displayWidth);
+  imagePreviewImgRight.dataset.displayHeight = String(displayHeight);
+
+  const canPanX = displayWidth > viewportWidth + 1;
+  const canPanY = displayHeight > viewportHeight + 1;
+  const canPan = canPanX || canPanY;
+  imagePreviewRight.classList.toggle('can-pan', canPan);
+  imagePreviewRight.classList.toggle('can-pan-x', canPanX);
+  imagePreviewRight.classList.toggle('can-pan-y', canPanY);
+
+  if (!canPan) {
+    view.scrollLeft = 0;
+    view.scrollTop = 0;
+    imagePreviewRight.scrollLeft = 0;
+    imagePreviewRight.scrollTop = 0;
+    stopImagePanRight();
+    updateEditorStatusBar();
+    return;
+  }
+
+  const maxScrollLeft = Math.max(0, displayWidth - viewportWidth);
+  const maxScrollTop = Math.max(0, displayHeight - viewportHeight);
+
+  let nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, view.scrollLeft));
+  let nextScrollTop = Math.max(0, Math.min(maxScrollTop, view.scrollTop));
+
+  if (anchorContentX !== null && previousDisplayWidth > 0) {
+    nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, (anchorContentX / previousDisplayWidth) * displayWidth - anchorOffsetX));
+    nextScrollTop = Math.max(0, Math.min(maxScrollTop, (anchorContentY / previousDisplayHeight) * displayHeight - anchorOffsetY));
+  }
+
+  imagePreviewRight.scrollLeft = nextScrollLeft;
+  imagePreviewRight.scrollTop = nextScrollTop;
+  view.scrollLeft = nextScrollLeft;
+  view.scrollTop = nextScrollTop;
+  updateEditorStatusBar();
+}
+
+function adjustImageZoomRight(deltaY, options = {}) {
+  const state = rightFilePath ? openFiles.get(rightFilePath) : null;
+  if (!state || state.kind !== 'image' || !state.imageDimensions) return false;
+  const view = ensureImageViewStateRight(state);
+  const zoomFactor = Math.exp(-deltaY * 0.0015);
+  const nextZoom = Math.max(IMAGE_PREVIEW_MIN_ZOOM, Math.min(IMAGE_PREVIEW_MAX_ZOOM, view.zoom * zoomFactor));
+  if (Math.abs(nextZoom - view.zoom) < 0.0001) return false;
+  view.zoom = nextZoom;
+  const rect = imagePreviewRight.getBoundingClientRect();
+  const anchorClientX = Number.isFinite(options.anchorClientX) ? options.anchorClientX : rect.left + rect.width / 2;
+  const anchorClientY = Number.isFinite(options.anchorClientY) ? options.anchorClientY : rect.top + rect.height / 2;
+  applyImagePreviewViewportRight({ preserveAnchor: true, anchorClientX, anchorClientY });
+  return true;
+}
+
+function updateImagePreviewDimensionsRight() {
+  if (!rightFilePath) return;
+  const state = openFiles.get(rightFilePath);
+  if (!state || state.kind !== 'image') return;
+  const width = Math.max(0, Number(imagePreviewImgRight.naturalWidth) || 0);
+  const height = Math.max(0, Number(imagePreviewImgRight.naturalHeight) || 0);
+  if (!width || !height) return;
+  state.imageDimensions = { width, height };
+  applyImagePreviewViewportRight();
+}
+
 function showImagePreview(filePath, imageSrc = '') {
   stopImagePan();
   if (monacoEditor) {
@@ -6393,81 +6640,241 @@ function isDirty(filePath) {
   return state.model.getValue() !== state.savedContent;
 }
 
+function buildTab(filePath, isActive, pane, options = {}) {
+  const tab = document.createElement('div');
+  tab.className = `tab${isActive ? ' active' : ''}`;
+  const dirty = isDirty(filePath);
+
+  const fileIcon = createFileTypeIconElement(filePath, 'tab-file-icon');
+  const label = document.createElement('span');
+  label.textContent = getFileName(filePath);
+
+  const close = document.createElement('span');
+  close.className = 'tab-close';
+  const closeIcon = document.createElement('span');
+  closeIcon.className = 'tab-close-icon';
+  close.appendChild(closeIcon);
+
+  tab.addEventListener('click', () => {
+    switchToFileInPane(filePath, pane);
+  });
+
+  close.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (options.onClose) {
+      options.onClose();
+    } else {
+      closeTab(filePath);
+    }
+  });
+
+  tab.appendChild(fileIcon);
+  tab.appendChild(label);
+  if (dirty) {
+    const dirtyDot = document.createElement('span');
+    dirtyDot.className = 'tab-dirty-dot';
+    dirtyDot.title = 'Unsaved changes';
+    tab.appendChild(dirtyDot);
+  }
+  tab.appendChild(close);
+
+  if (splitEnabled) {
+    tab.draggable = true;
+    tab.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/plain', JSON.stringify({ filePath, pane }));
+      e.dataTransfer.effectAllowed = 'move';
+      tab.classList.add('dragging');
+    });
+    tab.addEventListener('dragend', () => tab.classList.remove('dragging'));
+  }
+
+  return tab;
+}
+
+function getPaneFiles(pane) {
+  const files = [];
+  for (const [fp, st] of openFiles) {
+    if (pane === 'left' ? st.pane !== 'right' : (st.pane === 'right' || st.pane === 'both')) {
+      files.push(fp);
+    }
+  }
+  return files;
+}
+
+function closeTabFromPane(filePath, closingPane) {
+  const state = openFiles.get(filePath);
+  if (!state || state.pane !== 'both') return;
+
+  const paneFiles = getPaneFiles(closingPane);
+  const idx = paneFiles.indexOf(filePath);
+  const fallback = paneFiles[idx + 1] || paneFiles[idx - 1] || null;
+
+  state.pane = closingPane === 'left' ? 'right' : 'left';
+
+  if (closingPane === 'right') {
+    if (rightFilePath === filePath) {
+      if (fallback) { switchToFileInPane(fallback, 'right'); return; }
+      rightFilePath = null;
+      if (monacoEditorRight) monacoEditorRight.setModel(null);
+      editorRight.classList.add('hidden');
+      imagePreviewRight.classList.add('hidden');
+      imagePreviewImgRight.removeAttribute('src');
+      updateEditorStatusBar();
+    }
+  } else {
+    if (currentFilePath === filePath) {
+      if (fallback) { switchToFileInPane(fallback, 'left'); return; }
+      clearAllRemoteDecorations();
+      currentFilePath = null;
+      if (splitEnabled) {
+        editor.classList.add('hidden');
+        imagePreview.classList.add('hidden');
+        imagePreviewImg.removeAttribute('src');
+        if (monacoEditor) monacoEditor.setModel(null);
+      } else {
+        showTextEditor();
+        if (monacoEditor) monacoEditor.setModel(null);
+      }
+      updateEditorStatusBar();
+    }
+  }
+  renderTabs();
+}
+
 function renderTabs() {
   editorTabs.innerHTML = '';
+  if (splitEnabled) {
+    editorTabsRight.innerHTML = '';
+  }
 
-  for (const [filePath] of openFiles) {
-    const tab = document.createElement('div');
-    tab.className = `tab${filePath === currentFilePath ? ' active' : ''}`;
-    const dirty = isDirty(filePath);
+  for (const [filePath, state] of openFiles) {
+    const inLeft = state.pane !== 'right';
+    const inRight = state.pane === 'right' || state.pane === 'both';
 
-    const fileIcon = createFileTypeIconElement(filePath, 'tab-file-icon');
-    const label = document.createElement('span');
-    label.textContent = getFileName(filePath);
-
-    const close = document.createElement('span');
-    close.className = 'tab-close';
-    const closeIcon = document.createElement('span');
-    closeIcon.className = 'tab-close-icon';
-    close.appendChild(closeIcon);
-
-    tab.addEventListener('click', () => {
-      switchToFile(filePath);
-    });
-
-    close.addEventListener('click', (event) => {
-      event.stopPropagation();
-      closeTab(filePath);
-    });
-
-    tab.appendChild(fileIcon);
-    tab.appendChild(label);
-    if (dirty) {
-      const dirtyDot = document.createElement('span');
-      dirtyDot.className = 'tab-dirty-dot';
-      dirtyDot.title = 'Unsaved changes';
-      tab.appendChild(dirtyDot);
+    if (inLeft) {
+      const tab = buildTab(filePath, filePath === currentFilePath, 'left',
+        state.pane === 'both' ? { onClose: () => closeTabFromPane(filePath, 'left') } : {}
+      );
+      editorTabs.appendChild(tab);
     }
-    tab.appendChild(close);
-    editorTabs.appendChild(tab);
+
+    if (splitEnabled && inRight) {
+      const tab = buildTab(filePath, filePath === rightFilePath, 'right',
+        state.pane === 'both' ? { onClose: () => closeTabFromPane(filePath, 'right') } : {}
+      );
+      editorTabsRight.appendChild(tab);
+    }
   }
 
   updateSaveMenuItemsState();
 }
 
-function switchToFile(filePath) {
+function setActivePane(pane) {
+  activePaneId = pane;
+  editorTabsBarLeft.classList.toggle('pane-active', pane === 'left');
+  if (splitEnabled) {
+    editorTabsBarRight.classList.toggle('pane-active', pane === 'right');
+  }
+}
+
+function showTextEditorRight() {
+  stopImagePanRight();
+  editorRight.classList.remove('hidden');
+  imagePreviewRight.classList.add('hidden');
+  resetImagePreviewViewportRight();
+  imagePreviewImgRight.removeAttribute('src');
+  imagePreviewImgRight.alt = '';
+}
+
+function showImagePreviewRight(filePath, imageSrc) {
+  if (monacoEditorRight) {
+    monacoEditorRight.setModel(null);
+  }
+  editorRight.classList.add('hidden');
+  imagePreviewRight.classList.remove('hidden');
+  imagePreviewImgRight.src = imageSrc || `${toFileUrl(filePath)}?t=${Date.now()}`;
+  imagePreviewImgRight.alt = getFileName(filePath);
+
+  resetImagePreviewViewportRight();
+
+  // Defer both paths until after the browser has computed layout for the
+  // newly-visible container (clientWidth/Height would be 0 if read synchronously).
+  requestAnimationFrame(() => {
+    if (rightFilePath !== filePath) return;
+    if (imagePreviewImgRight.complete && imagePreviewImgRight.naturalWidth && imagePreviewImgRight.naturalHeight) {
+      updateImagePreviewDimensionsRight();
+    } else {
+      const state = openFiles.get(filePath);
+      if (state && state.kind === 'image' && state.imageDimensions) {
+        applyImagePreviewViewportRight();
+      }
+    }
+  });
+}
+
+function switchToFileInPane(filePath, pane) {
   const state = openFiles.get(filePath);
   if (!state) {
     return;
   }
 
-  if (currentFilePath && currentFilePath !== filePath) {
-    clearAllRemoteDecorations();
-  }
-
-  currentFilePath = filePath;
-  if (state.kind === 'image') {
-    showImagePreview(filePath, state.imageSrc || '');
+  if (pane === 'right') {
+    if (rightFilePath && rightFilePath !== filePath) {
+      if (monacoEditorRight) {
+        const rightIds = [...collabRemoteCursorDecorations.values()]
+          .filter(e => e.pane === 'right')
+          .flatMap(e => e.ids);
+        if (rightIds.length) monacoEditorRight.deltaDecorations(rightIds, []);
+      }
+    }
+    rightFilePath = filePath;
+    if (state.kind === 'image') {
+      showImagePreviewRight(filePath, state.imageSrc || '');
+    } else {
+      showTextEditorRight();
+      if (monacoEditorRight) {
+        monacoEditorRight.setModel(state.model);
+      }
+    }
+    if (collabConnected && rightFilePath) {
+      sendCollabPacket('presence:file', {
+        filePath: projectPathToCollabPath(rightFilePath)
+      });
+      if (state.kind === 'text') {
+        scheduleCursorBroadcast();
+      }
+    }
   } else {
-    showTextEditor();
-    if (!monacoEditor) {
-      return;
+    if (currentFilePath && currentFilePath !== filePath) {
+      clearAllRemoteDecorations();
     }
-    monacoEditor.setModel(state.model);
+    currentFilePath = filePath;
+    if (state.kind === 'image') {
+      showImagePreview(filePath, state.imageSrc || '');
+    } else {
+      showTextEditor();
+      if (!monacoEditor) {
+        return;
+      }
+      monacoEditor.setModel(state.model);
+    }
+    if (collabConnected && currentFilePath) {
+      sendCollabPacket('presence:file', {
+        filePath: projectPathToCollabPath(currentFilePath)
+      });
+      if (state.kind === 'text') {
+        scheduleCursorBroadcast();
+      }
+    }
   }
 
-  if (collabConnected && currentFilePath) {
-    sendCollabPacket('presence:file', {
-      filePath: projectPathToCollabPath(currentFilePath)
-    });
-
-    if (state.kind === 'text') {
-      scheduleCursorBroadcast();
-    }
-  }
-
+  setActivePane(pane);
   updateEditorStatusBar();
   renderTabs();
+}
+
+function switchToFile(filePath) {
+  switchToFileInPane(filePath, 'left');
 }
 
 async function closeTab(filePath) {
@@ -6492,23 +6899,47 @@ async function closeTab(filePath) {
     }
   }
 
-  const keys = [...openFiles.keys()];
-  const idx = keys.indexOf(filePath);
+  const statePane = state.pane || 'left';
+  const leftFiles = getPaneFiles('left');
+  const rightFiles = getPaneFiles('right');
+  const leftIdx = leftFiles.indexOf(filePath);
+  const rightIdx = rightFiles.indexOf(filePath);
+
   disposeOpenFileState(state);
   openFiles.delete(filePath);
 
-  if (currentFilePath === filePath) {
-    if (openFiles.size === 0) {
+  // Right pane cleanup
+  if ((statePane === 'right' || statePane === 'both') && splitEnabled && rightFilePath === filePath) {
+    const fallback = rightFiles[rightIdx + 1] || rightFiles[rightIdx - 1] || null;
+    if (fallback) {
+      switchToFileInPane(fallback, 'right');
+    } else {
+      rightFilePath = null;
+      if (monacoEditorRight) monacoEditorRight.setModel(null);
+      editorRight.classList.add('hidden');
+      imagePreviewRight.classList.add('hidden');
+      updateEditorStatusBar();
+    }
+  }
+
+  // Left pane cleanup
+  if (statePane !== 'right' && currentFilePath === filePath) {
+    const fallback = leftFiles[leftIdx + 1] || leftFiles[leftIdx - 1] || null;
+    if (fallback) {
+      switchToFileInPane(fallback, 'left');
+    } else {
       clearAllRemoteDecorations();
       currentFilePath = null;
-      showTextEditor();
-      if (monacoEditor) {
-        monacoEditor.setModel(null);
+      if (splitEnabled) {
+        editor.classList.add('hidden');
+        imagePreview.classList.add('hidden');
+        imagePreviewImg.removeAttribute('src');
+        if (monacoEditor) monacoEditor.setModel(null);
+      } else {
+        showTextEditor();
+        if (monacoEditor) monacoEditor.setModel(null);
       }
       updateEditorStatusBar();
-    } else {
-      const fallback = keys[idx + 1] || keys[idx - 1];
-      switchToFile(fallback);
     }
   }
 
@@ -6600,10 +7031,357 @@ function initMonacoEditor() {
         scheduleCursorBroadcast();
       });
 
+      monacoEditor.onDidFocusEditorWidget(() => {
+        if (splitEnabled && activePaneId !== 'left') {
+          setActivePane('left');
+        }
+      });
+
       resolve();
     });
   });
 }
+
+function setupTabScrollbar(tabsEl, wrapEl) {
+  const thumb = document.createElement('div');
+  thumb.className = 'tab-scroll-thumb';
+  wrapEl.appendChild(thumb);
+
+  function updateThumb() {
+    const { scrollLeft, scrollWidth, clientWidth } = tabsEl;
+    if (scrollWidth <= clientWidth) {
+      thumb.style.display = 'none';
+      return;
+    }
+    thumb.style.display = '';
+    const ratio = clientWidth / scrollWidth;
+    const thumbW = Math.max(30, clientWidth * ratio);
+    const maxScroll = scrollWidth - clientWidth;
+    const maxLeft = clientWidth - thumbW;
+    thumb.style.width = `${thumbW}px`;
+    thumb.style.left = `${(scrollLeft / maxScroll) * maxLeft}px`;
+  }
+
+  tabsEl.addEventListener('scroll', updateThumb);
+  new ResizeObserver(updateThumb).observe(tabsEl);
+  new MutationObserver(updateThumb).observe(tabsEl, { childList: true });
+
+  let dragStartX = 0, dragStartScroll = 0;
+
+  thumb.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragStartX = e.clientX;
+    dragStartScroll = tabsEl.scrollLeft;
+    const { scrollWidth, clientWidth } = tabsEl;
+    const thumbW = parseFloat(thumb.style.width) || 30;
+    const maxLeft = clientWidth - thumbW;
+    const maxScroll = scrollWidth - clientWidth;
+
+    const onMove = (ev) => {
+      const dx = ev.clientX - dragStartX;
+      tabsEl.scrollLeft = dragStartScroll + (dx / maxLeft) * maxScroll;
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+function bindTabBarDragDrop(tabBar, pane) {
+  tabBar.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    tabBar.classList.add('drag-over-pane');
+  });
+  tabBar.addEventListener('dragleave', () => tabBar.classList.remove('drag-over-pane'));
+  tabBar.addEventListener('drop', (e) => {
+    e.preventDefault();
+    tabBar.classList.remove('drag-over-pane');
+
+    // Try tab-to-tab drag first (JSON payload set by buildTab dragstart).
+    let data = null;
+    try {
+      const parsed = JSON.parse(e.dataTransfer.getData('text/plain'));
+      if (parsed && parsed.filePath && parsed.pane) data = parsed;
+    } catch {
+      // not a tab drag
+    }
+
+    if (data) {
+      const { filePath, pane: srcPane } = data;
+      if (srcPane === pane) return;
+      const state = openFiles.get(filePath);
+      if (!state) return;
+
+      if (state.pane === 'both') {
+        closeTabFromPane(filePath, srcPane);
+        switchToFileInPane(filePath, pane);
+      } else {
+        const srcFiles = getPaneFiles(srcPane);
+        const srcIdx = srcFiles.indexOf(filePath);
+        const srcFallback = srcFiles[srcIdx + 1] || srcFiles[srcIdx - 1] || null;
+        state.pane = pane;
+
+        if (srcPane === 'right' && rightFilePath === filePath) {
+          if (srcFallback) {
+            switchToFileInPane(srcFallback, 'right');
+          } else {
+            rightFilePath = null;
+            if (monacoEditorRight) monacoEditorRight.setModel(null);
+            editorRight.classList.add('hidden');
+            imagePreviewRight.classList.add('hidden');
+            imagePreviewImgRight.removeAttribute('src');
+            updateEditorStatusBar();
+          }
+        } else if (srcPane === 'left' && currentFilePath === filePath) {
+          if (srcFallback) {
+            switchToFileInPane(srcFallback, 'left');
+          } else {
+            clearAllRemoteDecorations();
+            currentFilePath = null;
+            editor.classList.add('hidden');
+            imagePreview.classList.add('hidden');
+            imagePreviewImg.removeAttribute('src');
+            if (monacoEditor) monacoEditor.setModel(null);
+            updateEditorStatusBar();
+          }
+        }
+
+        switchToFileInPane(filePath, pane);
+      }
+      return;
+    }
+
+    // Explorer-to-tab-bar drag: open each dragged file in the target pane.
+    if (explorerDragState) {
+      const fileEntries = explorerDragState.entries.filter(en => en.type === 'file');
+      if (!fileEntries.length) return;
+      activePaneId = pane;
+      for (const entry of fileEntries) {
+        openFile(entry.path);
+      }
+    }
+  });
+}
+
+function syncTabBarWidthsToPanes() {
+  if (!splitEnabled) return;
+  const leftW = editorPaneLeft.getBoundingClientRect().width;
+  if (leftW > 0) {
+    editorTabsBarLeft.style.flex = `0 1 ${leftW}px`;
+    editorTabsBarRight.style.flex = '1 1 0';
+  }
+}
+
+function bindSplitDividerResize() {
+  editorPaneDivider.addEventListener('mousedown', (e) => {
+    const startX = e.clientX;
+    const leftW = editorPaneLeft.getBoundingClientRect().width;
+    const totalW = editorPaneLeft.parentElement.getBoundingClientRect().width - 4;
+    const onMove = (me) => {
+      const delta = me.clientX - startX;
+      const newLeftW = Math.max(150, Math.min(totalW - 150, leftW + delta));
+      editorPaneLeft.style.flex = `0 1 ${newLeftW}px`;
+      editorPaneRight.style.flex = '1 1 0';
+      editorTabsBarLeft.style.flex = `0 1 ${newLeftW}px`;
+      editorTabsBarRight.style.flex = '1 1 0';
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      editorPaneDivider.classList.remove('dragging');
+    };
+    editorPaneDivider.classList.add('dragging');
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+function enableSplit() {
+  splitEnabled = true;
+  editorPaneRight.classList.remove('hidden');
+  editorPaneDivider.classList.remove('hidden');
+  editorTabsBarRight.classList.remove('hidden');
+  editorPaneDividerSpacer.classList.remove('hidden');
+  splitScreenBtn.classList.add('active');
+  splitScreenBtn.title = 'Close split view';
+  splitScreenBtn.setAttribute('aria-label', 'Close split view');
+
+  if (!monacoEditorRight) {
+    monacoEditorRight = window.monaco.editor.create(editorRight, {
+      value: '',
+      language: 'plaintext',
+      theme: themeMode === 'light' ? 'vs' : 'vs-dark',
+      automaticLayout: true,
+      minimap: { enabled: false },
+      fontSize: 14,
+      fontFamily: 'Consolas, monospace',
+      wordWrap: 'off',
+      scrollbar: {
+        vertical: 'visible',
+        horizontal: 'auto',
+        verticalScrollbarSize: 12,
+        horizontalScrollbarSize: 12
+      }
+    });
+
+    const currentPrefs = loadPrefs();
+    if (currentPrefs) {
+      const rulers = (currentPrefs['editor.rulers'] || '').split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isFinite(n) && n > 0);
+      monacoEditorRight.updateOptions({
+        fontSize: currentPrefs['editor.fontSize'],
+        fontFamily: currentPrefs['editor.fontFamily'],
+        tabSize: currentPrefs['editor.tabSize'],
+        insertSpaces: currentPrefs['editor.insertSpaces'],
+        wordWrap: currentPrefs['editor.wordWrap'],
+        minimap: { enabled: currentPrefs['editor.minimap'] },
+        lineNumbers: currentPrefs['editor.lineNumbers'],
+        renderWhitespace: currentPrefs['editor.renderWhitespace'],
+        cursorStyle: currentPrefs['editor.cursorStyle'],
+        cursorBlinking: currentPrefs['editor.cursorBlinking'],
+        scrollBeyondLastLine: currentPrefs['editor.scrollBeyondLastLine'],
+        smoothScrolling: currentPrefs['editor.smoothScrolling'],
+        autoClosingBrackets: currentPrefs['editor.autoClosingBrackets'],
+        autoClosingQuotes: currentPrefs['editor.autoClosingQuotes'],
+        bracketPairColorization: { enabled: currentPrefs['editor.bracketPairColorization'] },
+        formatOnPaste: currentPrefs['editor.formatOnPaste'],
+        glyphMargin: currentPrefs['editor.glyphMargin'],
+        rulers,
+        linkedEditing: currentPrefs['editor.linkedEditing'],
+        stickyScroll: { enabled: currentPrefs['editor.stickyScroll'] },
+        letterSpacing: currentPrefs['editor.letterSpacing'],
+        lineHeight: currentPrefs['editor.lineHeight']
+      });
+    }
+
+    monacoEditorRight.onDidChangeModelContent((event) => {
+      if (activePaneId === 'right' && rightFilePath) {
+        const state = openFiles.get(rightFilePath);
+        if (state) {
+          state.encoding = inferEncodingFromText(state.model.getValue());
+
+          if (collabConnected && collabMode === 'remote') {
+            state.savedContent = state.model.getValue();
+          }
+        }
+
+        if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && rightFilePath) {
+          const collabPath = projectPathToCollabPath(rightFilePath);
+          const baseVersion = Math.max(0, Number(collabFileVersions.get(collabPath)) || 0);
+          const ops = Array.isArray(event && event.changes)
+            ? event.changes.map((change) => ({
+                offset: Math.max(0, Number(change.rangeOffset) || 0),
+                deleteCount: Math.max(0, Number(change.rangeLength) || 0),
+                insertText: String(change.text || '')
+              }))
+            : [];
+
+          if (ops.length) {
+            sendCollabRequest('file:ops', {
+              filePath: collabPath,
+              baseVersion,
+              ops
+            }).then((ack) => {
+              if (ack && typeof ack.version !== 'undefined') {
+                collabFileVersions.set(collabPath, Math.max(0, Number(ack.version) || 0));
+              }
+            }).catch(() => {});
+          }
+        }
+
+        updateEditorStatusBar();
+        renderTabs();
+        renderTree();
+      }
+    });
+
+    monacoEditorRight.onDidChangeCursorPosition(() => {
+      if (activePaneId === 'right') {
+        updateEditorStatusBar();
+        scheduleCursorBroadcast();
+      }
+    });
+
+    monacoEditorRight.onDidChangeCursorSelection(() => {
+      if (activePaneId === 'right') {
+        scheduleCursorBroadcast();
+      }
+    });
+
+    monacoEditorRight.onDidFocusEditorWidget(() => {
+      setActivePane('right');
+    });
+  }
+
+  bindSplitDividerResize();
+
+  if (currentFilePath && openFiles.size === 1) {
+    // Only one tab — duplicate it to both panes.
+    const singleState = openFiles.get(currentFilePath);
+    if (singleState) singleState.pane = 'both';
+    switchToFileInPane(currentFilePath, 'right');
+  } else if (currentFilePath && openFiles.size > 1) {
+    // Multiple tabs — move the active tab to the right pane.
+    const movedPath = currentFilePath;
+    const activeState = openFiles.get(movedPath);
+    if (activeState) activeState.pane = 'right';
+    // Left pane gets the first remaining left-side tab.
+    const leftFallback = getPaneFiles('left')[0] || null;
+    if (leftFallback) {
+      switchToFileInPane(leftFallback, 'left');
+    } else {
+      currentFilePath = null;
+      if (monacoEditor) monacoEditor.setModel(null);
+      editor.classList.add('hidden');
+      updateEditorStatusBar();
+    }
+    switchToFileInPane(movedPath, 'right');
+  } else {
+    setActivePane('right');
+    renderTabs();
+  }
+  requestAnimationFrame(syncTabBarWidthsToPanes);
+}
+
+function disableSplit() {
+  for (const [, state] of openFiles) {
+    if (state.pane === 'right' || state.pane === 'both') {
+      state.pane = 'left';
+    }
+  }
+
+  rightFilePath = null;
+  if (monacoEditorRight) {
+    monacoEditorRight.setModel(null);
+  }
+
+  editorPaneLeft.style.flex = '';
+  editorPaneRight.style.flex = '';
+  editorTabsBarLeft.style.flex = '';
+  editorTabsBarRight.style.flex = '';
+  editorPaneRight.classList.add('hidden');
+  editorPaneDivider.classList.add('hidden');
+  editorTabsBarRight.classList.add('hidden');
+  editorPaneDividerSpacer.classList.add('hidden');
+  splitEnabled = false;
+  splitScreenBtn.classList.remove('active');
+  splitScreenBtn.title = 'Split editor';
+  splitScreenBtn.setAttribute('aria-label', 'Split editor');
+
+  setActivePane('left');
+  renderTabs();
+}
+
+splitScreenBtn.addEventListener('click', () => {
+  if (splitEnabled) {
+    disableSplit();
+  } else {
+    enableSplit();
+  }
+});
 
 function buildTreeNode(node) {
   const item = document.createElement('li');
@@ -8409,9 +9187,12 @@ function getNormalizedSelectionRange(model, selection) {
 }
 
 function clearRemoteDecorationsForClient(clientId) {
-  const decorationIds = collabRemoteCursorDecorations.get(clientId) || [];
-  if (decorationIds.length && monacoEditor && monacoEditor.getModel()) {
-    monacoEditor.deltaDecorations(decorationIds, []);
+  const entry = collabRemoteCursorDecorations.get(clientId);
+  if (entry && entry.ids.length) {
+    const editorToClear = entry.pane === 'right' ? monacoEditorRight : monacoEditor;
+    if (editorToClear && editorToClear.getModel()) {
+      editorToClear.deltaDecorations(entry.ids, []);
+    }
   }
 
   collabRemoteCursorDecorations.delete(clientId);
@@ -8748,16 +9529,16 @@ function applyRemoteOperationBatchToModel(filePath, ops, nextVersion) {
 }
 
 function updateRemoteCursorDecoration(clientId, name, filePath, position, selection) {
-  if (!monacoEditor || !monacoEditor.getModel() || !currentFilePath) {
-    return;
-  }
+  const inLeft = currentFilePath === filePath && monacoEditor && monacoEditor.getModel();
+  const inRight = splitEnabled && rightFilePath === filePath && monacoEditorRight && monacoEditorRight.getModel();
 
-  const model = monacoEditor.getModel();
-  if (currentFilePath !== filePath) {
+  if (!inLeft && !inRight) {
     clearRemoteDecorationsForClient(clientId);
     return;
   }
 
+  const targetEditor = inRight ? monacoEditorRight : monacoEditor;
+  const model = targetEditor.getModel();
   const color = getCollabColorById(clientId);
   const classSuffix = `remote-cursor-${String(clientId).replace(/[^a-z0-9_-]/gi, '').slice(0, 24)}`;
 
@@ -8776,9 +9557,12 @@ function updateRemoteCursorDecoration(clientId, name, filePath, position, select
   }
 
   styleTag.textContent = `
-    #editor .${classSuffix}, #editor .${classSuffix}-label { --collab-color: ${color}; }
-    #editor .${classSuffix}-label::after { content: '${String(name || 'Peer').replace(/'/g, "\\'")}'; background: ${color}; }
-    #editor .${classSuffix}-selection { background-color: ${collabColorWithAlpha(color, 0.24)}; }
+    #editor .${classSuffix}, #editor .${classSuffix}-label,
+    #editorRight .${classSuffix}, #editorRight .${classSuffix}-label { --collab-color: ${color}; }
+    #editor .${classSuffix}-label::after,
+    #editorRight .${classSuffix}-label::after { content: '${String(name || 'Peer').replace(/'/g, "\\'")}'; background: ${color}; }
+    #editor .${classSuffix}-selection,
+    #editorRight .${classSuffix}-selection { background-color: ${collabColorWithAlpha(color, 0.24)}; }
   `;
 
   const nextDecorations = [];
@@ -8796,7 +9580,7 @@ function updateRemoteCursorDecoration(clientId, name, filePath, position, select
     const column = Math.max(1, Number(position.column) || 1);
     const safeLine = Math.min(line, model.getLineCount());
     const safeColumn = Math.min(column, model.getLineMaxColumn(safeLine));
-    const visiblePosition = monacoEditor.getScrolledVisiblePosition(
+    const visiblePosition = targetEditor.getScrolledVisiblePosition(
       new window.monaco.Position(safeLine, safeColumn)
     );
     const placeLabelBelow = Boolean(visiblePosition && Number(visiblePosition.top) <= 22);
@@ -8816,9 +9600,20 @@ function updateRemoteCursorDecoration(clientId, name, filePath, position, select
     });
   }
 
-  const oldDecorations = collabRemoteCursorDecorations.get(clientId) || [];
-  const appliedDecorations = monacoEditor.deltaDecorations(oldDecorations, nextDecorations);
-  collabRemoteCursorDecorations.set(clientId, appliedDecorations);
+  const targetPane = inRight ? 'right' : 'left';
+  const oldEntry = collabRemoteCursorDecorations.get(clientId);
+
+  // If the cursor was previously rendered in a different editor, clear it from that editor first.
+  if (oldEntry && oldEntry.pane !== targetPane && oldEntry.ids.length) {
+    const prevEditor = oldEntry.pane === 'right' ? monacoEditorRight : monacoEditor;
+    if (prevEditor && prevEditor.getModel()) {
+      prevEditor.deltaDecorations(oldEntry.ids, []);
+    }
+  }
+
+  const oldIds = (oldEntry && oldEntry.pane === targetPane) ? oldEntry.ids : [];
+  const appliedIds = targetEditor.deltaDecorations(oldIds, nextDecorations);
+  collabRemoteCursorDecorations.set(clientId, { pane: targetPane, ids: appliedIds });
   collabRemoteCursorNames.set(clientId, name || 'Peer');
 }
 
@@ -9229,7 +10024,10 @@ async function stopCollaborationSession() {
 }
 
 function scheduleCursorBroadcast() {
-  if (!collabConnected || !currentFilePath || !monacoEditor || collabSuppressBroadcast) {
+  const activeFilePath = splitEnabled && activePaneId === 'right' ? rightFilePath : currentFilePath;
+  const activeEditor = splitEnabled && activePaneId === 'right' ? monacoEditorRight : monacoEditor;
+
+  if (!collabConnected || !activeFilePath || !activeEditor || collabSuppressBroadcast) {
     return;
   }
 
@@ -9239,14 +10037,14 @@ function scheduleCursorBroadcast() {
 
   collabCursorBroadcastTimer = setTimeout(() => {
     collabCursorBroadcastTimer = null;
-    const position = monacoEditor.getPosition();
-    const selection = monacoEditor.getSelection();
+    const position = activeEditor.getPosition();
+    const selection = activeEditor.getSelection();
     if (!position || !selection) {
       return;
     }
 
     sendCollabPacket('cursor:update', {
-      filePath: projectPathToCollabPath(currentFilePath),
+      filePath: projectPathToCollabPath(activeFilePath),
       position: {
         lineNumber: position.lineNumber,
         column: position.column
@@ -9291,9 +10089,22 @@ async function openFile(filePath, options = {}) {
     }
   }
 
+  const targetPane = splitEnabled ? activePaneId : 'left';
+
   if (openFiles.has(filePath)) {
+    const existing = openFiles.get(filePath);
+
+    // A file is "in the target pane" if its tab is already shown there.
+    const isInTargetPane = !splitEnabled
+      || existing.pane === 'both'
+      || (targetPane === 'left' ? existing.pane === 'left' : existing.pane === 'right');
+
+    if (!isInTargetPane) {
+      // File is only in the other pane — open it in both panes.
+      existing.pane = 'both';
+    }
+
     if (mode === 'permanent') {
-      const existing = openFiles.get(filePath);
       existing.preview = false;
       if (previewFilePath === filePath) {
         previewFilePath = null;
@@ -9301,7 +10112,7 @@ async function openFile(filePath, options = {}) {
       renderTabs();
     }
 
-    switchToFile(filePath);
+    switchToFileInPane(filePath, targetPane);
     return;
   }
 
@@ -9342,7 +10153,8 @@ async function openFile(filePath, options = {}) {
         zoom: 1,
         scrollLeft: 0,
         scrollTop: 0
-      }
+      },
+      pane: targetPane
     });
   } else {
     let content = '';
@@ -9369,13 +10181,14 @@ async function openFile(filePath, options = {}) {
       model,
       savedContent: content,
       preview: openAsPreview,
-      encoding
+      encoding,
+      pane: targetPane
     });
   }
 
   previewFilePath = openAsPreview ? filePath : null;
 
-  switchToFile(filePath);
+  switchToFileInPane(filePath, targetPane);
 }
 
 async function saveCurrentFile() {
@@ -10460,6 +11273,20 @@ document.addEventListener('mousemove', (event) => {
     }
   }
 
+  if (imagePanStateRight) {
+    const deltaX = event.clientX - imagePanStateRight.startX;
+    const deltaY = event.clientY - imagePanStateRight.startY;
+    imagePreviewRight.scrollLeft = imagePanStateRight.startScrollLeft - deltaX;
+    imagePreviewRight.scrollTop = imagePanStateRight.startScrollTop - deltaY;
+
+    const state = rightFilePath ? openFiles.get(rightFilePath) : null;
+    if (state && state.kind === 'image') {
+      const view = ensureImageViewStateRight(state);
+      view.scrollLeft = imagePreviewRight.scrollLeft;
+      view.scrollTop = imagePreviewRight.scrollTop;
+    }
+  }
+
   if (sidebarResizeState) {
     const deltaX = event.clientX - sidebarResizeState.startX;
     applySidebarWidth(sidebarResizeState.startWidth + deltaX);
@@ -10494,11 +11321,13 @@ document.addEventListener('mousemove', (event) => {
 
 document.addEventListener('mouseup', () => {
   stopImagePan();
+  stopImagePanRight();
   clearResizeState();
 });
 
 window.addEventListener('blur', () => {
   stopImagePan();
+  stopImagePanRight();
   clearResizeState();
 });
 
@@ -10513,6 +11342,13 @@ window.addEventListener('resize', () => {
     }
   }
 
+  if (rightFilePath) {
+    const state = openFiles.get(rightFilePath);
+    if (state && state.kind === 'image' && !imagePreviewRight.classList.contains('hidden')) {
+      applyImagePreviewViewportRight();
+    }
+  }
+
   if (monacoEditor) {
     monacoEditor.layout();
   }
@@ -10522,6 +11358,10 @@ window.addEventListener('resize', () => {
     api.resizeTerminal({ termId: activeTerminalId, cols: terminal.cols, rows: terminal.rows });
   }
 });
+
+new ResizeObserver(() => {
+  syncTabBarWidthsToPanes();
+}).observe(editorPanes);
 
 window.addEventListener('beforeunload', (event) => {
   if (isWindowCloseApproved || !hasDirtyFiles()) {
@@ -10544,6 +11384,11 @@ window.addEventListener('beforeunload', (event) => {
     await api.dispatchAppCommand('window:close');
   });
 });
+
+bindTabBarDragDrop(editorTabsBarLeft, 'left');
+bindTabBarDragDrop(editorTabsBarRight, 'right');
+setupTabScrollbar(editorTabs, editorTabsBarLeft);
+setupTabScrollbar(editorTabsRight, editorTabsBarRight);
 
 Promise.all([refreshProjectTree(), initMonacoEditor(), refreshRecentProjectsCache()])
   .then(async () => {
