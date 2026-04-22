@@ -206,6 +206,7 @@ let launchEditorState = {
 };
 let scmRefreshInProgress = false;
 let scmSyncMode = 'fetch';
+let gitChangedPaths = new Set();
 let scmState = 'no-project';
 let sidebarResizeState = null;
 let themeMode = 'dark';
@@ -472,7 +473,7 @@ const terminal = new Terminal({
   convertEol: true,
   cursorBlink: true,
   fontFamily: 'Consolas, monospace',
-  fontSize: 13,
+  fontSize: 14,
   theme: {
     background: '#0d1723',
     foreground: '#d6e9ff',
@@ -4418,11 +4419,14 @@ async function refreshSourceControlPanel() {
   try {
     const overview = await api.getGitOverview();
     if (overview.state === 'no-project') {
+      gitChangedPaths = new Set();
       applyScmState('no-project');
       return;
     }
 
     if (overview.state === 'no-repo') {
+      gitChangedPaths = new Set();
+      renderTree();
       applyScmState('no-repo');
       return;
     }
@@ -4432,6 +4436,12 @@ async function refreshSourceControlPanel() {
     scmSyncMode = hasRemoteChangesToPull(overview.branchLine) ? 'pull' : 'fetch';
     updateScmSyncButton();
     const changedFiles = Array.isArray(overview.files) ? overview.files : [];
+    const rootNorm = (project.rootPath || '').replace(/\\/g, '/').replace(/\/+$/, '');
+    gitChangedPaths = new Set(changedFiles.map(f => {
+      const relPath = f.path.includes(' -> ') ? f.path.split(' -> ').pop() : f.path;
+      return `${rootNorm}/${relPath}`.toLowerCase();
+    }));
+    renderTree();
     renderChangedFilesList(changedFiles);
     updateScmBadge(changedFiles.length, true);
     renderBranches(overview.branches || []);
@@ -5428,7 +5438,7 @@ function renderMenuBar() {
 
 const PREFS_SCHEMA = [
   // ── Editor ──────────────────────────────────────────────────────────────
-  { id: 'editor.fontSize', label: 'Font Size', description: 'Controls the font size in pixels for the editor.', category: 'editor', type: 'number', default: 14, min: 8, max: 32, step: 1 },
+  { id: 'editor.fontSize', label: 'Font Size', description: 'Controls the font size in pixels for the editor.', category: 'editor', type: 'number', default: 16, min: 8, max: 32, step: 1 },
   { id: 'editor.fontFamily', label: 'Font Family', description: 'Controls the font family used in the editor.', category: 'editor', type: 'text', default: 'Consolas, monospace' },
   { id: 'editor.tabSize', label: 'Tab Size', description: 'The number of spaces a tab is equal to.', category: 'editor', type: 'number', default: 4, min: 1, max: 8, step: 1 },
   { id: 'editor.insertSpaces', label: 'Insert Spaces', description: 'Insert spaces when pressing Tab instead of a tab character.', category: 'editor', type: 'boolean', default: true },
@@ -5453,9 +5463,9 @@ const PREFS_SCHEMA = [
   { id: 'editor.lineHeight', label: 'Line Height', description: 'Controls the line height. 0 means auto-computed.', category: 'editor', type: 'number', default: 0, min: 0, max: 100, step: 1 },
   // ── Appearance ────────────────────────────────────────────────────────
   { id: 'appearance.theme', label: 'Color Theme', description: 'Selects the overall color theme for the IDE.', category: 'appearance', type: 'select', default: 'dark', options: ['dark', 'light'] },
-  { id: 'appearance.uiFontSize', label: 'UI Font Size', description: 'Controls the base font size for the IDE interface (px).', category: 'appearance', type: 'number', default: 13, min: 10, max: 20, step: 1 },
+  { id: 'appearance.uiFontSize', label: 'UI Font Size', description: 'Controls the base font size for the IDE interface (px).', category: 'appearance', type: 'number', default: 16, min: 10, max: 20, step: 1 },
   // ── Terminal ──────────────────────────────────────────────────────────
-  { id: 'terminal.fontSize', label: 'Font Size', description: 'Controls the font size in pixels for the integrated terminal.', category: 'terminal', type: 'number', default: 13, min: 8, max: 24, step: 1 },
+  { id: 'terminal.fontSize', label: 'Font Size', description: 'Controls the font size in pixels for the integrated terminal.', category: 'terminal', type: 'number', default: 14, min: 8, max: 24, step: 1 },
   { id: 'terminal.fontFamily', label: 'Font Family', description: 'Controls the font family used in the integrated terminal.', category: 'terminal', type: 'text', default: 'Consolas, monospace' },
   { id: 'terminal.cursorBlink', label: 'Cursor Blink', description: 'Whether the terminal cursor blinks.', category: 'terminal', type: 'boolean', default: true },
   { id: 'terminal.cursorStyle', label: 'Cursor Style', description: 'Controls the cursor appearance in the terminal.', category: 'terminal', type: 'select', default: 'block', options: ['block', 'underline', 'bar'] },
@@ -5562,7 +5572,7 @@ function applyPrefs(prefs) {
     applyTheme(prefs['appearance.theme']);
   }
 
-  const uiFontSize = prefs['appearance.uiFontSize'] || 13;
+  const uiFontSize = prefs['appearance.uiFontSize'] || 16;
   document.documentElement.style.setProperty('--ui-font-size', `${uiFontSize}px`);
 
   terminal.options.fontSize = prefs['terminal.fontSize'];
@@ -6640,6 +6650,59 @@ function isDirty(filePath) {
   return state.model.getValue() !== state.savedContent;
 }
 
+function reorderOpenFile(draggedPath, targetPath, insertBefore) {
+  if (draggedPath === targetPath) return;
+  const entries = [...openFiles.entries()];
+  const draggedIdx = entries.findIndex(([p]) => p === draggedPath);
+  if (draggedIdx === -1) return;
+  const [draggedEntry] = entries.splice(draggedIdx, 1);
+  const newTargetIdx = entries.findIndex(([p]) => p === targetPath);
+  if (newTargetIdx === -1) return;
+  entries.splice(insertBefore ? newTargetIdx : newTargetIdx + 1, 0, draggedEntry);
+  openFiles.clear();
+  for (const [p, s] of entries) openFiles.set(p, s);
+  renderTabs();
+}
+
+function moveTabBetweenPanes(filePath, srcPane, destPane) {
+  const state = openFiles.get(filePath);
+  if (!state) return;
+  if (state.pane === 'both') {
+    closeTabFromPane(filePath, srcPane);
+    switchToFileInPane(filePath, destPane);
+    return;
+  }
+  const srcFiles = getPaneFiles(srcPane);
+  const srcIdx = srcFiles.indexOf(filePath);
+  const srcFallback = srcFiles[srcIdx + 1] || srcFiles[srcIdx - 1] || null;
+  state.pane = destPane;
+  if (srcPane === 'right' && rightFilePath === filePath) {
+    if (srcFallback) {
+      switchToFileInPane(srcFallback, 'right');
+    } else {
+      rightFilePath = null;
+      if (monacoEditorRight) monacoEditorRight.setModel(null);
+      editorRight.classList.add('hidden');
+      imagePreviewRight.classList.add('hidden');
+      imagePreviewImgRight.removeAttribute('src');
+      updateEditorStatusBar();
+    }
+  } else if (srcPane === 'left' && currentFilePath === filePath) {
+    if (srcFallback) {
+      switchToFileInPane(srcFallback, 'left');
+    } else {
+      clearAllRemoteDecorations();
+      currentFilePath = null;
+      editor.classList.add('hidden');
+      imagePreview.classList.add('hidden');
+      imagePreviewImg.removeAttribute('src');
+      if (monacoEditor) monacoEditor.setModel(null);
+      updateEditorStatusBar();
+    }
+  }
+  switchToFileInPane(filePath, destPane);
+}
+
 function buildTab(filePath, isActive, pane, options = {}) {
   const tab = document.createElement('div');
   tab.className = `tab${isActive ? ' active' : ''}`;
@@ -6678,15 +6741,43 @@ function buildTab(filePath, isActive, pane, options = {}) {
   }
   tab.appendChild(close);
 
-  if (splitEnabled) {
-    tab.draggable = true;
-    tab.addEventListener('dragstart', (e) => {
-      e.dataTransfer.setData('text/plain', JSON.stringify({ filePath, pane }));
-      e.dataTransfer.effectAllowed = 'move';
-      tab.classList.add('dragging');
-    });
-    tab.addEventListener('dragend', () => tab.classList.remove('dragging'));
-  }
+  tab.draggable = true;
+  tab.addEventListener('dragstart', (e) => {
+    e.dataTransfer.setData('text/plain', JSON.stringify({ filePath, pane }));
+    e.dataTransfer.effectAllowed = 'move';
+    tab.classList.add('dragging');
+  });
+  tab.addEventListener('dragend', () => {
+    tab.classList.remove('dragging');
+    document.querySelectorAll('.tab.drag-insert-before, .tab.drag-insert-after')
+      .forEach(t => t.classList.remove('drag-insert-before', 'drag-insert-after'));
+  });
+  tab.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const insertBefore = e.clientX < tab.getBoundingClientRect().left + tab.getBoundingClientRect().width / 2;
+    tab.classList.toggle('drag-insert-before', insertBefore);
+    tab.classList.toggle('drag-insert-after', !insertBefore);
+  });
+  tab.addEventListener('dragleave', () => {
+    tab.classList.remove('drag-insert-before', 'drag-insert-after');
+  });
+  tab.addEventListener('drop', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    tab.classList.remove('drag-insert-before', 'drag-insert-after');
+    let data = null;
+    try { data = JSON.parse(e.dataTransfer.getData('text/plain')); } catch {}
+    if (!data?.filePath) return;
+    const { filePath: draggedPath, pane: srcPane } = data;
+    if (draggedPath === filePath) return;
+    if (srcPane === pane || !splitEnabled) {
+      const insertBefore = e.clientX < tab.getBoundingClientRect().left + tab.getBoundingClientRect().width / 2;
+      reorderOpenFile(draggedPath, filePath, insertBefore);
+    } else {
+      moveTabBetweenPanes(draggedPath, srcPane, pane);
+    }
+  });
 
   return tab;
 }
@@ -7112,46 +7203,7 @@ function bindTabBarDragDrop(tabBar, pane) {
 
     if (data) {
       const { filePath, pane: srcPane } = data;
-      if (srcPane === pane) return;
-      const state = openFiles.get(filePath);
-      if (!state) return;
-
-      if (state.pane === 'both') {
-        closeTabFromPane(filePath, srcPane);
-        switchToFileInPane(filePath, pane);
-      } else {
-        const srcFiles = getPaneFiles(srcPane);
-        const srcIdx = srcFiles.indexOf(filePath);
-        const srcFallback = srcFiles[srcIdx + 1] || srcFiles[srcIdx - 1] || null;
-        state.pane = pane;
-
-        if (srcPane === 'right' && rightFilePath === filePath) {
-          if (srcFallback) {
-            switchToFileInPane(srcFallback, 'right');
-          } else {
-            rightFilePath = null;
-            if (monacoEditorRight) monacoEditorRight.setModel(null);
-            editorRight.classList.add('hidden');
-            imagePreviewRight.classList.add('hidden');
-            imagePreviewImgRight.removeAttribute('src');
-            updateEditorStatusBar();
-          }
-        } else if (srcPane === 'left' && currentFilePath === filePath) {
-          if (srcFallback) {
-            switchToFileInPane(srcFallback, 'left');
-          } else {
-            clearAllRemoteDecorations();
-            currentFilePath = null;
-            editor.classList.add('hidden');
-            imagePreview.classList.add('hidden');
-            imagePreviewImg.removeAttribute('src');
-            if (monacoEditor) monacoEditor.setModel(null);
-            updateEditorStatusBar();
-          }
-        }
-
-        switchToFileInPane(filePath, pane);
-      }
+      if (srcPane !== pane) moveTabBetweenPanes(filePath, srcPane, pane);
       return;
     }
 
@@ -7388,7 +7440,29 @@ function buildTreeNode(node) {
   const row = document.createElement('div');
   row.className = 'tree-node';
   row.dataset.path = node.path;
-  row.draggable = true;
+  row.draggable = false;
+
+  let _dragReady = false;
+  row.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    const startX = e.clientX, startY = e.clientY;
+    _dragReady = false;
+    const onMove = (me) => {
+      const dx = me.clientX - startX, dy = me.clientY - startY;
+      if (dx * dx + dy * dy > 16) {
+        _dragReady = true;
+        row.draggable = true;
+        document.removeEventListener('mousemove', onMove);
+      }
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      setTimeout(() => { row.draggable = false; }, 0);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
 
   if (node.ignored) {
     row.classList.add('ignored');
@@ -7410,8 +7484,12 @@ function buildTreeNode(node) {
   label.className = 'tree-node-label';
   label.textContent = node.name;
 
+  if (node.type === 'file' && gitChangedPaths.has(node.path.replace(/\\/g, '/').toLowerCase())) {
+    label.classList.add('git-modified');
+  }
+
   row.addEventListener('dragstart', (event) => {
-    if (inlineEditState || !event.dataTransfer) {
+    if (!_dragReady || inlineEditState || !event.dataTransfer) {
       event.preventDefault();
       return;
     }
@@ -7439,6 +7517,8 @@ function buildTreeNode(node) {
   });
 
   row.addEventListener('dragend', () => {
+    _dragReady = false;
+    row.draggable = false;
     explorerDragState = null;
     clearExplorerDragVisualState();
   });

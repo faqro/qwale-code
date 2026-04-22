@@ -10,7 +10,7 @@
   --danger: #de5656;
   --border: #2f4561;
   --topbar-h: 56px;
-  --ui-font-size: 13px;
+  --ui-font-size: 16px;
 }
 
 * {
@@ -439,8 +439,8 @@ body {
 }
 
 .confirm-btn.primary {
-  background: #2f7fe6;
-  border-color: #3d92ff;
+  background: #5a52c4;
+  border-color: #766ff0;
 }
 
 .confirm-btn.danger {
@@ -2308,6 +2308,10 @@ body {
   text-overflow: ellipsis;
 }
 
+.tree-node-label.git-modified {
+  color: #e8a44a;
+}
+
 .tree-inline-input {
   flex: 1;
   min-width: 80px;
@@ -2835,6 +2839,14 @@ body.light-theme .editor-pane-divider.dragging {
 
 .tab.dragging {
   opacity: 0.35;
+}
+
+.tab.drag-insert-before {
+  box-shadow: -2px 0 0 0 #8c85ff;
+}
+
+.tab.drag-insert-after {
+  box-shadow: 2px 0 0 0 #8c85ff;
 }
 
 #editor,
@@ -4430,6 +4442,10 @@ body.light-theme .tree-node.multi-selected {
 
 body.light-theme .tree-node.ignored {
   opacity: 0.52;
+}
+
+body.light-theme .tree-node-label.git-modified {
+  color: #b85e00;
 }
 
 body.light-theme .explorer-side-tabs {
