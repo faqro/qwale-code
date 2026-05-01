@@ -218,6 +218,11 @@ let aiBusy = false;
 let aiAbortController = null;
 let aiConversation = [];
 let aiConversationCursor = -1;
+const LOCAL_FILE_PREFIX = '__local__/';
+let collabProjectFingerprint = null;
+let collabLocalFiles = new Map();   // '__local__/<name>' → { name, content, dirty }
+let collabLocalFolders = new Map(); // '__local__/<folderName>' → { name, expanded }
+let collabLocalGitignorePatterns = '';
 let collabSocket = null;
 let collabConnected = false;
 let collabClientId = null;
@@ -2064,7 +2069,18 @@ async function deleteExplorerEntries(entries) {
   }
 
   for (const entry of compacted) {
-    if (collabConnected && collabMode === 'remote') {
+    if (entry.path.startsWith(LOCAL_FILE_PREFIX)) {
+      const name = entry.path.slice(LOCAL_FILE_PREFIX.length);
+      await api.deleteCollabLocalFile({ fingerprint: collabProjectFingerprint, name });
+      if (collabLocalFolders.has(entry.path)) {
+        collabLocalFolders.delete(entry.path);
+        for (const key of [...collabLocalFiles.keys()]) {
+          if (key.startsWith(entry.path + '/')) collabLocalFiles.delete(key);
+        }
+      } else {
+        collabLocalFiles.delete(entry.path);
+      }
+    } else if (collabConnected && collabMode === 'remote') {
       await sendCollabRequest('file:operation', {
         operation: {
           type: 'delete',
@@ -4900,7 +4916,44 @@ async function commitInlineEdit(name) {
     return;
   }
 
-  if (state.mode === 'rename') {
+  if (state.mode === 'rename' && state.targetPath && state.targetPath.startsWith(LOCAL_FILE_PREFIX)) {
+    const oldName = state.targetPath.slice(LOCAL_FILE_PREFIX.length);
+    const oldBasename = oldName.split('/').pop();
+    if (trimmed !== oldBasename) {
+      if (collabLocalFolders.has(state.targetPath)) {
+        // Renaming a local folder
+        await api.renameCollabLocalFile({ fingerprint: collabProjectFingerprint, oldName, newName: trimmed });
+        const newKey = LOCAL_FILE_PREFIX + trimmed;
+        const folderEntry = collabLocalFolders.get(state.targetPath);
+        collabLocalFolders.delete(state.targetPath);
+        collabLocalFolders.set(newKey, { ...(folderEntry || {}), name: trimmed });
+        // Remap all child file keys
+        const oldPrefix = state.targetPath + '/';
+        const newPrefix = newKey + '/';
+        for (const [fileKey, fileEntry] of [...collabLocalFiles.entries()]) {
+          if (fileKey.startsWith(oldPrefix)) {
+            const newFileKey = newPrefix + fileKey.slice(oldPrefix.length);
+            const newFileName = trimmed + '/' + fileEntry.name.split('/').pop();
+            collabLocalFiles.delete(fileKey);
+            collabLocalFiles.set(newFileKey, { ...fileEntry, name: newFileName });
+            remapOpenFilesForPathChange(fileKey, newFileKey, false);
+          }
+        }
+      } else {
+        // Renaming a file (potentially inside a folder)
+        const parentFolder = oldName.includes('/') ? oldName.split('/')[0] + '/' : '';
+        const newName = parentFolder + trimmed;
+        await api.renameCollabLocalFile({ fingerprint: collabProjectFingerprint, oldName, newName });
+        const newKey = LOCAL_FILE_PREFIX + newName;
+        const entry = collabLocalFiles.get(state.targetPath);
+        collabLocalFiles.delete(state.targetPath);
+        collabLocalFiles.set(newKey, { ...(entry || {}), name: newName });
+        remapOpenFilesForPathChange(state.targetPath, newKey, false);
+      }
+    }
+    renderTree();
+    return;
+  } else if (state.mode === 'rename') {
     let renamedPath = null;
     if (collabConnected && collabMode === 'remote') {
       const response = await sendCollabRequest('file:operation', {
@@ -4941,44 +4994,72 @@ async function commitInlineEdit(name) {
     }
   } else if (state.mode === 'create') {
     if (state.targetType === 'folder') {
-      if (collabConnected && collabMode === 'remote') {
-        await sendCollabRequest('file:operation', {
-          operation: {
-            type: 'create-folder',
-            parentPath: projectPathToCollabPath(state.parentPath),
-            name: trimmed
-          }
-        });
-      } else if (collabConnected) {
-        await sendCollabRequest('file:operation', {
-          operation: {
-            type: 'create-folder',
-            parentPath: projectPathToCollabPath(state.parentPath),
-            name: trimmed
-          }
-        });
-      } else {
-        await api.createFolder({ parentPath: state.parentPath, name: trimmed });
+      if (collabConnected && collabMode === 'remote' && isClientIgnoredPath(trimmed)) {
+        await createLocalCollabFolder(trimmed);
+        return;
+      }
+      try {
+        if (collabConnected && collabMode === 'remote') {
+          await sendCollabRequest('file:operation', {
+            operation: {
+              type: 'create-folder',
+              parentPath: projectPathToCollabPath(state.parentPath),
+              name: trimmed
+            }
+          });
+        } else if (collabConnected) {
+          await sendCollabRequest('file:operation', {
+            operation: {
+              type: 'create-folder',
+              parentPath: projectPathToCollabPath(state.parentPath),
+              name: trimmed
+            }
+          });
+        } else {
+          await api.createFolder({ parentPath: state.parentPath, name: trimmed });
+        }
+      } catch (err) {
+        alert(`Could not create folder: ${err && err.message ? err.message : String(err)}`);
+        renderTree();
+        return;
       }
     } else {
-      if (collabConnected && collabMode === 'remote') {
-        await sendCollabRequest('file:operation', {
-          operation: {
-            type: 'create-file',
-            parentPath: projectPathToCollabPath(state.parentPath),
-            name: trimmed
-          }
-        });
-      } else if (collabConnected) {
-        await sendCollabRequest('file:operation', {
-          operation: {
-            type: 'create-file',
-            parentPath: projectPathToCollabPath(state.parentPath),
-            name: trimmed
-          }
-        });
+      if (state.parentPath === LOCAL_FILE_PREFIX) {
+        await createLocalCollabFile(trimmed);
+        return;
+      } else if (state.parentPath.startsWith(LOCAL_FILE_PREFIX) && state.parentPath.endsWith('/')) {
+        const folderName = state.parentPath.slice(LOCAL_FILE_PREFIX.length, -1);
+        await createLocalCollabFile(folderName + '/' + trimmed);
+        return;
+      } else if (collabConnected && collabMode === 'remote' && isClientIgnoredPath(trimmed)) {
+        await createLocalCollabFile(trimmed);
+        return;
       } else {
-        await api.createFile({ parentPath: state.parentPath, name: trimmed });
+        try {
+          if (collabConnected && collabMode === 'remote') {
+            await sendCollabRequest('file:operation', {
+              operation: {
+                type: 'create-file',
+                parentPath: projectPathToCollabPath(state.parentPath),
+                name: trimmed
+              }
+            });
+          } else if (collabConnected) {
+            await sendCollabRequest('file:operation', {
+              operation: {
+                type: 'create-file',
+                parentPath: projectPathToCollabPath(state.parentPath),
+                name: trimmed
+              }
+            });
+          } else {
+            await api.createFile({ parentPath: state.parentPath, name: trimmed });
+          }
+        } catch (err) {
+          alert(`Could not create file: ${err && err.message ? err.message : String(err)}`);
+          renderTree();
+          return;
+        }
       }
     }
   }
@@ -5112,8 +5193,16 @@ function hasDirtyFiles() {
   return false;
 }
 
+function hasLocalFileSaveTarget() {
+  // True when a local collab file is the active file and open for editing
+  const active = currentFilePath || (splitEnabled && activePaneId === 'right' ? rightFilePath : null);
+  if (!active || !active.startsWith(LOCAL_FILE_PREFIX)) return false;
+  const state = openFiles.get(active);
+  return !!(state && state.kind === 'text');
+}
+
 function canRunSaveActions() {
-  return openFiles.size > 0 && hasDirtyFiles();
+  return (openFiles.size > 0 && hasDirtyFiles()) || hasLocalFileSaveTarget();
 }
 
 function inferEncodingFromText(content) {
@@ -6639,6 +6728,13 @@ function disposeOpenFileState(state) {
 }
 
 function isDirty(filePath) {
+  if (String(filePath || '').startsWith(LOCAL_FILE_PREFIX)) {
+    const state = openFiles.get(filePath);
+    if (!state || state.kind !== 'text') return false;
+    const entry = collabLocalFiles.get(filePath);
+    return state.model.getValue() !== (entry && entry.content !== null ? entry.content : state.savedContent);
+  }
+
   if (isCollabAutosaveMode()) {
     return false;
   }
@@ -6710,7 +6806,9 @@ function buildTab(filePath, isActive, pane, options = {}) {
 
   const fileIcon = createFileTypeIconElement(filePath, 'tab-file-icon');
   const label = document.createElement('span');
-  label.textContent = getFileName(filePath);
+  label.textContent = String(filePath || '').startsWith(LOCAL_FILE_PREFIX)
+    ? filePath.slice(LOCAL_FILE_PREFIX.length)
+    : getFileName(filePath);
 
   const close = document.createElement('span');
   close.className = 'tab-close';
@@ -7082,7 +7180,11 @@ function initMonacoEditor() {
           }
         }
 
-        if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && currentFilePath) {
+        if (currentFilePath && currentFilePath.startsWith(LOCAL_FILE_PREFIX)) {
+          const entry = collabLocalFiles.get(currentFilePath);
+          if (entry) { entry.dirty = true; }
+          renderTabs();
+        } else if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && currentFilePath) {
           const collabPath = projectPathToCollabPath(currentFilePath);
           const baseVersion = Math.max(0, Number(collabFileVersions.get(collabPath)) || 0);
           const ops = Array.isArray(event && event.changes)
@@ -7320,7 +7422,11 @@ function enableSplit() {
           }
         }
 
-        if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && rightFilePath) {
+        if (rightFilePath && rightFilePath.startsWith(LOCAL_FILE_PREFIX)) {
+          const entry = collabLocalFiles.get(rightFilePath);
+          if (entry) { entry.dirty = true; }
+          renderTabs();
+        } else if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && rightFilePath) {
           const collabPath = projectPathToCollabPath(rightFilePath);
           const baseVersion = Math.max(0, Number(collabFileVersions.get(collabPath)) || 0);
           const ops = Array.isArray(event && event.changes)
@@ -7555,7 +7661,7 @@ function buildTreeNode(node) {
     });
 
     input.addEventListener('blur', async () => {
-      await commit();
+      if (document.body.contains(input)) await commit();
     });
 
     requestAnimationFrame(() => {
@@ -7686,7 +7792,7 @@ function buildTreeNode(node) {
         });
 
         createInput.addEventListener('blur', async () => {
-          await commitCreate();
+          if (document.body.contains(createInput)) await commitCreate();
         });
 
         createRow.appendChild(createIcon);
@@ -7770,6 +7876,330 @@ function buildTreeNode(node) {
   return item;
 }
 
+function promptNewLocalFile() {
+  inlineEditState = { mode: 'create', targetType: 'file', parentPath: LOCAL_FILE_PREFIX, value: '' };
+  renderTree();
+}
+
+function buildLocalInlineCreateInput(parentPath, placeholder) {
+  const createItem = document.createElement('li');
+  const createRow = document.createElement('div');
+  createRow.className = 'tree-node local-file-node';
+  const createIcon = document.createElement('span');
+  createIcon.className = `file-type-icon ${getFileTypeIconClass('new.txt')}`;
+  const createInput = document.createElement('input');
+  createInput.className = 'tree-inline-input';
+  createInput.type = 'text';
+  createInput.placeholder = placeholder;
+  const commitCreate = async () => { await commitInlineEdit(createInput.value); };
+  createInput.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); await commitCreate(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit(); }
+  });
+  createInput.addEventListener('blur', async () => { if (document.body.contains(createInput)) await commitCreate(); });
+  createRow.appendChild(createIcon);
+  createRow.appendChild(createInput);
+  createItem.appendChild(createRow);
+  requestAnimationFrame(() => createInput.focus());
+  return createItem;
+}
+
+function buildLocalFilesSection() {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'local-files-section';
+
+  const header = document.createElement('div');
+  header.className = 'local-files-header';
+  header.textContent = 'Local Files';
+  header.title = 'Files stored only on your machine — not shared with the host';
+
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'local-files-add-btn';
+  addBtn.title = 'Create new local file';
+  addBtn.textContent = '+';
+  addBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    promptNewLocalFile();
+  });
+  header.appendChild(addBtn);
+  wrapper.appendChild(header);
+
+  const list = document.createElement('ul');
+  list.className = 'local-files-list';
+
+  // Render local folders first
+  for (const [folderKey, folder] of collabLocalFolders) {
+    list.appendChild(buildLocalFolderNode(folderKey, folder));
+  }
+
+  // Render root-level local files (not inside a folder)
+  for (const [virtualPath, entry] of collabLocalFiles) {
+    if (!entry.name.includes('/')) {
+      list.appendChild(buildLocalFileNode(virtualPath, entry));
+    }
+  }
+
+  // Root-level inline create input
+  if (inlineEditState && inlineEditState.mode === 'create' && inlineEditState.parentPath === LOCAL_FILE_PREFIX) {
+    list.appendChild(buildLocalInlineCreateInput(LOCAL_FILE_PREFIX, 'New local file name'));
+  }
+
+  wrapper.appendChild(list);
+  return wrapper;
+}
+
+function buildLocalFolderNode(folderKey, folder) {
+  const item = document.createElement('li');
+
+  const row = document.createElement('div');
+  row.className = 'tree-node local-file-node';
+  row.dataset.path = folderKey;
+
+  if (explorerSelectedPaths.has(folderKey) || selectedNodePath === folderKey) {
+    row.classList.add('selected');
+  }
+
+  const folderIcon = document.createElement('span');
+  folderIcon.className = folder.expanded ? 'node-icon node-icon-folder expanded' : 'node-icon node-icon-folder';
+
+  const label = document.createElement('span');
+  label.className = 'tree-node-label';
+
+  const badge = document.createElement('span');
+  badge.className = 'local-file-badge';
+  badge.textContent = 'local';
+  badge.title = 'Stored only on your machine';
+
+  if (inlineEditState && inlineEditState.mode === 'rename' && inlineEditState.targetPath === folderKey) {
+    const renameInput = document.createElement('input');
+    renameInput.className = 'tree-inline-input';
+    renameInput.type = 'text';
+    renameInput.value = folder.name;
+    const commitRename = async () => { await commitInlineEdit(renameInput.value); };
+    renameInput.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); await commitRename(); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit(); }
+    });
+    renameInput.addEventListener('blur', async () => { if (document.body.contains(renameInput)) await commitRename(); });
+    row.appendChild(folderIcon);
+    row.appendChild(renameInput);
+    requestAnimationFrame(() => { renameInput.focus(); renameInput.select(); });
+  } else {
+    label.textContent = folder.name;
+    row.appendChild(folderIcon);
+    row.appendChild(label);
+    row.appendChild(badge);
+  }
+
+  row.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setExplorerPanelFocus(true);
+    selectedNodePath = folderKey;
+    explorerSelectedPaths.clear();
+    explorerSelectedPaths.add(folderKey);
+    folder.expanded = !folder.expanded;
+    renderTree();
+  });
+
+  row.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    selectedNodePath = folderKey;
+    explorerSelectedPaths.clear();
+    explorerSelectedPaths.add(folderKey);
+    showLocalFolderContextMenu(e, folderKey, folder);
+  });
+
+  item.appendChild(row);
+
+  if (folder.expanded) {
+    const children = document.createElement('ul');
+    const folderPrefix = LOCAL_FILE_PREFIX + folder.name + '/';
+    for (const [virtualPath, entry] of collabLocalFiles) {
+      if (virtualPath.startsWith(folderPrefix)) {
+        children.appendChild(buildLocalFileNode(virtualPath, entry, true));
+      }
+    }
+    const childParentPath = LOCAL_FILE_PREFIX + folder.name + '/';
+    if (inlineEditState && inlineEditState.mode === 'create' && inlineEditState.parentPath === childParentPath) {
+      children.appendChild(buildLocalInlineCreateInput(childParentPath, 'New file name'));
+    }
+    item.appendChild(children);
+  }
+
+  return item;
+}
+
+function buildLocalFileNode(virtualPath, entry, insideFolder = false) {
+  const item = document.createElement('li');
+  const row = document.createElement('div');
+  row.className = 'tree-node local-file-node';
+  row.dataset.path = virtualPath;
+
+  if (explorerSelectedPaths.has(virtualPath) || selectedNodePath === virtualPath) {
+    row.classList.add('selected');
+  }
+
+  const fileIcon = document.createElement('span');
+  fileIcon.className = `file-type-icon ${getFileTypeIconClass(entry.name)}`;
+
+  const label = document.createElement('span');
+  label.className = 'tree-node-label';
+  const displayName = insideFolder ? entry.name.split('/').pop() : entry.name;
+  label.textContent = displayName;
+
+  const badge = document.createElement('span');
+  badge.className = 'local-file-badge';
+  badge.textContent = 'local';
+  badge.title = 'Stored only on your machine';
+
+  row.appendChild(fileIcon);
+  row.appendChild(label);
+  row.appendChild(badge);
+
+  const localEntry = collabLocalFiles.get(virtualPath);
+  const fileState = openFiles.get(virtualPath);
+  const isFileDirty = fileState && fileState.kind === 'text'
+    ? fileState.model.getValue() !== (localEntry ? localEntry.content : '')
+    : false;
+  if (isFileDirty) {
+    const dot = document.createElement('span');
+    dot.className = 'tab-dirty-indicator';
+    row.appendChild(dot);
+  }
+
+  if (inlineEditState && inlineEditState.mode === 'rename' && inlineEditState.targetPath === virtualPath) {
+    row.innerHTML = '';
+    row.appendChild(fileIcon);
+    const renameInput = document.createElement('input');
+    renameInput.className = 'tree-inline-input';
+    renameInput.type = 'text';
+    renameInput.value = entry.name.split('/').pop();
+    const commitRename = async () => { await commitInlineEdit(renameInput.value); };
+    renameInput.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); await commitRename(); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit(); }
+    });
+    renameInput.addEventListener('blur', async () => { if (document.body.contains(renameInput)) await commitRename(); });
+    row.appendChild(renameInput);
+    requestAnimationFrame(() => { renameInput.focus(); renameInput.select(); });
+  }
+
+  let clickTimer = null;
+  row.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (clickTimer) clearTimeout(clickTimer);
+    clickTimer = setTimeout(async () => {
+      clickTimer = null;
+      setExplorerPanelFocus(true);
+      selectedNodePath = virtualPath;
+      explorerSelectedPaths.clear();
+      explorerSelectedPaths.add(virtualPath);
+      await openFile(virtualPath, { mode: 'preview' });
+      renderTree();
+    }, 220);
+  });
+
+  row.addEventListener('dblclick', async (e) => {
+    e.stopPropagation();
+    if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
+    setExplorerPanelFocus(true);
+    selectedNodePath = virtualPath;
+    explorerSelectedPaths.clear();
+    explorerSelectedPaths.add(virtualPath);
+    await openFile(virtualPath, { mode: 'permanent' });
+    renderTree();
+  });
+
+  row.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    selectedNodePath = virtualPath;
+    explorerSelectedPaths.clear();
+    explorerSelectedPaths.add(virtualPath);
+    showLocalFileContextMenu(e, virtualPath, entry);
+  });
+
+  item.appendChild(row);
+  return item;
+}
+
+function showLocalFileContextMenu(event, virtualPath, entry) {
+  ensureExplorerContextMenu();
+  explorerMenu.innerHTML = '';
+
+  addExplorerMenuItem(explorerMenu, 'Open', async () => {
+    await openFile(virtualPath, { mode: 'permanent' });
+  });
+  addExplorerMenuDivider(explorerMenu);
+  addExplorerMenuItem(explorerMenu, 'Rename', () => {
+    inlineEditState = { mode: 'rename', targetType: 'file', targetPath: virtualPath };
+    renderTree();
+  });
+  addExplorerMenuItem(explorerMenu, 'Delete', async () => {
+    const displayName = entry.name.split('/').pop();
+    const ok = await showConfirmDialog({
+      title: 'Delete Local File',
+      message: `Delete "${displayName}" from your local storage? This cannot be undone.`,
+      confirmLabel: 'Delete',
+      confirmStyle: 'danger'
+    });
+    if (!ok) return;
+    try {
+      await api.deleteCollabLocalFile({ fingerprint: collabProjectFingerprint, name: entry.name });
+      collabLocalFiles.delete(virtualPath);
+      if (openFiles.has(virtualPath)) await closeTab(virtualPath);
+    } catch { /* ignore */ }
+    renderTree();
+  });
+
+  explorerMenu.style.left = `${event.clientX}px`;
+  explorerMenu.style.top = `${event.clientY}px`;
+  explorerMenu.classList.remove('hidden');
+}
+
+function showLocalFolderContextMenu(event, folderKey, folder) {
+  ensureExplorerContextMenu();
+  explorerMenu.innerHTML = '';
+
+  addExplorerMenuItem(explorerMenu, 'New File', () => {
+    folder.expanded = true;
+    inlineEditState = { mode: 'create', targetType: 'file', parentPath: folderKey + '/', value: '' };
+    renderTree();
+  });
+  addExplorerMenuDivider(explorerMenu);
+  addExplorerMenuItem(explorerMenu, 'Rename', () => {
+    inlineEditState = { mode: 'rename', targetType: 'folder', targetPath: folderKey };
+    renderTree();
+  });
+  addExplorerMenuItem(explorerMenu, 'Delete', async () => {
+    const ok = await showConfirmDialog({
+      title: 'Delete Local Folder',
+      message: `Delete "${folder.name}" and all its files from your local storage? This cannot be undone.`,
+      confirmLabel: 'Delete',
+      confirmStyle: 'danger'
+    });
+    if (!ok) return;
+    try {
+      await api.deleteCollabLocalFile({ fingerprint: collabProjectFingerprint, name: folder.name });
+      collabLocalFolders.delete(folderKey);
+      const prefix = folderKey + '/';
+      for (const [key] of [...collabLocalFiles.entries()]) {
+        if (key.startsWith(prefix)) {
+          if (openFiles.has(key)) await closeTab(key);
+          collabLocalFiles.delete(key);
+        }
+      }
+    } catch { /* ignore */ }
+    renderTree();
+  });
+
+  explorerMenu.style.left = `${event.clientX}px`;
+  explorerMenu.style.top = `${event.clientY}px`;
+  explorerMenu.classList.remove('hidden');
+}
+
 function renderTree() {
   treeRoot.innerHTML = '';
   clearExplorerDragVisualState();
@@ -7821,7 +8251,7 @@ function renderTree() {
       }
     });
     input.addEventListener('blur', async () => {
-      await commit();
+      if (document.body.contains(input)) await commit();
     });
 
     row.appendChild(icon);
@@ -7835,6 +8265,10 @@ function renderTree() {
   }
 
   treeRoot.appendChild(list);
+
+  if (collabConnected && collabMode === 'remote' && !collabIsSessionHost) {
+    treeRoot.appendChild(buildLocalFilesSection());
+  }
 
   treeRoot.ondragover = (event) => {
     if (!explorerDragState || !project.rootPath) {
@@ -7945,7 +8379,71 @@ function collabFilePathToProjectPath(collabPath) {
   return `${normalizedRoot}\\${normalizedPath.replace(/\//g, '\\')}`;
 }
 
+function isClientIgnoredPath(name) {
+  if (!collabLocalGitignorePatterns) return false;
+  const lines = collabLocalGitignorePatterns.split('\n')
+    .map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+  for (const pattern of lines) {
+    const bare = pattern.replace(/\/$/, ''); // strip trailing slash (folder-only markers)
+    if (bare === name) return true;
+    if (bare.includes('*')) {
+      const re = new RegExp('^' + bare.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
+      if (re.test(name)) return true;
+    }
+  }
+  return false;
+}
+
+async function loadCollabLocalFiles(fingerprint) {
+  collabLocalFiles.clear();
+  collabLocalFolders.clear();
+  try {
+    const entries = await api.listCollabLocalFiles({ fingerprint });
+    for (const entry of entries) {
+      if (entry.type === 'folder') {
+        const folderKey = LOCAL_FILE_PREFIX + entry.name;
+        collabLocalFolders.set(folderKey, { name: entry.name, expanded: false });
+        for (const child of entry.children || []) {
+          const fileKey = LOCAL_FILE_PREFIX + entry.name + '/' + child.name;
+          collabLocalFiles.set(fileKey, { name: entry.name + '/' + child.name, content: null, dirty: false });
+        }
+      } else {
+        collabLocalFiles.set(LOCAL_FILE_PREFIX + entry.name, { name: entry.name, content: null, dirty: false });
+      }
+    }
+  } catch { /* non-fatal */ }
+  renderTree();
+}
+
+async function createLocalCollabFolder(name) {
+  if (!collabProjectFingerprint) return;
+  if (!name || name.includes('/') || name.includes('\\')) return;
+  const key = LOCAL_FILE_PREFIX + name;
+  if (collabLocalFolders.has(key)) return;
+  await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name });
+  collabLocalFolders.set(key, { name, expanded: true });
+  renderTree();
+}
+
+async function createLocalCollabFile(name) {
+  if (!collabProjectFingerprint) return;
+  if (!name || name.includes('\\')) return;
+  // allow at most one folder level: 'folder/file'
+  const parts = name.split('/');
+  if (parts.length > 2 || parts.some(p => !p || p === '.' || p === '..')) return;
+  const key = LOCAL_FILE_PREFIX + name;
+  if (collabLocalFiles.has(key)) {
+    await openFile(key, { mode: 'permanent' });
+    return;
+  }
+  await api.writeCollabLocalFile({ fingerprint: collabProjectFingerprint, name, content: '' });
+  collabLocalFiles.set(key, { name, content: '', dirty: false });
+  renderTree();
+  await openFile(key, { mode: 'permanent' });
+}
+
 function projectPathToCollabPath(projectPath) {
+  if (String(projectPath || '').startsWith(LOCAL_FILE_PREFIX)) return '';
   const fullPath = String(projectPath || '');
   if (!fullPath) {
     return '';
@@ -9518,6 +10016,19 @@ function clearCollabSessionState() {
     collabCursorBroadcastTimer = null;
   }
 
+  if (collabProjectFingerprint) {
+    for (const [, entry] of collabLocalFiles) {
+      if (entry.dirty && entry.content !== null) {
+        api.writeCollabLocalFile({ fingerprint: collabProjectFingerprint,
+          name: entry.name, content: entry.content }).catch(() => {});
+      }
+    }
+  }
+  collabProjectFingerprint = null;
+  collabLocalFiles.clear();
+  collabLocalFolders.clear();
+  collabLocalGitignorePatterns = '';
+
   collabClientId = null;
   collabIsSessionHost = false;
   collabConnected = false;
@@ -9962,6 +10473,8 @@ function connectCollabSocket(serverUrl, code, name, mode) {
         }
 
         if (mode === 'remote') {
+          collabProjectFingerprint = joinResponse.projectFingerprint || null;
+          collabLocalGitignorePatterns = joinResponse.gitignorePatterns || '';
           project = {
             rootPath: '/',
             rootName: joinResponse.snapshot && joinResponse.snapshot.rootName ? joinResponse.snapshot.rootName : 'Shared Project',
@@ -9970,9 +10483,13 @@ function connectCollabSocket(serverUrl, code, name, mode) {
           projectInfo.textContent = `${project.rootName}  |  shared`;
           expandedFolders.clear();
           expandedFolders.add('/');
-          renderTree();
           refreshFileSearchIndex();
           applyScmState('no-project');
+          if (collabProjectFingerprint) {
+            await loadCollabLocalFiles(collabProjectFingerprint);
+          } else {
+            renderTree();
+          }
         }
 
         renderCollabPresence();
@@ -10240,7 +10757,15 @@ async function openFile(filePath, options = {}) {
     let content = '';
     let encoding = 'UTF-8';
 
-    if (collabConnected && collabMode === 'remote') {
+    const isLocalFile = String(filePath || '').startsWith(LOCAL_FILE_PREFIX);
+    if (isLocalFile && collabProjectFingerprint) {
+      const name = filePath.slice(LOCAL_FILE_PREFIX.length);
+      const raw = await api.readCollabLocalFile({ fingerprint: collabProjectFingerprint, name });
+      content = typeof raw === 'string' ? raw : '';
+      const entry = collabLocalFiles.get(filePath);
+      if (entry && entry.content === null) entry.content = content;
+      encoding = inferEncodingFromText(content);
+    } else if (collabConnected && collabMode === 'remote') {
       const collabFile = await openFileWithCollabSupport(filePath);
       content = collabFile && typeof collabFile.content === 'string' ? collabFile.content : '';
       encoding = inferEncodingFromText(content);
@@ -10272,11 +10797,13 @@ async function openFile(filePath, options = {}) {
 }
 
 async function saveCurrentFile() {
-  if (!canRunSaveActions()) {
+  if (!currentFilePath) {
     return;
   }
 
-  if (!currentFilePath) {
+  const isLocalFile = currentFilePath.startsWith(LOCAL_FILE_PREFIX);
+
+  if (!isLocalFile && !canRunSaveActions()) {
     return;
   }
 
@@ -10287,7 +10814,12 @@ async function saveCurrentFile() {
 
   const content = fileState.model.getValue();
 
-  if (!isCollabAutosaveMode()) {
+  if (isLocalFile && collabProjectFingerprint) {
+    const name = currentFilePath.slice(LOCAL_FILE_PREFIX.length);
+    await api.writeCollabLocalFile({ fingerprint: collabProjectFingerprint, name, content });
+    const entry = collabLocalFiles.get(currentFilePath);
+    if (entry) { entry.content = content; entry.dirty = false; }
+  } else if (!isCollabAutosaveMode()) {
     await api.writeFile({
       filePath: currentFilePath,
       content
@@ -11176,10 +11708,6 @@ document.addEventListener('keydown', async (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
     try {
-      if (!canRunSaveActions()) {
-        return;
-      }
-
       if (event.shiftKey) {
         await saveCurrentFileAs();
       } else if (event.altKey) {

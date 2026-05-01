@@ -1,6 +1,6 @@
 const path = require('path');
 const fs = require('fs/promises');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 const { WebSocketServer } = require('ws');
 const ignore = require('ignore');
 const {
@@ -86,6 +86,7 @@ class CollaborationHostServer {
     this.hostSenderId = null;
     this.sessionHostClientId = null;
     this.projectPath = null;
+    this.projectFingerprint = null;
     this.gitignoreMatcher = null;
 
     this.clients = new Map();
@@ -160,6 +161,7 @@ class CollaborationHostServer {
     this.hostSenderId = null;
     this.sessionHostClientId = null;
     this.projectPath = null;
+    this.projectFingerprint = null;
     this.gitignoreMatcher = null;
 
     if (typeof this.onServerStopped === 'function') {
@@ -182,6 +184,10 @@ class CollaborationHostServer {
     this.hostSenderId = senderId;
     this.sessionId = randomUUID ? randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     this.sessionCode = randomCode(6);
+    this.projectFingerprint = createHash('sha256')
+      .update(path.resolve(projectPath).replace(/\\/g, '/').toLowerCase())
+      .digest('hex')
+      .slice(0, 32);
 
     this.wss = new WebSocketServer({
       host: '0.0.0.0',
@@ -566,6 +572,14 @@ class CollaborationHostServer {
     }
 
     const snapshot = await this.buildSnapshotPayload();
+
+    let gitignorePatterns = '';
+    try {
+      gitignorePatterns = await fs.readFile(
+        path.join(this.projectPath, '.gitignore'), 'utf8'
+      );
+    } catch { /* .gitignore is optional */ }
+
     this.send(socket, 'join:ok', {
       requestId: packet.requestId || null,
       clientId,
@@ -573,6 +587,8 @@ class CollaborationHostServer {
       isSessionHost: clientId === this.sessionHostClientId,
       sessionId: this.sessionId,
       code: this.sessionCode,
+      projectFingerprint: this.projectFingerprint,
+      gitignorePatterns,
       snapshot,
       presence: this.getPresenceList()
     });
@@ -924,31 +940,40 @@ class CollaborationHostServer {
       };
     };
 
-    if (!client.isHostClient) {
-      if (type === 'create-file') {
-        await createFile(false);
+    try {
+      if (!client.isHostClient) {
+        if (type === 'create-file') {
+          await createFile(false);
+        } else if (type === 'create-folder') {
+          await createFolder(false);
+        } else if (type === 'delete') {
+          await deleteEntry(false);
+        } else if (type === 'rename') {
+          await renameEntry(false);
+        } else if (type === 'move') {
+          await moveEntry(false);
+        } else {
+          return;
+        }
+      } else if (type === 'create-file') {
+        await createFile(true);
       } else if (type === 'create-folder') {
-        await createFolder(false);
+        await createFolder(true);
       } else if (type === 'delete') {
-        await deleteEntry(false);
+        await deleteEntry(true);
       } else if (type === 'rename') {
-        await renameEntry(false);
+        await renameEntry(true);
       } else if (type === 'move') {
-        await moveEntry(false);
+        await moveEntry(true);
       } else {
         return;
       }
-    } else if (type === 'create-file') {
-      await createFile(true);
-    } else if (type === 'create-folder') {
-      await createFolder(true);
-    } else if (type === 'delete') {
-      await deleteEntry(true);
-    } else if (type === 'rename') {
-      await renameEntry(true);
-    } else if (type === 'move') {
-      await moveEntry(true);
-    } else {
+    } catch (err) {
+      this.send(socket, 'file:operation:error', {
+        requestId: packet.requestId || null,
+        type,
+        message: err && err.message ? err.message : String(err)
+      });
       return;
     }
 
@@ -971,11 +996,13 @@ class CollaborationHostServer {
       }, socket);
     }
 
-    const snapshot = await this.buildSnapshotPayload();
-    this.broadcast('tree:update', {
-      tree: snapshot.tree,
-      rootName: snapshot.rootName
-    });
+    try {
+      const snapshot = await this.buildSnapshotPayload();
+      this.broadcast('tree:update', {
+        tree: snapshot.tree,
+        rootName: snapshot.rootName
+      });
+    } catch { /* non-fatal — tree update failure should not block the ok response */ }
 
     this.broadcast('activity:add', {
       level: 'file-op',

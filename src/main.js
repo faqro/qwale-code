@@ -267,6 +267,30 @@ function getRecentProjectsFilePath() {
   return path.join(app.getPath('userData'), 'recent-projects.json');
 }
 
+function getCollabLocalDir(fingerprint) {
+  return path.join(app.getPath('userData'), 'collab-local', fingerprint);
+}
+
+function isValidCollabFingerprint(fp) {
+  return typeof fp === 'string' && /^[a-f0-9]{32}$/.test(fp);
+}
+
+function isValidCollabFileName(name) {
+  return typeof name === 'string' && name.length > 0 && name.length <= 255
+    && !name.includes('/') && !name.includes('\\')
+    && name !== '.' && name !== '..';
+}
+
+// Like isValidCollabFileName but allows one level of nesting: 'folder/file'
+function isValidCollabFilePath(p) {
+  if (typeof p !== 'string' || p.length === 0 || p.length > 512) return false;
+  const parts = p.split('/');
+  if (parts.length > 2) return false;
+  return parts.every(seg =>
+    seg.length > 0 && seg.length <= 255 && !seg.includes('\\') && seg !== '.' && seg !== '..'
+  );
+}
+
 async function loadRecentProjects() {
   try {
     const filePath = getRecentProjectsFilePath();
@@ -1005,6 +1029,82 @@ ipcMain.handle('file:write', async (event, { filePath, content }) => {
   }
 
   await fsp.writeFile(filePath, content, 'utf8');
+  return { ok: true };
+});
+
+ipcMain.handle('collab:local:list', async (_event, { fingerprint }) => {
+  if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
+  const dir = getCollabLocalDir(fingerprint);
+  await fsp.mkdir(dir, { recursive: true });
+  const entries = await fsp.readdir(dir, { withFileTypes: true });
+  const result = [];
+  for (const e of entries) {
+    if (e.isFile()) {
+      result.push({ name: e.name, type: 'file' });
+    } else if (e.isDirectory()) {
+      const subEntries = await fsp.readdir(path.join(dir, e.name), { withFileTypes: true });
+      result.push({
+        name: e.name,
+        type: 'folder',
+        children: subEntries.filter(s => s.isFile()).map(s => ({ name: s.name }))
+      });
+    }
+  }
+  return result;
+});
+
+ipcMain.handle('collab:local:read', async (_event, { fingerprint, name }) => {
+  if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
+  if (!isValidCollabFilePath(name)) throw new Error('Invalid file path.');
+  const dir = getCollabLocalDir(fingerprint);
+  const filePath = path.join(dir, ...name.split('/'));
+  try {
+    return await fsp.readFile(filePath, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+});
+
+ipcMain.handle('collab:local:write', async (_event, { fingerprint, name, content }) => {
+  if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
+  if (!isValidCollabFilePath(name)) throw new Error('Invalid file path.');
+  const dir = getCollabLocalDir(fingerprint);
+  await fsp.mkdir(dir, { recursive: true });
+  const filePath = path.join(dir, ...name.split('/'));
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  await fsp.writeFile(filePath, String(content ?? ''), 'utf8');
+  return { ok: true };
+});
+
+ipcMain.handle('collab:local:delete', async (_event, { fingerprint, name }) => {
+  if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
+  if (!isValidCollabFilePath(name)) throw new Error('Invalid path.');
+  const dir = getCollabLocalDir(fingerprint);
+  const targetPath = path.join(dir, ...name.split('/'));
+  const stat = await fsp.stat(targetPath);
+  if (stat.isDirectory()) {
+    await fsp.rm(targetPath, { recursive: true, force: false });
+  } else {
+    await fsp.unlink(targetPath);
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('collab:local:rename', async (_event, { fingerprint, oldName, newName }) => {
+  if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
+  if (!isValidCollabFilePath(oldName)) throw new Error('Invalid old name.');
+  if (!isValidCollabFileName(newName)) throw new Error('Invalid new name.');
+  const dir = getCollabLocalDir(fingerprint);
+  await fsp.rename(path.join(dir, ...oldName.split('/')), path.join(dir, newName));
+  return { ok: true };
+});
+
+ipcMain.handle('collab:local:createFolder', async (_event, { fingerprint, name }) => {
+  if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
+  if (!isValidCollabFileName(name)) throw new Error('Invalid folder name.');
+  const dir = path.join(getCollabLocalDir(fingerprint), name);
+  await fsp.mkdir(dir, { recursive: true });
   return { ok: true };
 });
 

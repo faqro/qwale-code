@@ -2308,6 +2308,84 @@ body {
   text-overflow: ellipsis;
 }
 
+.local-files-section {
+  margin-top: 12px;
+  border-top: 1px solid rgba(111, 103, 255, 0.2);
+  padding-top: 6px;
+}
+
+.local-files-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #7a9bbf;
+  user-select: none;
+}
+
+.local-files-add-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: #7a9bbf;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 3px;
+  margin-left: auto;
+  border-radius: 3px;
+}
+
+.local-files-add-btn:hover {
+  color: #cfe6ff;
+  background: rgba(111, 103, 255, 0.15);
+}
+
+.local-files-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Override .tree ul indentation for the top-level local files list */
+.tree .local-files-list {
+  padding-left: 0;
+}
+
+.local-files-list ul {
+  list-style: none;
+  margin: 0;
+  padding-left: 16px;
+}
+
+.local-file-badge {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #a56bff;
+  background: rgba(111, 103, 255, 0.15);
+  border: 1px solid rgba(111, 103, 255, 0.3);
+  border-radius: 3px;
+  padding: 0 3px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+body.light-theme .local-files-header {
+  color: #5577aa;
+}
+
+body.light-theme .local-file-badge {
+  color: #6f3fc9;
+  background: rgba(111, 63, 201, 0.1);
+  border-color: rgba(111, 63, 201, 0.25);
+}
+
 .tree-node-label.git-modified {
   color: #e8a44a;
 }
