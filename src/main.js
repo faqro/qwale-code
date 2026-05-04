@@ -37,6 +37,7 @@ let recentProjects = [];
 const windowProjectState = new Map();
 const windowInitialProject = new Map();
 const projectWatchers = new Map();
+const collabSharedWatchers = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
 let collaborationHostServer = null;
 const filteredDevtoolsContents = new WeakSet();
@@ -166,8 +167,12 @@ function startProjectWatcherForWebContents(webContentsId, projectPath) {
   const normalizedProjectPath = path.resolve(projectPath);
 
   try {
-    const watcher = fs.watch(normalizedProjectPath, { recursive: true }, () => {
-      scheduleProjectChangedNotification(webContentsId, normalizedProjectPath);
+    const watcher = fs.watch(normalizedProjectPath, { recursive: true }, (evt, filename) => {
+      try {
+        scheduleProjectChangedNotification(webContentsId, normalizedProjectPath);
+      } catch (err) {
+        console.warn('Project watcher callback error:', err && err.stack ? err.stack : err);
+      }
     });
 
     projectWatchers.set(webContentsId, {
@@ -271,6 +276,18 @@ function getCollabLocalDir(fingerprint) {
   return path.join(app.getPath('userData'), 'collab-local', fingerprint);
 }
 
+function getCollabSharedDir(fingerprint) {
+  return path.join(getCollabLocalDir(fingerprint), 'shared');
+}
+
+function getCollabLocalManifestPath(fingerprint) {
+  return path.join(getCollabLocalDir(fingerprint), 'local-files.json');
+}
+
+function getCollabLocalContentDir(fingerprint) {
+  return getCollabSharedDir(fingerprint);
+}
+
 function isValidCollabFingerprint(fp) {
   return typeof fp === 'string' && /^[a-f0-9]{32}$/.test(fp);
 }
@@ -289,6 +306,254 @@ function isValidCollabFilePath(p) {
   return parts.every(seg =>
     seg.length > 0 && seg.length <= 255 && !seg.includes('\\') && seg !== '.' && seg !== '..'
   );
+}
+
+function normalizeCollabLocalEntryName(name) {
+  return String(name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function normalizeCollabLocalManifestEntries(entries) {
+  const folders = [];
+  const files = [];
+  const list = Array.isArray(entries) ? entries : [];
+
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const name = normalizeCollabLocalEntryName(entry.name);
+    if (!name) {
+      continue;
+    }
+
+    if (entry.type === 'folder') {
+      folders.push({
+        name,
+        type: 'folder',
+        children: Array.isArray(entry.children)
+          ? entry.children
+              .map((child) => ({ name: normalizeCollabLocalEntryName(child && child.name) }))
+              .filter((child) => child.name)
+          : []
+      });
+    } else {
+      files.push({ name, type: 'file' });
+    }
+  }
+
+  folders.sort((a, b) => a.name.localeCompare(b.name));
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  return [...folders, ...files];
+}
+
+async function readCollabLocalManifest(fingerprint) {
+  const manifestPath = getCollabLocalManifestPath(fingerprint);
+  try {
+    const raw = await fsp.readFile(manifestPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return normalizeCollabLocalManifestEntries(parsed && parsed.entries);
+  } catch {
+    return [];
+  }
+}
+
+async function writeCollabLocalManifest(fingerprint, entries) {
+  const dir = getCollabLocalDir(fingerprint);
+  await fsp.mkdir(dir, { recursive: true });
+  const manifestPath = getCollabLocalManifestPath(fingerprint);
+  const normalized = normalizeCollabLocalManifestEntries(entries);
+  await fsp.writeFile(manifestPath, JSON.stringify({ entries: normalized }, null, 2), 'utf8');
+  return normalized;
+}
+
+async function ensureCollabLocalStorage(fingerprint) {
+  const localDir = getCollabLocalDir(fingerprint);
+  const contentDir = getCollabLocalContentDir(fingerprint);
+  const manifestPath = getCollabLocalManifestPath(fingerprint);
+
+  await fsp.mkdir(localDir, { recursive: true });
+  await fsp.mkdir(contentDir, { recursive: true });
+
+  try {
+    await fsp.access(manifestPath);
+    return readCollabLocalManifest(fingerprint);
+  } catch {
+    // Fall through to legacy migration.
+  }
+
+  const legacyEntries = [];
+  try {
+    const entries = await fsp.readdir(localDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name === 'shared' || entry.name === 'local-files.json') {
+        continue;
+      }
+
+      const sourcePath = path.join(localDir, entry.name);
+      const destinationPath = path.join(contentDir, entry.name);
+
+      if (entry.isDirectory()) {
+        const childEntries = await fsp.readdir(sourcePath, { withFileTypes: true });
+        legacyEntries.push({
+          name: entry.name,
+          type: 'folder',
+          children: childEntries.filter((child) => child.isFile()).map((child) => ({ name: child.name }))
+        });
+      } else if (entry.isFile()) {
+        legacyEntries.push({ name: entry.name, type: 'file' });
+      }
+
+      try {
+        await fsp.rm(destinationPath, { recursive: true, force: true });
+        await fsp.rename(sourcePath, destinationPath);
+      } catch {
+        // Best-effort migration; fall back to the manifest we derived.
+      }
+    }
+  } catch {
+    // Legacy directory may be empty on first launch.
+  }
+
+  return writeCollabLocalManifest(fingerprint, legacyEntries);
+}
+
+function removeLocalEntryFromManifest(entries, targetName) {
+  const name = normalizeCollabLocalEntryName(targetName);
+  const normalized = normalizeCollabLocalManifestEntries(entries);
+  const result = [];
+
+  for (const entry of normalized) {
+    if (entry.type === 'folder') {
+      if (entry.name === name) {
+        continue;
+      }
+
+      result.push({
+        ...entry,
+        children: Array.isArray(entry.children)
+          ? entry.children.filter((child) => child.name !== name && !child.name.startsWith(`${name}/`))
+          : []
+      });
+      continue;
+    }
+
+    if (entry.name !== name) {
+      result.push(entry);
+    }
+  }
+
+  return normalizeCollabLocalManifestEntries(result);
+}
+
+function renameLocalEntryInManifest(entries, oldName, newName) {
+  const sourceName = normalizeCollabLocalEntryName(oldName);
+  const destinationName = normalizeCollabLocalEntryName(newName);
+  const normalized = normalizeCollabLocalManifestEntries(entries);
+  const result = [];
+  const sourceParts = sourceName.split('/');
+  const destinationParts = destinationName.split('/');
+  const sourceFolder = sourceParts[0];
+  const sourceLeaf = sourceParts[sourceParts.length - 1];
+  const destinationLeaf = destinationParts[destinationParts.length - 1];
+
+  for (const entry of normalized) {
+    if (entry.type === 'folder') {
+      if (entry.name === sourceName) {
+        result.push({
+          ...entry,
+          name: destinationName,
+          children: Array.isArray(entry.children)
+            ? entry.children.map((child) => ({
+                name: child.name.startsWith(`${sourceName}/`)
+                  ? `${destinationName}${child.name.slice(sourceName.length)}`
+                  : child.name
+              }))
+            : []
+        });
+        continue;
+      }
+
+      if (sourceParts.length > 1 && entry.name === sourceFolder) {
+        result.push({
+          ...entry,
+          children: Array.isArray(entry.children)
+            ? entry.children.map((child) => ({
+                name: child.name === sourceLeaf
+                  ? `${sourceFolder}/${destinationLeaf}`
+                  : child.name
+              }))
+            : []
+        });
+        continue;
+      }
+
+      result.push({
+        ...entry,
+        children: Array.isArray(entry.children)
+          ? entry.children.map((child) => ({
+              name: child.name.startsWith(`${sourceName}/`)
+                ? `${destinationName}${child.name.slice(sourceName.length)}`
+                : child.name
+            }))
+          : []
+      });
+      continue;
+    }
+
+    if (entry.name === sourceName) {
+      result.push({ ...entry, name: destinationName });
+    } else {
+      result.push(entry);
+    }
+  }
+
+  return normalizeCollabLocalManifestEntries(result);
+}
+
+function normalizeCollabRelativePath(relativePath) {
+  const raw = String(relativePath || '').trim().replace(/\\/g, '/').replace(/^\/+/, '');
+  return raw;
+}
+
+function isValidCollabSharedRelativePath(relativePath, allowEmpty = false) {
+  const normalized = normalizeCollabRelativePath(relativePath);
+  if (!normalized) {
+    return allowEmpty;
+  }
+
+  if (normalized.length > 2048 || normalized.includes('\0')) {
+    return false;
+  }
+
+  const parts = normalized.split('/');
+  return parts.every((part) => part && part !== '.' && part !== '..');
+}
+
+function resolveCollabSharedPath(fingerprint, relativePath = '', allowEmpty = false) {
+  if (!isValidCollabFingerprint(fingerprint)) {
+    throw new Error('Invalid fingerprint.');
+  }
+
+  if (!isValidCollabSharedRelativePath(relativePath, allowEmpty)) {
+    throw new Error('Invalid shared path.');
+  }
+
+  const rootPath = path.resolve(getCollabSharedDir(fingerprint));
+  const normalizedRelativePath = normalizeCollabRelativePath(relativePath);
+  const absolutePath = normalizedRelativePath
+    ? path.resolve(rootPath, ...normalizedRelativePath.split('/'))
+    : rootPath;
+
+  if (absolutePath !== rootPath && !absolutePath.startsWith(rootPath + path.sep)) {
+    throw new Error('Shared path is outside the collaborative workspace.');
+  }
+
+  return {
+    rootPath,
+    relativePath: normalizedRelativePath,
+    absolutePath
+  };
 }
 
 async function loadRecentProjects() {
@@ -1034,30 +1299,16 @@ ipcMain.handle('file:write', async (event, { filePath, content }) => {
 
 ipcMain.handle('collab:local:list', async (_event, { fingerprint }) => {
   if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
-  const dir = getCollabLocalDir(fingerprint);
-  await fsp.mkdir(dir, { recursive: true });
-  const entries = await fsp.readdir(dir, { withFileTypes: true });
-  const result = [];
-  for (const e of entries) {
-    if (e.isFile()) {
-      result.push({ name: e.name, type: 'file' });
-    } else if (e.isDirectory()) {
-      const subEntries = await fsp.readdir(path.join(dir, e.name), { withFileTypes: true });
-      result.push({
-        name: e.name,
-        type: 'folder',
-        children: subEntries.filter(s => s.isFile()).map(s => ({ name: s.name }))
-      });
-    }
-  }
-  return result;
+  await ensureCollabLocalStorage(fingerprint);
+  return readCollabLocalManifest(fingerprint);
 });
 
 ipcMain.handle('collab:local:read', async (_event, { fingerprint, name }) => {
   if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
   if (!isValidCollabFilePath(name)) throw new Error('Invalid file path.');
-  const dir = getCollabLocalDir(fingerprint);
-  const filePath = path.join(dir, ...name.split('/'));
+  await ensureCollabLocalStorage(fingerprint);
+  const dir = getCollabLocalContentDir(fingerprint);
+  const filePath = path.join(dir, ...normalizeCollabLocalEntryName(name).split('/'));
   try {
     return await fsp.readFile(filePath, 'utf8');
   } catch (err) {
@@ -1069,42 +1320,251 @@ ipcMain.handle('collab:local:read', async (_event, { fingerprint, name }) => {
 ipcMain.handle('collab:local:write', async (_event, { fingerprint, name, content }) => {
   if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
   if (!isValidCollabFilePath(name)) throw new Error('Invalid file path.');
-  const dir = getCollabLocalDir(fingerprint);
+  await ensureCollabLocalStorage(fingerprint);
+  const dir = getCollabLocalContentDir(fingerprint);
   await fsp.mkdir(dir, { recursive: true });
-  const filePath = path.join(dir, ...name.split('/'));
+  const normalizedName = normalizeCollabLocalEntryName(name);
+  const filePath = path.join(dir, ...normalizedName.split('/'));
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   await fsp.writeFile(filePath, String(content ?? ''), 'utf8');
+
+  const manifest = await readCollabLocalManifest(fingerprint);
+  const nextEntries = [];
+  const parts = normalizedName.split('/');
+  let folderEntry = null;
+
+  for (const entry of manifest) {
+    if (entry.type === 'folder' && entry.name === parts[0]) {
+      folderEntry = {
+        ...entry,
+        children: Array.isArray(entry.children) ? [...entry.children] : []
+      };
+      continue;
+    }
+
+    if (entry.name !== normalizedName) {
+      nextEntries.push(entry);
+    }
+  }
+
+  if (parts.length === 1) {
+    nextEntries.push({ name: normalizedName, type: 'file' });
+  } else {
+    const childName = parts.slice(1).join('/');
+    if (!folderEntry) {
+      folderEntry = { name: parts[0], type: 'folder', children: [] };
+    }
+    const folderChildren = Array.isArray(folderEntry.children) ? folderEntry.children : [];
+    const childExists = folderChildren.some((child) => child.name === childName);
+    if (!childExists) {
+      folderChildren.push({ name: childName });
+    }
+    folderEntry.children = folderChildren;
+    nextEntries.push(folderEntry);
+  }
+
+  await writeCollabLocalManifest(fingerprint, nextEntries);
   return { ok: true };
 });
 
 ipcMain.handle('collab:local:delete', async (_event, { fingerprint, name }) => {
   if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
   if (!isValidCollabFilePath(name)) throw new Error('Invalid path.');
-  const dir = getCollabLocalDir(fingerprint);
-  const targetPath = path.join(dir, ...name.split('/'));
+  await ensureCollabLocalStorage(fingerprint);
+  const dir = getCollabLocalContentDir(fingerprint);
+  const normalizedName = normalizeCollabLocalEntryName(name);
+  const targetPath = path.join(dir, ...normalizedName.split('/'));
   const stat = await fsp.stat(targetPath);
   if (stat.isDirectory()) {
     await fsp.rm(targetPath, { recursive: true, force: false });
   } else {
     await fsp.unlink(targetPath);
   }
+
+  const manifest = await readCollabLocalManifest(fingerprint);
+  await writeCollabLocalManifest(fingerprint, removeLocalEntryFromManifest(manifest, normalizedName));
   return { ok: true };
 });
 
 ipcMain.handle('collab:local:rename', async (_event, { fingerprint, oldName, newName }) => {
   if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
   if (!isValidCollabFilePath(oldName)) throw new Error('Invalid old name.');
-  if (!isValidCollabFileName(newName)) throw new Error('Invalid new name.');
-  const dir = getCollabLocalDir(fingerprint);
-  await fsp.rename(path.join(dir, ...oldName.split('/')), path.join(dir, newName));
+  await ensureCollabLocalStorage(fingerprint);
+  const dir = getCollabLocalContentDir(fingerprint);
+  const normalizedOldName = normalizeCollabLocalEntryName(oldName);
+  const normalizedNewName = normalizeCollabLocalEntryName(newName);
+  const renameTargetName = normalizedNewName.includes('/') || !normalizedOldName.includes('/')
+    ? normalizedNewName
+    : `${normalizedOldName.split('/').slice(0, -1).join('/')}/${normalizedNewName}`;
+
+  if (!isValidCollabFilePath(renameTargetName) && !isValidCollabFileName(renameTargetName)) {
+    throw new Error('Invalid new name.');
+  }
+
+  await fsp.rename(path.join(dir, ...normalizedOldName.split('/')), path.join(dir, ...renameTargetName.split('/')));
+
+  const manifest = await readCollabLocalManifest(fingerprint);
+  await writeCollabLocalManifest(fingerprint, renameLocalEntryInManifest(manifest, normalizedOldName, renameTargetName));
   return { ok: true };
 });
 
 ipcMain.handle('collab:local:createFolder', async (_event, { fingerprint, name }) => {
   if (!isValidCollabFingerprint(fingerprint)) throw new Error('Invalid fingerprint.');
   if (!isValidCollabFileName(name)) throw new Error('Invalid folder name.');
-  const dir = path.join(getCollabLocalDir(fingerprint), name);
+  await ensureCollabLocalStorage(fingerprint);
+  const dir = path.join(getCollabLocalContentDir(fingerprint), name);
   await fsp.mkdir(dir, { recursive: true });
+
+  const manifest = await readCollabLocalManifest(fingerprint);
+  const nextEntries = normalizeCollabLocalManifestEntries(manifest);
+  if (!nextEntries.some((entry) => entry.type === 'folder' && entry.name === name)) {
+    nextEntries.push({ name, type: 'folder', children: [] });
+  }
+  await writeCollabLocalManifest(fingerprint, nextEntries);
+  return { ok: true };
+});
+
+ipcMain.handle('collab:shared:getRoot', async (_event, { fingerprint }) => {
+  const resolved = resolveCollabSharedPath(fingerprint, '', true);
+  await fsp.mkdir(resolved.rootPath, { recursive: true });
+  return {
+    rootPath: resolved.rootPath
+  };
+});
+
+ipcMain.handle('collab:shared:read', async (_event, { fingerprint, relativePath }) => {
+  const resolved = resolveCollabSharedPath(fingerprint, relativePath);
+  try {
+    const raw = await fsp.readFile(resolved.absolutePath, 'utf8');
+    return raw;
+  } catch (err) {
+    // If file is binary or cannot be read as utf8, return base64
+    try {
+      const buf = await fsp.readFile(resolved.absolutePath);
+      return buf.toString('base64');
+    } catch {
+      throw err;
+    }
+  }
+});
+
+ipcMain.handle('collab:shared:startWatcher', async (event, { fingerprint }) => {
+  const webContentsId = event && event.sender && event.sender.id ? event.sender.id : null;
+  if (!webContentsId) return { ok: false };
+  try {
+    const resolved = resolveCollabSharedPath(fingerprint, '', true);
+    await fsp.mkdir(resolved.rootPath, { recursive: true });
+    // If already watching for this webContents, stop first
+    if (collabSharedWatchers.has(webContentsId)) {
+      try { collabSharedWatchers.get(webContentsId).close(); } catch {}
+      collabSharedWatchers.delete(webContentsId);
+    }
+
+    const watcher = fs.watch(resolved.rootPath, { recursive: true }, (evt, filename) => {
+      try {
+        const relativePath = filename ? String(filename).replace(/\\/g, '/') : '';
+        const payload = { fingerprint, eventType: evt, relativePath };
+        sendCollabEventToRenderer(webContentsId, { type: 'collab:shared:fs-event', payload });
+      } catch (err) {
+        console.warn('collab shared watcher callback error:', err && err.stack ? err.stack : err);
+      }
+    });
+
+    collabSharedWatchers.set(webContentsId, watcher);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false };
+  }
+});
+
+ipcMain.handle('collab:shared:stopWatcher', async (event) => {
+  const webContentsId = event && event.sender && event.sender.id ? event.sender.id : null;
+  if (!webContentsId) return { ok: false };
+  const watcher = collabSharedWatchers.get(webContentsId);
+  if (watcher) {
+    try { watcher.close(); } catch {}
+    collabSharedWatchers.delete(webContentsId);
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('collab:shared:reset', async (_event, { fingerprint }) => {
+  const resolved = resolveCollabSharedPath(fingerprint, '', true);
+  await fsp.mkdir(resolved.rootPath, { recursive: true });
+
+  const manifest = await readCollabLocalManifest(fingerprint);
+  const preservedFolders = [];
+  const preservedFiles = [];
+
+  for (const entry of manifest) {
+    if (entry.type === 'folder') {
+      preservedFolders.push(entry.name);
+      for (const child of entry.children || []) {
+        const relativePath = `${entry.name}/${child.name}`;
+        try {
+          const content = await fsp.readFile(path.join(resolved.rootPath, ...relativePath.split('/')), 'utf8');
+          preservedFiles.push({ relativePath, content });
+        } catch {
+          // Ignore missing entries during preserve.
+        }
+      }
+      continue;
+    }
+
+    try {
+      const content = await fsp.readFile(path.join(resolved.rootPath, ...entry.name.split('/')), 'utf8');
+      preservedFiles.push({ relativePath: entry.name, content });
+    } catch {
+      // Ignore missing entries during preserve.
+    }
+  }
+
+  await fsp.rm(resolved.rootPath, { recursive: true, force: true });
+  await fsp.mkdir(resolved.rootPath, { recursive: true });
+
+  for (const folderPath of preservedFolders) {
+    const destinationFolder = path.join(resolved.rootPath, ...folderPath.split('/'));
+    await fsp.mkdir(destinationFolder, { recursive: true });
+  }
+
+  for (const preserved of preservedFiles) {
+    const destinationPath = path.join(resolved.rootPath, ...preserved.relativePath.split('/'));
+    await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
+    await fsp.writeFile(destinationPath, preserved.content, 'utf8');
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('collab:shared:ensureFolder', async (_event, { fingerprint, relativePath }) => {
+  const resolved = resolveCollabSharedPath(fingerprint, relativePath);
+  await fsp.mkdir(resolved.absolutePath, { recursive: true });
+  return { ok: true };
+});
+
+ipcMain.handle('collab:shared:write', async (_event, { fingerprint, relativePath, content, encoding }) => {
+  const resolved = resolveCollabSharedPath(fingerprint, relativePath);
+  await fsp.mkdir(path.dirname(resolved.absolutePath), { recursive: true });
+
+  if (String(encoding || '').toLowerCase() === 'base64') {
+    await fsp.writeFile(resolved.absolutePath, Buffer.from(String(content || ''), 'base64'));
+  } else {
+    await fsp.writeFile(resolved.absolutePath, String(content ?? ''), 'utf8');
+  }
+
+  return { ok: true };
+});
+
+ipcMain.handle('collab:shared:delete', async (_event, { fingerprint, relativePath }) => {
+  const resolved = resolveCollabSharedPath(fingerprint, relativePath);
+  await fsp.rm(resolved.absolutePath, { recursive: true, force: true });
+  return { ok: true };
+});
+
+ipcMain.handle('collab:shared:rename', async (_event, { fingerprint, oldRelativePath, newRelativePath }) => {
+  const oldResolved = resolveCollabSharedPath(fingerprint, oldRelativePath);
+  const newResolved = resolveCollabSharedPath(fingerprint, newRelativePath);
+  await fsp.mkdir(path.dirname(newResolved.absolutePath), { recursive: true });
+  await fsp.rename(oldResolved.absolutePath, newResolved.absolutePath);
   return { ok: true };
 });
 
@@ -1766,13 +2226,37 @@ ipcMain.handle('app:setTheme', (event, mode) => {
   return { ok: true };
 });
 
-ipcMain.handle('terminal:create', (event, { cwd, shellType }) => {
+ipcMain.handle('terminal:create', (event, payload = {}) => {
+  const { cwd, shellType, collabFingerprint, collabRemoteMode } = payload;
   const senderProjectPath = getProjectPathForSender(event.sender);
   const senderWebContentsId = event.sender.id;
   const termId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const normalizedCwd = typeof cwd === 'string' ? cwd.trim() : '';
-  const hasValidCwd = Boolean(normalizedCwd) && fs.existsSync(normalizedCwd);
-  const projectCwd = hasValidCwd ? normalizedCwd : senderProjectPath || app.getPath('home');
+  let hasValidCwd = false;
+  if (normalizedCwd && path.isAbsolute(normalizedCwd)) {
+    try {
+      hasValidCwd = fs.statSync(normalizedCwd).isDirectory();
+    } catch {
+      hasValidCwd = false;
+    }
+  }
+
+  let projectCwd = hasValidCwd ? normalizedCwd : senderProjectPath || app.getPath('home');
+
+  const useCollabRemoteRoot = Boolean(collabRemoteMode) && isValidCollabFingerprint(collabFingerprint);
+  if (useCollabRemoteRoot) {
+    const collabRoot = path.resolve(getCollabSharedDir(collabFingerprint));
+    fs.mkdirSync(collabRoot, { recursive: true });
+
+    if (hasValidCwd) {
+      const resolvedCwd = path.resolve(normalizedCwd);
+      const insideCollabRoot = resolvedCwd === collabRoot || resolvedCwd.startsWith(collabRoot + path.sep);
+      projectCwd = insideCollabRoot ? resolvedCwd : collabRoot;
+    } else {
+      projectCwd = collabRoot;
+    }
+  }
+
   const requestedShellType = typeof shellType === 'string' ? shellType : 'powershell';
 
   if (requestedShellType === 'wsl' && !isWslAvailable()) {

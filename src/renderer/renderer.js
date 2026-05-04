@@ -223,6 +223,12 @@ let collabProjectFingerprint = null;
 let collabLocalFiles = new Map();   // '__local__/<name>' → { name, content, dirty }
 let collabLocalFolders = new Map(); // '__local__/<folderName>' → { name, expanded }
 let collabLocalGitignorePatterns = '';
+let collabLocalGitignoreMatcher = null;
+let collabSharedWorkspaceRoot = '';
+let collabSharedWorkspaceReady = Promise.resolve();
+let collabSharedWorkspaceSyncToken = 0;
+const collabSharedWriteTimers = new Map();
+let collabLocalOnlyPaths = new Set(); // Paths that are local-only (won't sync to host)
 let collabSocket = null;
 let collabConnected = false;
 let collabClientId = null;
@@ -1353,9 +1359,25 @@ function bindTerminalBridgeEvents() {
 }
 
 async function createTerminalSession(shellType = 'powershell') {
+  let terminalCwd = project.rootPath;
+  const collabRemoteMode = collabConnected && collabMode === 'remote' && Boolean(collabProjectFingerprint);
+  if (collabRemoteMode) {
+    try {
+      await collabSharedWorkspaceReady;
+    } catch {
+      // Terminal creation will still proceed with fallback cwd.
+    }
+
+    if (collabSharedWorkspaceRoot) {
+      terminalCwd = collabSharedWorkspaceRoot;
+    }
+  }
+
   const created = await api.createTerminal({
-    cwd: project.rootPath,
-    shellType
+    cwd: terminalCwd,
+    shellType,
+    collabFingerprint: collabRemoteMode ? collabProjectFingerprint : null,
+    collabRemoteMode
   });
 
   const session = {
@@ -2018,10 +2040,10 @@ async function moveExplorerEntries(entries, destinationPath) {
 
     let movedPath = null;
     if (collabConnected && collabMode === 'remote') {
-      const response = await sendCollabRequest('file:operation', { operation });
+      const response = await sendCollabFileOperation(operation);
       movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
     } else if (collabConnected) {
-      const response = await sendCollabRequest('file:operation', { operation });
+      const response = await sendCollabFileOperation(operation);
       movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
     } else {
       const result = await api.movePath({ sourcePath: entry.path, destinationDir: destinationPath });
@@ -2081,18 +2103,14 @@ async function deleteExplorerEntries(entries) {
         collabLocalFiles.delete(entry.path);
       }
     } else if (collabConnected && collabMode === 'remote') {
-      await sendCollabRequest('file:operation', {
-        operation: {
-          type: 'delete',
-          targetPath: projectPathToCollabPath(entry.path)
-        }
+      await sendCollabFileOperation({
+        type: 'delete',
+        targetPath: projectPathToCollabPath(entry.path)
       });
     } else if (collabConnected) {
-      await sendCollabRequest('file:operation', {
-        operation: {
-          type: 'delete',
-          targetPath: projectPathToCollabPath(entry.path)
-        }
+      await sendCollabFileOperation({
+        type: 'delete',
+        targetPath: projectPathToCollabPath(entry.path)
       });
     } else {
       await api.deletePath({ targetPath: entry.path });
@@ -4848,6 +4866,18 @@ function showExplorerContextMenu(event, contextNode) {
       }, { disabled: !canPaste, shortcut: explorerShortcutLabel.paste });
     }
   } else {
+    if (collabConnected && collabMode === 'remote' && !collabIsSessionHost) {
+      addExplorerMenuItem(explorerMenu, 'New Local File', async () => {
+        promptNewLocalFile();
+      }, { shortcut: explorerShortcutLabel.newFile });
+
+      addExplorerMenuItem(explorerMenu, 'New Local Folder', async () => {
+        promptNewLocalFolder();
+      });
+
+      addExplorerMenuDivider(explorerMenu);
+    }
+
     addExplorerMenuItem(explorerMenu, 'New File', async () => {
       startInlineCreate('file', project.rootPath);
     }, { disabled: !project.rootPath, shortcut: explorerShortcutLabel.newFile });
@@ -4956,12 +4986,10 @@ async function commitInlineEdit(name) {
   } else if (state.mode === 'rename') {
     let renamedPath = null;
     if (collabConnected && collabMode === 'remote') {
-      const response = await sendCollabRequest('file:operation', {
-        operation: {
-          type: 'rename',
-          targetPath: projectPathToCollabPath(state.targetPath),
-          newName: trimmed
-        }
+      const response = await sendCollabFileOperation({
+        type: 'rename',
+        targetPath: projectPathToCollabPath(state.targetPath),
+        newName: trimmed
       });
 
       renamedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
@@ -4970,12 +4998,10 @@ async function commitInlineEdit(name) {
         renamedPath = `${parent}/${trimmed}`.replace(/\\/g, '/');
       }
     } else if (collabConnected) {
-      const response = await sendCollabRequest('file:operation', {
-        operation: {
-          type: 'rename',
-          targetPath: projectPathToCollabPath(state.targetPath),
-          newName: trimmed
-        }
+      const response = await sendCollabFileOperation({
+        type: 'rename',
+        targetPath: projectPathToCollabPath(state.targetPath),
+        newName: trimmed
       });
 
       renamedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
@@ -4994,26 +5020,26 @@ async function commitInlineEdit(name) {
     }
   } else if (state.mode === 'create') {
     if (state.targetType === 'folder') {
+      if (state.parentPath === LOCAL_FILE_PREFIX) {
+        await createLocalCollabFolder(trimmed);
+        return;
+      }
       if (collabConnected && collabMode === 'remote' && isClientIgnoredPath(trimmed)) {
         await createLocalCollabFolder(trimmed);
         return;
       }
       try {
         if (collabConnected && collabMode === 'remote') {
-          await sendCollabRequest('file:operation', {
-            operation: {
-              type: 'create-folder',
-              parentPath: projectPathToCollabPath(state.parentPath),
-              name: trimmed
-            }
+          await sendCollabFileOperation({
+            type: 'create-folder',
+            parentPath: projectPathToCollabPath(state.parentPath),
+            name: trimmed
           });
         } else if (collabConnected) {
-          await sendCollabRequest('file:operation', {
-            operation: {
-              type: 'create-folder',
-              parentPath: projectPathToCollabPath(state.parentPath),
-              name: trimmed
-            }
+          await sendCollabFileOperation({
+            type: 'create-folder',
+            parentPath: projectPathToCollabPath(state.parentPath),
+            name: trimmed
           });
         } else {
           await api.createFolder({ parentPath: state.parentPath, name: trimmed });
@@ -5037,20 +5063,16 @@ async function commitInlineEdit(name) {
       } else {
         try {
           if (collabConnected && collabMode === 'remote') {
-            await sendCollabRequest('file:operation', {
-              operation: {
-                type: 'create-file',
-                parentPath: projectPathToCollabPath(state.parentPath),
-                name: trimmed
-              }
+            await sendCollabFileOperation({
+              type: 'create-file',
+              parentPath: projectPathToCollabPath(state.parentPath),
+              name: trimmed
             });
           } else if (collabConnected) {
-            await sendCollabRequest('file:operation', {
-              operation: {
-                type: 'create-file',
-                parentPath: projectPathToCollabPath(state.parentPath),
-                name: trimmed
-              }
+            await sendCollabFileOperation({
+              type: 'create-file',
+              parentPath: projectPathToCollabPath(state.parentPath),
+              name: trimmed
             });
           } else {
             await api.createFile({ parentPath: state.parentPath, name: trimmed });
@@ -5102,10 +5124,10 @@ async function pasteIntoPath(destinationPath) {
 
       let movedPath = null;
       if (collabConnected && collabMode === 'remote') {
-        const response = await sendCollabRequest('file:operation', { operation });
+        const response = await sendCollabFileOperation(operation);
         movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
       } else if (collabConnected) {
-        const response = await sendCollabRequest('file:operation', { operation });
+        const response = await sendCollabFileOperation(operation);
         movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
       } else {
         const result = await api.movePath({ sourcePath: item.sourcePath, destinationDir: destinationPath });
@@ -7177,6 +7199,9 @@ function initMonacoEditor() {
 
           if (collabConnected && collabMode === 'remote') {
             state.savedContent = state.model.getValue();
+            if (state.kind === 'text' && currentFilePath && !currentFilePath.startsWith(LOCAL_FILE_PREFIX)) {
+              queueCollabSharedTextWrite(currentFilePath, state.savedContent);
+            }
           }
         }
 
@@ -7419,6 +7444,9 @@ function enableSplit() {
 
           if (collabConnected && collabMode === 'remote') {
             state.savedContent = state.model.getValue();
+            if (state.kind === 'text' && rightFilePath && !rightFilePath.startsWith(LOCAL_FILE_PREFIX)) {
+              queueCollabSharedTextWrite(rightFilePath, state.savedContent);
+            }
           }
         }
 
@@ -7881,6 +7909,11 @@ function promptNewLocalFile() {
   renderTree();
 }
 
+function promptNewLocalFolder() {
+  inlineEditState = { mode: 'create', targetType: 'folder', parentPath: LOCAL_FILE_PREFIX, value: '' };
+  renderTree();
+}
+
 function buildLocalInlineCreateInput(parentPath, placeholder) {
   const createItem = document.createElement('li');
   const createRow = document.createElement('div');
@@ -8224,6 +8257,22 @@ function renderTree() {
     list.appendChild(buildTreeNode(node));
   }
 
+  if (collabConnected && collabMode === 'remote' && !collabIsSessionHost) {
+    for (const [folderKey, folder] of collabLocalFolders) {
+      list.appendChild(buildLocalFolderNode(folderKey, folder));
+    }
+
+    for (const [virtualPath, entry] of collabLocalFiles) {
+      if (!entry.name.includes('/')) {
+        list.appendChild(buildLocalFileNode(virtualPath, entry));
+      }
+    }
+
+    if (inlineEditState && inlineEditState.mode === 'create' && inlineEditState.parentPath === LOCAL_FILE_PREFIX) {
+      list.appendChild(buildLocalInlineCreateInput(LOCAL_FILE_PREFIX, 'New local file name'));
+    }
+  }
+
   if (inlineEditState && inlineEditState.mode === 'create' && inlineEditState.parentPath === project.rootPath) {
     const createRow = document.createElement('li');
     const row = document.createElement('div');
@@ -8265,10 +8314,6 @@ function renderTree() {
   }
 
   treeRoot.appendChild(list);
-
-  if (collabConnected && collabMode === 'remote' && !collabIsSessionHost) {
-    treeRoot.appendChild(buildLocalFilesSection());
-  }
 
   treeRoot.ondragover = (event) => {
     if (!explorerDragState || !project.rootPath) {
@@ -8381,17 +8426,8 @@ function collabFilePathToProjectPath(collabPath) {
 
 function isClientIgnoredPath(name) {
   if (!collabLocalGitignorePatterns) return false;
-  const lines = collabLocalGitignorePatterns.split('\n')
-    .map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-  for (const pattern of lines) {
-    const bare = pattern.replace(/\/$/, ''); // strip trailing slash (folder-only markers)
-    if (bare === name) return true;
-    if (bare.includes('*')) {
-      const re = new RegExp('^' + bare.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
-      if (re.test(name)) return true;
-    }
-  }
-  return false;
+  if (!window.qwaleApi || typeof window.qwaleApi.isGitignorePathIgnored !== 'function') return false;
+  return window.qwaleApi.isGitignorePathIgnored(collabLocalGitignorePatterns, normalizeCollabRelativePath(name));
 }
 
 async function loadCollabLocalFiles(fingerprint) {
@@ -8464,6 +8500,267 @@ function projectPathToCollabPath(projectPath) {
   }
 
   return normalizedPath;
+}
+
+function normalizeCollabRelativePath(relativePath) {
+  return String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function canUseCollabSharedMirror() {
+  return collabConnected
+    && collabMode === 'remote'
+    && Boolean(collabProjectFingerprint)
+    && Boolean(collabSharedWorkspaceRoot);
+}
+
+async function syncCollabSharedFile(relativePath, content, encoding = 'utf8') {
+  if (!canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const normalizedPath = normalizeCollabRelativePath(relativePath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  await api.writeCollabSharedFile({
+    fingerprint: collabProjectFingerprint,
+    relativePath: normalizedPath,
+    content,
+    encoding
+  });
+}
+
+async function syncCollabSharedDelete(relativePath) {
+  if (!canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const normalizedPath = normalizeCollabRelativePath(relativePath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  await api.deleteCollabSharedPath({
+    fingerprint: collabProjectFingerprint,
+    relativePath: normalizedPath
+  });
+}
+
+async function syncCollabSharedRename(oldRelativePath, newRelativePath) {
+  if (!canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const oldPath = normalizeCollabRelativePath(oldRelativePath);
+  const newPath = normalizeCollabRelativePath(newRelativePath);
+  if (!oldPath || !newPath) {
+    return;
+  }
+
+  await api.renameCollabSharedPath({
+    fingerprint: collabProjectFingerprint,
+    oldRelativePath: oldPath,
+    newRelativePath: newPath
+  });
+}
+
+async function syncCollabSharedEnsureFolder(relativePath) {
+  if (!canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const normalizedPath = normalizeCollabRelativePath(relativePath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  await api.ensureCollabSharedFolder({
+    fingerprint: collabProjectFingerprint,
+    relativePath: normalizedPath
+  });
+}
+
+function queueCollabSharedTextWrite(projectPath, content) {
+  if (!canUseCollabSharedMirror() || !projectPath || String(projectPath).startsWith(LOCAL_FILE_PREFIX)) {
+    return;
+  }
+
+  const collabPath = normalizeCollabRelativePath(projectPathToCollabPath(projectPath));
+  if (!collabPath) {
+    return;
+  }
+
+  if (collabSharedWriteTimers.has(collabPath)) {
+    clearTimeout(collabSharedWriteTimers.get(collabPath));
+  }
+
+  const timer = setTimeout(() => {
+    collabSharedWriteTimers.delete(collabPath);
+    syncCollabSharedFile(collabPath, String(content ?? ''), 'utf8').catch(() => {});
+  }, 120);
+
+  collabSharedWriteTimers.set(collabPath, timer);
+}
+
+function collectSnapshotEntries(nodes) {
+  const folders = [];
+  const files = [];
+  const queue = Array.isArray(nodes) ? [...nodes] : [];
+
+  while (queue.length) {
+    const node = queue.shift();
+    if (!node || !node.path || !node.type) {
+      continue;
+    }
+
+    const relPath = normalizeCollabRelativePath(node.path);
+    if (!relPath) {
+      continue;
+    }
+
+    if (node.type === 'folder') {
+      folders.push(relPath);
+      if (Array.isArray(node.children) && node.children.length) {
+        queue.push(...node.children);
+      }
+    } else if (node.type === 'file') {
+      files.push(relPath);
+    }
+  }
+
+  return { folders, files };
+}
+
+async function initializeCollabSharedWorkspace(snapshot, fingerprint) {
+  if (!fingerprint) {
+    collabSharedWorkspaceRoot = '';
+    collabSharedWorkspaceReady = Promise.resolve();
+    return;
+  }
+
+  const syncToken = ++collabSharedWorkspaceSyncToken;
+  const pending = (async () => {
+    const rootPayload = await api.getCollabSharedRoot({ fingerprint });
+    if (syncToken !== collabSharedWorkspaceSyncToken) {
+      return;
+    }
+
+    collabSharedWorkspaceRoot = String(rootPayload && rootPayload.rootPath ? rootPayload.rootPath : '');
+    await api.resetCollabSharedWorkspace({ fingerprint });
+
+    const snapshotTree = Array.isArray(snapshot && snapshot.tree) ? snapshot.tree : [];
+    const { folders, files } = collectSnapshotEntries(snapshotTree);
+
+    for (const folderPath of folders) {
+      if (syncToken !== collabSharedWorkspaceSyncToken) {
+        return;
+      }
+
+      await api.ensureCollabSharedFolder({
+        fingerprint,
+        relativePath: folderPath
+      });
+    }
+
+    const queue = [...files];
+    const workerCount = Math.max(1, Math.min(6, queue.length || 1));
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (queue.length) {
+        if (syncToken !== collabSharedWorkspaceSyncToken) {
+          return;
+        }
+
+        const filePath = queue.shift();
+        if (!filePath) {
+          continue;
+        }
+
+        try {
+          const response = await sendCollabRequest('file:get', { filePath });
+          const responseContent = String(response && response.content ? response.content : '');
+          const responseEncoding = String(response && response.encoding ? response.encoding : '').toLowerCase();
+
+          await api.writeCollabSharedFile({
+            fingerprint,
+            relativePath: filePath,
+            content: responseContent,
+            encoding: responseEncoding === 'base64' ? 'base64' : 'utf8'
+          });
+        } catch {
+          // Ignore per-file fetch failures during initial sync.
+        }
+      }
+    });
+
+    await Promise.all(workers);
+  })();
+
+  collabSharedWorkspaceReady = pending;
+  await pending;
+}
+
+async function syncCollabFileOperationToSharedMirror(operation, responsePath = '') {
+  if (!operation || typeof operation.type !== 'string' || !canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const type = String(operation.type || '').toLowerCase();
+  if (type === 'create-file') {
+    const fallbackPath = normalizeCollabRelativePath(`${String(operation.parentPath || '').replace(/[\\/]+$/, '')}/${String(operation.name || '').replace(/^\/+/, '')}`);
+    const targetPath = normalizeCollabRelativePath(responsePath || fallbackPath);
+    if (targetPath) {
+      await syncCollabSharedFile(targetPath, '', 'utf8');
+    }
+    return;
+  }
+
+  if (type === 'create-folder') {
+    const fallbackPath = normalizeCollabRelativePath(`${String(operation.parentPath || '').replace(/[\\/]+$/, '')}/${String(operation.name || '').replace(/^\/+/, '')}`);
+    const targetPath = normalizeCollabRelativePath(responsePath || fallbackPath);
+    if (targetPath) {
+      await syncCollabSharedEnsureFolder(targetPath);
+    }
+    return;
+  }
+
+  if (type === 'delete') {
+    const targetPath = normalizeCollabRelativePath(operation.targetPath || operation.sourcePath || responsePath);
+    if (targetPath) {
+      await syncCollabSharedDelete(targetPath);
+    }
+    return;
+  }
+
+  if (type === 'rename') {
+    const sourcePath = normalizeCollabRelativePath(operation.targetPath || operation.sourcePath);
+    const destinationPath = normalizeCollabRelativePath(responsePath || operation.destinationPath);
+    if (sourcePath && destinationPath) {
+      await syncCollabSharedRename(sourcePath, destinationPath);
+    }
+    return;
+  }
+
+  if (type === 'move') {
+    const sourcePath = normalizeCollabRelativePath(operation.sourcePath || operation.targetPath);
+    const destinationPath = normalizeCollabRelativePath(responsePath || operation.destinationPath);
+    if (sourcePath && destinationPath) {
+      await syncCollabSharedRename(sourcePath, destinationPath);
+    }
+  }
+}
+
+async function sendCollabFileOperation(operation) {
+  // Skip operations on local-only files (they won't sync to host)
+  const targetPath = operation && (operation.targetPath || operation.sourcePath || '');
+  if (targetPath && collabLocalOnlyPaths.has(normalizeCollabRelativePath(targetPath))) {
+    await syncCollabFileOperationToSharedMirror(operation, '');
+    return {};
+  }
+
+  const response = await sendCollabRequest('file:operation', { operation });
+  await syncCollabFileOperationToSharedMirror(operation, response && response.path ? response.path : '');
+  return response;
 }
 
 function addCollabActivity(message) {
@@ -10016,6 +10313,21 @@ function clearCollabSessionState() {
     collabCursorBroadcastTimer = null;
   }
 
+  for (const timer of collabSharedWriteTimers.values()) {
+    clearTimeout(timer);
+  }
+  collabSharedWriteTimers.clear();
+  collabSharedWorkspaceSyncToken += 1;
+  collabSharedWorkspaceReady = Promise.resolve();
+  collabSharedWorkspaceRoot = '';
+  collabLocalOnlyPaths.clear();
+
+  try {
+    api.stopCollabSharedWatcher && api.stopCollabSharedWatcher().catch(() => {});
+  } catch {
+    // ignore
+  }
+
   if (collabProjectFingerprint) {
     for (const [, entry] of collabLocalFiles) {
       if (entry.dirty && entry.content !== null) {
@@ -10114,6 +10426,7 @@ function applyRemoteOperationBatchToModel(filePath, ops, nextVersion) {
   state.savedContent = model.getValue();
   state.encoding = inferEncodingFromText(state.savedContent);
   collabFileVersions.set(projectPathToCollabPath(filePath), Math.max(0, Number(nextVersion) || 0));
+  queueCollabSharedTextWrite(filePath, state.savedContent);
   updateEditorStatusBar();
   renderTabs();
   renderTree();
@@ -10215,8 +10528,11 @@ async function openFileWithCollabSupport(filePath) {
 
   const collabPath = projectPathToCollabPath(filePath);
   const response = await sendCollabRequest('file:get', { filePath: collabPath });
+  const responseContent = String(response.content || '');
+  const responseEncoding = String(response.encoding || '').toLowerCase();
+  await syncCollabSharedFile(collabPath, responseContent, responseEncoding === 'base64' ? 'base64' : 'utf8').catch(() => {});
   return {
-    content: String(response.content || ''),
+    content: responseContent,
     version: Math.max(0, Number(response.version) || 0),
     encoding: String(response.encoding || ''),
     mimeType: String(response.mimeType || '')
@@ -10379,9 +10695,20 @@ async function handleCollabPacket(packet) {
 
     const operation = packet.operation && typeof packet.operation === 'object' ? packet.operation : null;
     const changeType = String(operation && operation.type ? operation.type : '').toLowerCase();
+    if (!changeType) {
+      return;
+    }
+
+    if (changeType === 'create-file' || changeType === 'create-folder') {
+      await syncCollabFileOperationToSharedMirror(operation).catch(() => {});
+      return;
+    }
+
     if (changeType !== 'delete' && changeType !== 'rename' && changeType !== 'move') {
       return;
     }
+
+    await syncCollabFileOperationToSharedMirror(operation).catch(() => {});
 
     const sourcePath = collabFilePathToProjectPath(operation.sourcePath || operation.targetPath || '');
     const destinationPath = collabFilePathToProjectPath(operation.destinationPath || '');
@@ -10402,6 +10729,16 @@ async function handleCollabPacket(packet) {
   if (packet.type === 'file:ops') {
     const projectPath = collabFilePathToProjectPath(packet.filePath || '');
     applyRemoteOperationBatchToModel(projectPath, packet.ops || [], packet.toVersion);
+    if (!(openFiles.get(projectPath) && openFiles.get(projectPath).kind === 'text')) {
+      const collabPath = normalizeCollabRelativePath(packet.filePath || '');
+      if (collabPath) {
+        sendCollabRequest('file:get', { filePath: collabPath }).then((response) => {
+          const responseContent = String(response && response.content ? response.content : '');
+          const responseEncoding = String(response && response.encoding ? response.encoding : '').toLowerCase();
+          syncCollabSharedFile(collabPath, responseContent, responseEncoding === 'base64' ? 'base64' : 'utf8').catch(() => {});
+        }).catch(() => {});
+      }
+    }
     return;
   }
 
@@ -10409,6 +10746,10 @@ async function handleCollabPacket(packet) {
     const projectPath = collabFilePathToProjectPath(packet.filePath || '');
     const state = openFiles.get(projectPath);
     if (!state || state.kind !== 'text') {
+      const collabPath = normalizeCollabRelativePath(packet.filePath || '');
+      if (collabPath) {
+        syncCollabSharedFile(collabPath, String(packet.content || ''), 'utf8').catch(() => {});
+      }
       return;
     }
 
@@ -10417,6 +10758,7 @@ async function handleCollabPacket(packet) {
     collabSuppressBroadcast = false;
     state.savedContent = state.model.getValue();
     collabFileVersions.set(projectPathToCollabPath(projectPath), Math.max(0, Number(packet.version) || 0));
+    queueCollabSharedTextWrite(projectPath, state.savedContent);
     renderTabs();
     renderTree();
     return;
@@ -10475,6 +10817,7 @@ function connectCollabSocket(serverUrl, code, name, mode) {
         if (mode === 'remote') {
           collabProjectFingerprint = joinResponse.projectFingerprint || null;
           collabLocalGitignorePatterns = joinResponse.gitignorePatterns || '';
+          collabLocalGitignoreMatcher = null;
           project = {
             rootPath: '/',
             rootName: joinResponse.snapshot && joinResponse.snapshot.rootName ? joinResponse.snapshot.rootName : 'Shared Project',
@@ -10487,7 +10830,19 @@ function connectCollabSocket(serverUrl, code, name, mode) {
           applyScmState('no-project');
           if (collabProjectFingerprint) {
             await loadCollabLocalFiles(collabProjectFingerprint);
+            collabSharedWorkspaceReady = initializeCollabSharedWorkspace(joinResponse.snapshot || {}, collabProjectFingerprint)
+              .catch(() => {
+                collabSharedWorkspaceRoot = '';
+              });
+            // Start shared-folder watcher so we can classify terminal-created files
+            try {
+              await api.startCollabSharedWatcher({ fingerprint: collabProjectFingerprint });
+            } catch {
+              // ignore watcher start failures
+            }
           } else {
+            collabSharedWorkspaceRoot = '';
+            collabSharedWorkspaceReady = Promise.resolve();
             renderTree();
           }
         }
@@ -11663,6 +12018,11 @@ if (api.onCollabEvent) {
     if (!event || typeof event !== 'object') {
       return;
     }
+    // Handle shared filesystem watcher events first
+    if (event && event.type === 'collab:shared:fs-event' && event.payload) {
+      void handleSharedFsEvent(event.payload).catch(() => {});
+      return;
+    }
 
     const packet = {
       type: event.type,
@@ -11670,6 +12030,35 @@ if (api.onCollabEvent) {
     };
     void handleCollabPacket(packet).catch(() => {});
   });
+}
+
+async function handleSharedFsEvent(payload) {
+  try {
+    if (!payload || typeof payload !== 'object') return;
+    const fingerprint = String(payload.fingerprint || '');
+    if (!fingerprint || fingerprint !== collabProjectFingerprint) return;
+    const eventType = String(payload.eventType || '').toLowerCase();
+    const rel = normalizeCollabRelativePath(payload.relativePath || '');
+    if (!rel) return;
+    if (!canUseCollabSharedMirror()) return;
+
+    if (eventType === 'added' || eventType === 'created') {
+      // If the new entry matches client ignore patterns, mark it as local-only
+      if (!isClientIgnoredPath(rel)) return;
+
+      // Add to local-only set (won't be synced to host)
+      collabLocalOnlyPaths.add(rel);
+      
+      // Update explorer to show this file in its actual location
+      try {
+        await refreshProjectTree();
+      } catch {
+        // ignore refresh errors
+      }
+    }
+  } catch {
+    // swallow
+  }
 }
 
 document.addEventListener('keydown', async (event) => {

@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer } = require('electron');
+const ignore = require('ignore');
 
 contextBridge.exposeInMainWorld('qwaleApi', {
   openProject: () => ipcRenderer.invoke('project:open'),
@@ -39,12 +40,29 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   stopCollabServer: () => ipcRenderer.invoke('collab:stopServer'),
   getCollabServerInfo: () => ipcRenderer.invoke('collab:getServerInfo'),
   openCollabJoinWindow: (payload) => ipcRenderer.invoke('collab:openJoinWindow', payload),
+  createIgnoreMatcher: () => ignore(),
+  isGitignorePathIgnored: (patterns, relativePath) => {
+    const matcher = ignore();
+    matcher.add('.git/');
+    matcher.add(String(patterns || ''));
+    const rel = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    return matcher.ignores(rel) || matcher.ignores(`${rel}/`);
+  },
   listCollabLocalFiles:    (payload) => ipcRenderer.invoke('collab:local:list',         payload),
   readCollabLocalFile:     (payload) => ipcRenderer.invoke('collab:local:read',         payload),
   writeCollabLocalFile:    (payload) => ipcRenderer.invoke('collab:local:write',        payload),
   deleteCollabLocalFile:   (payload) => ipcRenderer.invoke('collab:local:delete',       payload),
   renameCollabLocalFile:   (payload) => ipcRenderer.invoke('collab:local:rename',       payload),
   createCollabLocalFolder: (payload) => ipcRenderer.invoke('collab:local:createFolder', payload),
+  getCollabSharedRoot:     (payload) => ipcRenderer.invoke('collab:shared:getRoot',     payload),
+  resetCollabSharedWorkspace: (payload) => ipcRenderer.invoke('collab:shared:reset',    payload),
+  ensureCollabSharedFolder: (payload) => ipcRenderer.invoke('collab:shared:ensureFolder', payload),
+  writeCollabSharedFile:   (payload) => ipcRenderer.invoke('collab:shared:write',       payload),
+  deleteCollabSharedPath:  (payload) => ipcRenderer.invoke('collab:shared:delete',      payload),
+  renameCollabSharedPath:  (payload) => ipcRenderer.invoke('collab:shared:rename',      payload),
+  readCollabSharedFile:    (payload) => ipcRenderer.invoke('collab:shared:read',        payload),
+  startCollabSharedWatcher: (payload) => ipcRenderer.invoke('collab:shared:startWatcher', payload),
+  stopCollabSharedWatcher:  () => ipcRenderer.invoke('collab:shared:stopWatcher'),
   runAiCommand: (payload) => ipcRenderer.invoke('ai:runCommand', payload),
   getTerminalProfiles: () => ipcRenderer.invoke('terminal:getProfiles'),
   createTerminal: (payload) => ipcRenderer.invoke('terminal:create', payload),
