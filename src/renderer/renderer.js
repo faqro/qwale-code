@@ -8506,6 +8506,45 @@ function normalizeCollabRelativePath(relativePath) {
   return String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
 }
 
+function isBinaryFile(relativePath) {
+  const p = String(relativePath || '').toLowerCase();
+  return /\.(png|jpg|jpeg|gif|webp|svg|ico|pdf|zip|tar|gz|rar|bmp|mp4|mov|mp3|wav|ogg|ttf|woff|woff2)$/i.test(p);
+}
+
+function promptExternalEditConflict(relativePath) {
+  const name = String(relativePath || '').split('/').pop() || relativePath;
+  // Return true when user chooses to use external version, false to keep local edits
+  return window.confirm(`${name} was modified externally. Replace unsaved local edits with the external version? (OK = Use external)`);
+}
+
+const collabRecentWrites = new Map();
+
+function markRecentCollabWrite(relPath) {
+  const normalizedPath = normalizeCollabRelativePath(relPath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  const expiry = Date.now() + 1500;
+  collabRecentWrites.set(normalizedPath, expiry);
+  setTimeout(() => {
+    const currentExpiry = collabRecentWrites.get(normalizedPath);
+    if (currentExpiry && currentExpiry <= Date.now()) {
+      collabRecentWrites.delete(normalizedPath);
+    }
+  }, 2000);
+}
+
+function isRecentlyCollabWritten(relPath) {
+  const normalizedPath = normalizeCollabRelativePath(relPath);
+  if (!normalizedPath) {
+    return false;
+  }
+
+  const expiry = collabRecentWrites.get(normalizedPath);
+  return Boolean(expiry && expiry > Date.now());
+}
+
 function canUseCollabSharedMirror() {
   return collabConnected
     && collabMode === 'remote'
@@ -8523,6 +8562,7 @@ async function syncCollabSharedFile(relativePath, content, encoding = 'utf8') {
     return;
   }
 
+  markRecentCollabWrite(normalizedPath);
   await api.writeCollabSharedFile({
     fingerprint: collabProjectFingerprint,
     relativePath: normalizedPath,
@@ -8541,6 +8581,7 @@ async function syncCollabSharedDelete(relativePath) {
     return;
   }
 
+  markRecentCollabWrite(normalizedPath);
   await api.deleteCollabSharedPath({
     fingerprint: collabProjectFingerprint,
     relativePath: normalizedPath
@@ -8558,6 +8599,8 @@ async function syncCollabSharedRename(oldRelativePath, newRelativePath) {
     return;
   }
 
+  markRecentCollabWrite(oldPath);
+  markRecentCollabWrite(newPath);
   await api.renameCollabSharedPath({
     fingerprint: collabProjectFingerprint,
     oldRelativePath: oldPath,
@@ -8575,6 +8618,7 @@ async function syncCollabSharedEnsureFolder(relativePath) {
     return;
   }
 
+  markRecentCollabWrite(normalizedPath);
   await api.ensureCollabSharedFolder({
     fingerprint: collabProjectFingerprint,
     relativePath: normalizedPath
@@ -8597,6 +8641,7 @@ function queueCollabSharedTextWrite(projectPath, content) {
 
   const timer = setTimeout(() => {
     collabSharedWriteTimers.delete(collabPath);
+    markRecentCollabWrite(collabPath);
     syncCollabSharedFile(collabPath, String(content ?? ''), 'utf8').catch(() => {});
   }, 120);
 
@@ -8651,6 +8696,16 @@ async function initializeCollabSharedWorkspace(snapshot, fingerprint) {
 
     const snapshotTree = Array.isArray(snapshot && snapshot.tree) ? snapshot.tree : [];
     const { folders, files } = collectSnapshotEntries(snapshotTree);
+
+      // Populate local-only paths from the initial snapshot based on .gitignore
+      try {
+        collabLocalOnlyPaths.clear();
+        for (const p of [...folders, ...files]) {
+          try {
+            if (isClientIgnoredPath(p)) collabLocalOnlyPaths.add(p);
+          } catch { /* ignore per-path classification errors */ }
+        }
+      } catch { /* non-fatal */ }
 
     for (const folderPath of folders) {
       if (syncToken !== collabSharedWorkspaceSyncToken) {
@@ -10745,8 +10800,36 @@ async function handleCollabPacket(packet) {
   if (packet.type === 'file:sync') {
     const projectPath = collabFilePathToProjectPath(packet.filePath || '');
     const state = openFiles.get(projectPath);
+    const encoding = String(packet.encoding || 'utf8').toLowerCase();
+    const collabPath = normalizeCollabRelativePath(packet.filePath || '');
+
+    if (encoding === 'base64') {
+      const content = String(packet.content || '');
+      const mimeType = String(packet.mimeType || '').trim() || (isImageFile(projectPath) ? `image/${(projectPath.match(/\.([^.\\/]+)$/) || [])[1] || 'png'}` : 'application/octet-stream');
+
+      if (state && state.kind === 'image') {
+        state.imageSrc = `data:${mimeType};base64,${content}`;
+        state.imageDimensions = null;
+        if (projectPath === currentFilePath) {
+          showImagePreview(projectPath, state.imageSrc);
+        }
+        if (splitEnabled && projectPath === rightFilePath) {
+          showImagePreviewRight(projectPath, state.imageSrc);
+        }
+      }
+
+      if (collabPath) {
+        syncCollabSharedFile(collabPath, content, 'base64').catch(() => {});
+      }
+
+      if (state && state.kind === 'image') {
+        renderTabs();
+        renderTree();
+      }
+      return;
+    }
+
     if (!state || state.kind !== 'text') {
-      const collabPath = normalizeCollabRelativePath(packet.filePath || '');
       if (collabPath) {
         syncCollabSharedFile(collabPath, String(packet.content || ''), 'utf8').catch(() => {});
       }
@@ -10834,6 +10917,7 @@ function connectCollabSocket(serverUrl, code, name, mode) {
               .catch(() => {
                 collabSharedWorkspaceRoot = '';
               });
+            await collabSharedWorkspaceReady;
             // Start shared-folder watcher so we can classify terminal-created files
             try {
               await api.startCollabSharedWatcher({ fingerprint: collabProjectFingerprint });
@@ -12042,20 +12126,79 @@ async function handleSharedFsEvent(payload) {
     if (!rel) return;
     if (!canUseCollabSharedMirror()) return;
 
-    if (eventType === 'added' || eventType === 'created') {
-      // If the new entry matches client ignore patterns, mark it as local-only
-      if (!isClientIgnoredPath(rel)) return;
+    console.debug('handleSharedFsEvent', { eventType, relativePath: rel, fingerprint });
 
-      // Add to local-only set (won't be synced to host)
-      collabLocalOnlyPaths.add(rel);
-      
-      // Update explorer to show this file in its actual location
-      try {
-        await refreshProjectTree();
-      } catch {
-        // ignore refresh errors
-      }
+    if (isRecentlyCollabWritten(rel)) {
+      console.debug('handleSharedFsEvent:suppressed', { eventType, relativePath: rel, fingerprint });
+      return;
     }
+
+    const deleteEvents = new Set(['deleted', 'unlink', 'removed']);
+    const upsertEvents = new Set(['added', 'created', 'change', 'changed', 'modified', 'rename', 'moved']);
+    const exists = payload.exists === true ? true : payload.exists === false ? false : null;
+
+    if (deleteEvents.has(eventType) || ((eventType === 'rename' || eventType === 'moved') && exists === false)) {
+      if (isClientIgnoredPath(rel)) {
+        collabLocalOnlyPaths.delete(rel);
+        try { await refreshProjectTree(); } catch {}
+        return;
+      }
+
+      try {
+        await sendCollabFileOperation({ type: 'delete', targetPath: rel });
+      } catch {}
+      try { await refreshProjectTree(); } catch {}
+      return;
+    }
+
+    if (isClientIgnoredPath(rel)) {
+      collabLocalOnlyPaths.add(rel);
+      try { await refreshProjectTree(); } catch {}
+      return;
+    }
+
+    if (!upsertEvents.has(eventType) && exists !== true) {
+      try { await refreshProjectTree(); } catch {}
+      return;
+    }
+
+    try {
+      const disk = await api.readCollabSharedFile({ fingerprint, relativePath: rel });
+      const diskContent = typeof disk === 'string'
+        ? disk
+        : String(disk && typeof disk.content !== 'undefined' ? disk.content : '');
+      const diskEnc = typeof disk === 'object' && disk
+        ? String(disk.encoding || '').toLowerCase()
+        : '';
+      const isBinary = (diskEnc === 'base64') || isBinaryFile(rel);
+
+      const projPath = resolveProjectFilePath(rel);
+      if (projPath && isDirty(projPath)) {
+        const useExternal = promptExternalEditConflict(rel);
+        if (!useExternal) {
+          return;
+        }
+      }
+
+      try {
+        const ack = await sendCollabRequest('file:sync', {
+          filePath: rel,
+          content: diskContent,
+          encoding: isBinary ? 'base64' : 'utf8'
+        });
+        if (ack && typeof ack.version !== 'undefined') {
+          collabFileVersions.set(rel, Math.max(0, Number(ack.version) || 0));
+        }
+      } catch {
+        // Best effort: the mirror still drives the local explorer state.
+      }
+
+      try { await syncCollabSharedFile(rel, diskContent, isBinary ? 'base64' : 'utf8'); } catch {}
+      try { await refreshProjectTree(); } catch {}
+    } catch {
+      try { await refreshProjectTree(); } catch {}
+    }
+    return;
   } catch {
     // swallow
   }

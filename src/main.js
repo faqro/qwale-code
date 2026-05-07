@@ -1463,8 +1463,26 @@ ipcMain.handle('collab:shared:startWatcher', async (event, { fingerprint }) => {
     const watcher = fs.watch(resolved.rootPath, { recursive: true }, (evt, filename) => {
       try {
         const relativePath = filename ? String(filename).replace(/\\/g, '/') : '';
-        const payload = { fingerprint, eventType: evt, relativePath };
-        sendCollabEventToRenderer(webContentsId, { type: 'collab:shared:fs-event', payload });
+        void (async () => {
+          let exists = null;
+          let isDirectory = null;
+
+          if (relativePath) {
+            try {
+              const stat = await fsp.stat(path.join(resolved.rootPath, relativePath));
+              exists = true;
+              isDirectory = stat.isDirectory();
+            } catch {
+              exists = false;
+            }
+          }
+
+          const payload = { fingerprint, eventType: evt, relativePath, exists, isDirectory };
+          console.debug('collab:shared:watch', { webContentsId, fingerprint, eventType: evt, relativePath, exists, isDirectory });
+          sendCollabEventToRenderer(webContentsId, { type: 'collab:shared:fs-event', payload });
+        })().catch((err) => {
+          console.warn('collab shared watcher callback error:', err && err.stack ? err.stack : err);
+        });
       } catch (err) {
         console.warn('collab shared watcher callback error:', err && err.stack ? err.stack : err);
       }

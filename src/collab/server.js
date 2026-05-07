@@ -442,6 +442,11 @@ class CollaborationHostServer {
       return;
     }
 
+    if (packet.type === 'file:sync') {
+      await this.handleFileSync(socket, packet, client);
+      return;
+    }
+
     if (packet.type === 'file:ops') {
       await this.handleFileOps(socket, packet, client);
       return;
@@ -632,6 +637,73 @@ class CollaborationHostServer {
       content: fileState.content,
       version: fileState.history.length
     });
+  }
+
+  async handleFileSync(socket, packet, client) {
+    const targetPath = String(packet.filePath || '').replace(/^[\\/]+/, '');
+    if (!targetPath) {
+      this.send(socket, 'file:sync:error', {
+        requestId: packet.requestId || null,
+        message: 'Missing file path.'
+      });
+      return;
+    }
+
+    if (!this.isSharedPath(targetPath, false)) {
+      this.send(socket, 'file:sync:error', {
+        requestId: packet.requestId || null,
+        message: 'That path is not shared in this session.'
+      });
+      return;
+    }
+
+    const encoding = String(packet.encoding || 'utf8').toLowerCase();
+    const resolved = this.resolveRelativePath(targetPath);
+    let content = packet.content != null ? packet.content : '';
+
+    if (encoding === 'base64') {
+      await fs.writeFile(resolved.absolutePath, Buffer.from(String(content), 'base64'));
+      this.fileStates.delete(targetPath);
+    } else {
+      content = String(content);
+      await fs.writeFile(resolved.absolutePath, content, 'utf8');
+      this.fileStates.set(targetPath, {
+        filePath: targetPath,
+        content,
+        history: []
+      });
+    }
+
+    const response = {
+      requestId: packet.requestId || null,
+      filePath: targetPath,
+      encoding: encoding === 'base64' ? 'base64' : 'utf8',
+      version: 0
+    };
+
+    if (encoding === 'base64' && isImageFilePath(targetPath)) {
+      response.mimeType = this.getImageMimeType(targetPath);
+    }
+
+    this.broadcast('file:sync', {
+      filePath: targetPath,
+      content: String(packet.content || ''),
+      encoding: response.encoding,
+      version: response.version,
+      mimeType: response.mimeType || null,
+      actorClientId: client.clientId,
+      actorName: client.name
+    });
+
+    try {
+      const snapshot = await this.buildSnapshotPayload();
+      this.broadcast('tree:update', {
+        tree: snapshot.tree,
+        rootName: snapshot.rootName
+      });
+    } catch { /* non-fatal */ }
+
+    this.send(socket, 'file:sync:ok', response);
   }
 
   getImageMimeType(filePath) {
