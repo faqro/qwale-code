@@ -8425,9 +8425,13 @@ function collabFilePathToProjectPath(collabPath) {
 }
 
 function isClientIgnoredPath(name) {
+  const rel = normalizeCollabRelativePath(name || '');
+  if (!rel) return false;
+  // Always treat .qwcode and its contents as local-only
+  if (rel === '.qwcode' || rel.startsWith('.qwcode/')) return true;
   if (!collabLocalGitignorePatterns) return false;
   if (!window.qwaleApi || typeof window.qwaleApi.isGitignorePathIgnored !== 'function') return false;
-  return window.qwaleApi.isGitignorePathIgnored(collabLocalGitignorePatterns, normalizeCollabRelativePath(name));
+  return window.qwaleApi.isGitignorePathIgnored(collabLocalGitignorePatterns, rel);
 }
 
 async function loadCollabLocalFiles(fingerprint) {
