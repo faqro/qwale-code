@@ -41,7 +41,7 @@ const collabLocalWatchers = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
 let collaborationHostServer = null;
 const filteredDevtoolsContents = new WeakSet();
-const DEFAULT_RELAY_URL = process.env.QWALE_RELAY_URL || 'ws://localhost:8787';
+const DEFAULT_RELAY_URL = process.env.QWALE_RELAY_URL || 'wss://qwale-code.onrender.com';
 
 function killTerminalSession(termId) {
   const session = terminals.get(termId);
