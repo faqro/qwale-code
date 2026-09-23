@@ -29,6 +29,13 @@ module.exports = {
     asar: true,
     // Used for the packaged app executable icon (Windows expects .ico).
     icon: path.join(__dirname, 'src/renderer/assets/desktop-app-logo'),
+    // Ad-hoc sign the mac build (no paid Apple Developer cert needed) so
+    // Gatekeeper doesn't report the downloaded/quarantined app as "damaged".
+    // Users still see an "unidentified developer" prompt, which is bypassable.
+    osxSign: {
+      identity: '-',
+      identityValidation: false,
+    },
   },
   rebuildConfig: {},
   makers: [

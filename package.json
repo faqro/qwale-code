@@ -1,7 +1,7 @@
 {
   "name": "qwalecode",
   "productName": "QwaleCode",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Lightweight Electron IDE and Code Platform",
   "main": "src/main.js",
   "scripts": {
