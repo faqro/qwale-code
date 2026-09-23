@@ -46,11 +46,18 @@ module.exports = {
     },
     {
       name: '@electron-forge/maker-deb',
-      config: {},
+      config: {
+        // Packager names the binary from packagerConfig/productName ("QwaleCode"),
+        // but electron-installer-debian defaults to package.json's "name" field
+        // ("qwalecode") when this isn't set, so it can't find the binary.
+        options: { bin: 'QwaleCode' },
+      },
     },
     {
       name: '@electron-forge/maker-rpm',
-      config: {},
+      config: {
+        options: { bin: 'QwaleCode' },
+      },
     },
   ],
   publishers: [

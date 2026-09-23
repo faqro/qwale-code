@@ -28,7 +28,10 @@ jobs:
 
   publish-windows:
     needs: create-draft-release
-    runs-on: windows-latest
+    # Pinned to windows-2022 (not windows-latest): newer runner images ship a
+    # Visual Studio version node-gyp can't parse yet, breaking node-pty's
+    # native rebuild ("unknown version \"undefined\"" / "find VS" errors).
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
