@@ -231,6 +231,7 @@ const collabSharedWriteTimers = new Map();
 let collabLocalOnlyPaths = new Set(); // Paths that are local-only (won't sync to host)
 let collabSocket = null;
 let collabConnected = false;
+let collabLocalRefreshTimer = null;
 let collabClientId = null;
 let collabIsSessionHost = false;
 let collabParticipantName = `User-${Math.floor(Math.random() * 900 + 100)}`;
@@ -673,6 +674,56 @@ async function loadAiConversationFromDisk() {
     return;
   }
 
+  // In remote collaboration mode, read from shared project via collaboration API
+  if (collabConnected && collabMode === 'remote') {
+    const chatConfigPath = getAiChatConfigPath();
+    if (!chatConfigPath) {
+      clearAiConversationHistory();
+      return;
+    }
+
+    // Prefer collab-local storage for .qwcode files when available
+    if (collabProjectFingerprint) {
+      try {
+        const raw = await api.readCollabLocalFile({ fingerprint: collabProjectFingerprint, name: '.qwcode/chat.json' });
+        const content = typeof raw === 'string' ? raw : '';
+        if (!content) {2
+          clearAiConversationHistory();
+          return;
+        }
+        const parsed = JSON.parse(content);
+        const source = Array.isArray(parsed) ? parsed : (parsed && parsed.conversation);
+        aiConversation = normalizeAiConversationEntries(source);
+        aiConversationCursor = aiConversation.length ? aiConversation.length - 1 : -1;
+        renderAiConversationFromState();
+        syncAiChatControls();
+      } catch {
+        clearAiConversationHistory();
+      }
+      return;
+    }
+
+    // Fallback: try remote file:get if fingerprint not available
+    try {
+      const collabPath = projectPathToCollabPath(chatConfigPath);
+      const response = await sendCollabRequest('file:get', { filePath: collabPath });
+      const raw = typeof response === 'string' ? response : (response && typeof response.content !== 'undefined' ? String(response.content) : '');
+      if (!raw) {
+        clearAiConversationHistory();
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      const source = Array.isArray(parsed) ? parsed : (parsed && parsed.conversation);
+      aiConversation = normalizeAiConversationEntries(source);
+      aiConversationCursor = aiConversation.length ? aiConversation.length - 1 : -1;
+      renderAiConversationFromState();
+      syncAiChatControls();
+    } catch {
+      clearAiConversationHistory();
+    }
+    return;
+  }
+
   const chatConfigPath = getAiChatConfigPath();
   if (!chatConfigPath) {
     clearAiConversationHistory();
@@ -703,6 +754,51 @@ async function saveAiConversationToDisk() {
     return;
   }
 
+  if (collabConnected && collabMode === 'remote') {
+    // Save to shared project via collaboration APIs as local un-synced file
+    const qwcodeFolderPath = getQwcodeStorageFolderPath();
+    const chatConfigPath = getAiChatConfigPath();
+    if (!qwcodeFolderPath || !chatConfigPath) {
+      return;
+    }
+    // Prefer collab-local storage APIs for .qwcode (client-local)
+    if (collabProjectFingerprint) {
+      try {
+        await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+      } catch {
+        // folder may already exist
+      }
+
+      try {
+        await api.writeCollabLocalFile({
+          fingerprint: collabProjectFingerprint,
+          name: '.qwcode/chat.json',
+          content: JSON.stringify({ version: 1, conversation: aiConversation }, null, 2)
+        });
+        // refresh local-collab listing so explorer shows the new file
+        try { await loadCollabLocalFiles(collabProjectFingerprint); } catch {}
+      } catch {
+        // Non-fatal: best effort to persist
+      }
+    } else {
+      // Fallback to remote write if fingerprint not ready
+      try {
+        await sendCollabFileOperation({ type: 'create-folder', parentPath: '/', name: '.qwcode' });
+      } catch {}
+      try {
+        const collabPath = projectPathToCollabPath(chatConfigPath);
+        await sendCollabRequest('file:sync', {
+          filePath: collabPath,
+          content: JSON.stringify({ version: 1, conversation: aiConversation }, null, 2),
+          encoding: 'utf8'
+        });
+      } catch {
+        // Non-fatal
+      }
+    }
+    return;
+  }
+
   const qwcodeFolderPath = getQwcodeStorageFolderPath();
   const chatConfigPath = getAiChatConfigPath();
   if (!qwcodeFolderPath || !chatConfigPath) {
@@ -711,8 +807,19 @@ async function saveAiConversationToDisk() {
 
   let createdFolder = false;
   try {
-    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
-    createdFolder = true;
+    if (collabConnected && collabMode === 'remote' && collabProjectFingerprint) {
+      try {
+        await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+        createdFolder = true;
+      } catch (error) {
+        if (!isAlreadyExistsError(error)) {
+          throw error;
+        }
+      }
+    } else {
+      await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+      createdFolder = true;
+    }
   } catch (error) {
     if (!isAlreadyExistsError(error)) {
       throw error;
@@ -940,12 +1047,29 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'get_project_tree') {
     addAiActivity('Refreshing project tree...');
+    if (collabConnected && collabMode === 'remote') {
+      await refreshProjectTree();
+      return JSON.stringify({
+        rootPath: project.rootPath,
+        rootName: project.rootName,
+        tree: Array.isArray(project.tree) ? project.tree : []
+      });
+    }
+
     const refreshed = await api.refreshProject();
     return JSON.stringify(refreshed);
   }
 
   if (name === 'read_file') {
     addAiActivity(`Reading file: ${String(args.filePath || '')}`);
+    // If in remote collaboration (non-host), read from shared project via collab request
+    if (collabConnected && collabMode === 'remote') {
+      const collabPath = projectPathToCollabPath(args.filePath || '');
+      const response = await sendCollabRequest('file:get', { filePath: collabPath });
+      if (typeof response === 'string') return response;
+      return typeof response === 'object' && typeof response.content !== 'undefined' ? String(response.content) : '';
+    }
+
     const abs = toAbsoluteProjectPath(args.filePath);
     const payload = await api.readFile(abs);
     return typeof payload === 'string' ? payload : payload.content;
@@ -953,6 +1077,14 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'write_file') {
     addAiActivity(`Edited file: ${String(args.filePath || '')}`);
+    if (collabConnected && collabMode === 'remote') {
+      const collabPath = projectPathToCollabPath(args.filePath || '');
+      // Best-effort: use file:sync to update remote host's authoritative file
+      await sendCollabRequest('file:sync', { filePath: collabPath, content: String(args.content || ''), encoding: 'utf8' });
+      await refreshProjectTree();
+      return 'ok';
+    }
+
     const abs = toAbsoluteProjectPath(args.filePath);
     await api.writeFile({ filePath: abs, content: String(args.content || '') });
     await refreshProjectTree();
@@ -961,6 +1093,13 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'create_file') {
     addAiActivity(`Created file: ${String(args.parentPath || '')}/${String(args.name || '')}`);
+    if (collabConnected && collabMode === 'remote') {
+      const parent = projectPathToCollabPath(args.parentPath || '');
+      await sendCollabFileOperation({ type: 'create-file', parentPath: parent, name: String(args.name || '') });
+      await refreshProjectTree();
+      return 'ok';
+    }
+
     const parent = toAbsoluteProjectPath(args.parentPath);
     await api.createFile({ parentPath: parent, name: String(args.name || '') });
     await refreshProjectTree();
@@ -969,6 +1108,13 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'create_folder') {
     addAiActivity(`Created folder: ${String(args.parentPath || '')}/${String(args.name || '')}`);
+    if (collabConnected && collabMode === 'remote') {
+      const parent = projectPathToCollabPath(args.parentPath || '');
+      await sendCollabFileOperation({ type: 'create-folder', parentPath: parent, name: String(args.name || '') });
+      await refreshProjectTree();
+      return 'ok';
+    }
+
     const parent = toAbsoluteProjectPath(args.parentPath);
     await api.createFolder({ parentPath: parent, name: String(args.name || '') });
     await refreshProjectTree();
@@ -977,6 +1123,13 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'delete_path') {
     addAiActivity(`Deleted path: ${String(args.targetPath || '')}`);
+    if (collabConnected && collabMode === 'remote') {
+      const target = projectPathToCollabPath(args.targetPath || '');
+      await sendCollabFileOperation({ type: 'delete', targetPath: target });
+      await refreshProjectTree();
+      return 'ok';
+    }
+
     const target = toAbsoluteProjectPath(args.targetPath);
     await api.deletePath({ targetPath: target });
     await refreshProjectTree();
@@ -986,6 +1139,11 @@ async function runAiTool(name, args, signal) {
   if (name === 'run_command') {
     const command = String(args.command || '');
     addAiActivity(`Running command: ${command}`);
+    // Running shell commands from a non-host remote client is not allowed
+    if (collabConnected && collabMode === 'remote' && !collabIsSessionHost) {
+      throw new Error('Running commands is not allowed while connected as a non-host remote client.');
+    }
+
     const result = await api.runAiCommand({ command });
     const exitCode = result && typeof result.exitCode !== 'undefined' ? result.exitCode : 'unknown';
     addAiActivity(`Command finished (exit ${exitCode}): ${command}`);
@@ -3027,6 +3185,37 @@ async function saveLaunchConfigToDisk() {
     throw new Error('Open a project folder first.');
   }
 
+  if (collabConnected && collabMode === 'remote') {
+    await collabSharedWorkspaceReady;
+    // Save to shared project via collaboration APIs as local un-synced file
+    try {
+      // Ensure .qwcode folder exists in shared project (prefer collab-local)
+      if (!collabProjectFingerprint) {
+        throw new Error('Collaboration workspace is not ready yet.');
+      }
+      try {
+        await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+      } catch {}
+    } catch {
+      // Folder may already exist; continue
+    }
+
+    try {
+      // Write launch.json to shared project; will be treated as local un-synced
+      await api.writeCollabLocalFile({
+        fingerprint: collabProjectFingerprint,
+        name: '.qwcode/launch.json',
+        content: JSON.stringify(launchConfigState, null, 2)
+      });
+      try { await loadCollabLocalFiles(collabProjectFingerprint); } catch {}
+    } catch (error) {
+      throw new Error(`Could not save launch configuration: ${error.message}`);
+    }
+    launchConfigExists = true;
+    launchConfigLoadError = '';
+    return;
+  }
+
   await api.writeFile({
     filePath: launchConfigPath,
     content: JSON.stringify(launchConfigState, null, 2)
@@ -3090,8 +3279,17 @@ async function createLaunchConfigFromPanel() {
 
   let createdFolder = false;
   try {
-    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
-    createdFolder = true;
+    if (collabConnected && collabMode === 'remote') {
+      await collabSharedWorkspaceReady;
+      if (!collabProjectFingerprint) {
+        throw new Error('Collaboration workspace is not ready yet.');
+      }
+      await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+      createdFolder = true;
+    } else {
+      await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+      createdFolder = true;
+    }
   } catch (error) {
     if (!isAlreadyExistsError(error)) {
       throw error;
@@ -3101,7 +3299,7 @@ async function createLaunchConfigFromPanel() {
   launchConfigState = createDefaultLaunchConfig();
   await saveLaunchConfigToDisk();
 
-  if (createdFolder) {
+  if (createdFolder && !(collabConnected && collabMode === 'remote')) {
     await maybePromptAddQwcodeToGitignore();
   }
 
@@ -3130,6 +3328,65 @@ async function loadLaunchConfigFromDisk() {
   }
 
   try {
+    // Remote non-host: prefer collab-local storage for .qwcode/launch.json
+    if (collabConnected && collabMode === 'remote') {
+      if (collabProjectFingerprint) {
+        try {
+          const raw = await api.readCollabLocalFile({ fingerprint: collabProjectFingerprint, name: '.qwcode/launch.json' });
+          if (!raw) {
+            launchConfigExists = false;
+            launchConfigState = createDefaultLaunchConfig();
+            closeLaunchEditor();
+            renderRunDebugPanel();
+            return;
+          }
+          const parsed = JSON.parse(typeof raw === 'string' ? raw : '');
+          launchConfigState = normalizeLaunchConfig(parsed);
+          launchConfigExists = true;
+        } catch (error) {
+          const message = String(error && error.message ? error.message : error || '');
+          if (!/ENOENT|no such file|cannot find|not exist/i.test(message)) {
+            launchConfigLoadError = message;
+          }
+          launchConfigExists = false;
+          launchConfigState = createDefaultLaunchConfig();
+          closeLaunchEditor();
+        }
+        // Ensure UI updated
+        renderRunDebugPanel();
+        return;
+      }
+
+      // fingerprint not available: try remote file:get fallback
+      try {
+        const collabPath = projectPathToCollabPath(launchConfigPath);
+        const response = await sendCollabRequest('file:get', { filePath: collabPath });
+        const raw = typeof response === 'string' ? response : (response && typeof response.content !== 'undefined' ? String(response.content) : '');
+        if (!raw) {
+          launchConfigExists = false;
+          launchConfigState = createDefaultLaunchConfig();
+          closeLaunchEditor();
+          renderRunDebugPanel();
+          return;
+        }
+        const parsed = JSON.parse(raw);
+        launchConfigState = normalizeLaunchConfig(parsed);
+        launchConfigExists = true;
+        renderRunDebugPanel();
+        return;
+      } catch (error) {
+        const message = String(error && error.message ? error.message : error || '');
+        if (!/ENOENT|no such file|cannot find|not exist/i.test(message)) {
+          launchConfigLoadError = message;
+        }
+        launchConfigExists = false;
+        launchConfigState = createDefaultLaunchConfig();
+        closeLaunchEditor();
+        renderRunDebugPanel();
+        return;
+      }
+    }
+
     const payload = await api.readFile({ filePath: launchConfigPath, allowMissing: true });
     if (!payload) {
       launchConfigExists = false;
@@ -3213,6 +3470,26 @@ async function ensureLaunchConfigReadyForAiTools() {
     throw new Error('Could not resolve launch configuration path.');
   }
 
+  const launchFolderPath = getLaunchStorageFolderPath();
+  if (!launchFolderPath) {
+    throw new Error('Could not resolve launch folder path.');
+  }
+
+  // Remote non-host: ensure collab workspace and .qwcode folder are ready before any local file access
+  if (collabConnected && collabMode === 'remote') {
+    await collabSharedWorkspaceReady;
+    try {
+      if (!collabProjectFingerprint) {
+        throw new Error('Collaboration workspace is not ready yet.');
+      }
+      await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+    } catch {
+      // Folder may already exist
+    }
+  } else {
+    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+  }
+
   const payload = await api.readFile({ filePath: launchConfigPath, allowMissing: true });
   if (payload) {
     try {
@@ -3225,13 +3502,6 @@ async function ensureLaunchConfigReadyForAiTools() {
       throw new Error('launch.json exists but is invalid JSON. Fix it before AI modifies launch options.');
     }
   }
-
-  const launchFolderPath = getLaunchStorageFolderPath();
-  if (!launchFolderPath) {
-    throw new Error('Could not resolve launch folder path.');
-  }
-
-  await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
   launchConfigState = createDefaultLaunchConfig();
   await saveLaunchConfigToDisk();
 }
@@ -3542,15 +3812,23 @@ function quoteForCmdExecutable(value) {
 
 function resolveLaunchActionCwd(cwdValue) {
   const raw = String(cwdValue || '').trim();
+
+  // Determine base root path based on mode
+  let baseRoot = project.rootPath || '';
+  const collabRemoteMode = collabConnected && collabMode === 'remote' && Boolean(collabProjectFingerprint);
+  if (collabRemoteMode && collabSharedWorkspaceRoot) {
+    baseRoot = collabSharedWorkspaceRoot;
+  }
+
   if (!raw) {
-    return project.rootPath || '';
+    return baseRoot;
   }
 
   if (isAbsolutePathInput(raw)) {
     return raw;
   }
 
-  return joinPathSegments(project.rootPath || '', raw);
+  return joinPathSegments(baseRoot, raw);
 }
 
 function wrapPowerShellCommandWithLaunchCwd(command, cwdValue) {
@@ -9936,13 +10214,13 @@ function renderCollabQuickButton() {
 }
 
 async function copyCollabJoinDetails() {
-  const serverUrl = String(collabServerUrlInput.value || '').trim();
+  const relayUrl = String(collabServerUrlInput.value || '').trim();
   const code = String(collabCodeInput.value || collabSessionCode || '').trim().toUpperCase();
-  if (!serverUrl || !code) {
+  if (!relayUrl || !code) {
     throw new Error('Session details are not available yet.');
   }
 
-  await api.copyToClipboard(`Server: ${serverUrl}\nCode: ${code}`);
+  await api.copyToClipboard(`Relay: ${relayUrl}\nCode: ${code}`);
   setCollabInfo('Join details copied to clipboard');
 }
 
@@ -10272,7 +10550,9 @@ function sendCollabPacket(type, payload = {}) {
     return;
   }
 
-  collabSocket.send(JSON.stringify({ type, ...payload }));
+  // All collaboration-protocol traffic is wrapped in a relay envelope so the
+  // relay server can forward it to the host without understanding its contents.
+  collabSocket.send(JSON.stringify({ kind: 'relay', data: { type, ...payload } }));
 }
 
 function sendCollabRequest(type, payload = {}) {
@@ -10867,12 +11147,94 @@ async function handleCollabPacket(packet) {
   }
 }
 
-function connectCollabSocket(serverUrl, code, name, mode) {
+function connectCollabSocket(relayUrl, code, name, mode) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(serverUrl);
+    const socket = new WebSocket(relayUrl);
     let settled = false;
+    let relayJoined = false;
 
-    socket.addEventListener('open', async () => {
+    socket.addEventListener('open', () => {
+      // Relay-level handshake: ask the relay to attach this connection to the
+      // session identified by `code`. Once acknowledged, the normal collaboration
+      // protocol handshake (`join`) proceeds transparently through the relay.
+      socket.send(JSON.stringify({ kind: 'join-session', code }));
+    });
+
+    socket.addEventListener('message', (event) => {
+      const packet = (() => {
+        try {
+          return JSON.parse(String(event.data || ''));
+        } catch {
+          return null;
+        }
+      })();
+
+      if (!packet || typeof packet.kind !== 'string') {
+        return;
+      }
+
+      if (packet.kind === 'session-joined') {
+        if (relayJoined) {
+          return;
+        }
+        relayJoined = true;
+        void beginCollabHandshake();
+        return;
+      }
+
+      if (packet.kind === 'error') {
+        if (!settled) {
+          settled = true;
+          reject(new Error(packet.message || 'Could not join the collaboration session.'));
+          try {
+            socket.close();
+          } catch {
+            // Ignore close errors.
+          }
+        }
+        return;
+      }
+
+      if (packet.kind === 'host-left') {
+        collabDisconnectNotice = packet.message || 'Host ended the session.';
+        return;
+      }
+
+      if (packet.kind !== 'relay') {
+        return;
+      }
+
+      void handleCollabPacket(packet.data).catch(() => {});
+    });
+
+    socket.addEventListener('close', () => {
+      const wasRemoteSession = collabMode === 'remote';
+      const disconnectNotice = collabDisconnectNotice || 'Collaboration offline';
+      collabDisconnectNotice = '';
+      collabSocket = null;
+      clearCollabSessionState();
+      addCollabChatSystemMessage(disconnectNotice);
+      if (wasRemoteSession) {
+        teardownRemoteCollaborationWorkspace(disconnectNotice).catch((error) => {
+          setCollabInfo(error && error.message ? error.message : 'Collaboration offline');
+        });
+      } else {
+        setCollabInfo(disconnectNotice);
+      }
+      if (!settled) {
+        settled = true;
+        reject(new Error('Collaboration connection closed.'));
+      }
+    });
+
+    socket.addEventListener('error', () => {
+      if (!settled) {
+        settled = true;
+        reject(new Error('Could not connect to the relay server.'));
+      }
+    });
+
+    async function beginCollabHandshake() {
       collabSocket = socket;
       try {
         const joinResponse = await sendCollabRequest('join', {
@@ -10928,6 +11290,11 @@ function connectCollabSocket(serverUrl, code, name, mode) {
             } catch {
               // ignore watcher start failures
             }
+            try {
+              await api.startCollabLocalWatcher({ fingerprint: collabProjectFingerprint });
+            } catch {
+              // ignore local watcher start failures
+            }
           } else {
             collabSharedWorkspaceRoot = '';
             collabSharedWorkspaceReady = Promise.resolve();
@@ -10947,44 +11314,7 @@ function connectCollabSocket(serverUrl, code, name, mode) {
         settled = true;
         reject(error);
       }
-    });
-
-    socket.addEventListener('message', (event) => {
-      const packet = (() => {
-        try {
-          return JSON.parse(String(event.data || ''));
-        } catch {
-          return null;
-        }
-      })();
-
-      void handleCollabPacket(packet).catch(() => {});
-    });
-
-    socket.addEventListener('close', () => {
-      const wasRemoteSession = collabMode === 'remote';
-      const disconnectNotice = collabDisconnectNotice || 'Collaboration offline';
-      collabDisconnectNotice = '';
-      collabSocket = null;
-      clearCollabSessionState();
-      addCollabChatSystemMessage(disconnectNotice);
-      if (wasRemoteSession) {
-        teardownRemoteCollaborationWorkspace(disconnectNotice).catch((error) => {
-          setCollabInfo(error && error.message ? error.message : 'Collaboration offline');
-        });
-      } else {
-        setCollabInfo(disconnectNotice);
-      }
-      if (!settled) {
-        reject(new Error('Collaboration connection closed.'));
-      }
-    });
-
-    socket.addEventListener('error', () => {
-      if (!settled) {
-        reject(new Error('Could not connect to collaboration host.'));
-      }
-    });
+    }
   });
 }
 
@@ -10993,17 +11323,19 @@ async function startCollaborationAsHost() {
     throw new Error('Open a local project first.');
   }
 
-  const info = await api.startCollabServer({});
-  const defaultUrl = Array.isArray(info.urls) && info.urls.length > 0 ? info.urls[0] : '';
-  const shareUrl = defaultUrl || `ws://127.0.0.1:${info.port}`;
-  collabServerUrlInput.value = shareUrl;
+  const relayUrl = String(collabServerUrlInput.value || '').trim();
+  if (!relayUrl) {
+    throw new Error('Enter the relay server URL first.');
+  }
+
+  const info = await api.startCollabServer({ relayUrl });
   collabCodeInput.value = info.code || '';
 
   if (!collabConnected) {
-    await connectCollabSocket(shareUrl, info.code, getRequestedCollabName(), 'host');
+    await connectCollabSocket(relayUrl, info.code, getRequestedCollabName(), 'host');
   }
 
-  setCollabInfo(`Sharing on ${shareUrl} - Code ${info.code}`);
+  setCollabInfo(`Sharing via ${relayUrl} - Code ${info.code}`);
   addCollabActivity(`Sharing started. Code: ${info.code}`);
   addCollabChatSystemMessage(`Sharing started. Code: ${info.code}`);
 }
@@ -11013,22 +11345,22 @@ async function joinCollaborationAsClient() {
     return;
   }
 
-  const serverUrl = String(collabServerUrlInput.value || '').trim();
+  const relayUrl = String(collabServerUrlInput.value || '').trim();
   const code = String(collabCodeInput.value || '').trim().toUpperCase();
-  if (!serverUrl || !code) {
-    throw new Error('Enter both server URL and session code.');
+  if (!relayUrl || !code) {
+    throw new Error('Enter the relay server URL and session code.');
   }
 
   if (project.rootPath) {
     await api.openCollabJoinWindow({
-      serverUrl,
+      relayUrl,
       code,
       name: getRequestedCollabName()
     });
     return;
   }
 
-  await connectCollabSocket(serverUrl, code, getRequestedCollabName(), 'remote');
+  await connectCollabSocket(relayUrl, code, getRequestedCollabName(), 'remote');
 }
 
 async function stopCollaborationSession() {
@@ -11050,7 +11382,6 @@ async function stopCollaborationSession() {
 
   if (wasHostSession) {
     await api.stopCollabServer();
-    collabServerUrlInput.value = '';
     collabCodeInput.value = '';
   }
 
@@ -12057,11 +12388,11 @@ if (api.onMenuAction) {
         toggleThemeMode();
       } else if (action === 'collab:autoJoin') {
         setSidebarPanel('collaborate');
-        const incomingServerUrl = payload && payload.serverUrl ? String(payload.serverUrl) : '';
+        const incomingRelayUrl = payload && payload.relayUrl ? String(payload.relayUrl) : '';
         const incomingCode = payload && payload.code ? String(payload.code).toUpperCase() : '';
         const incomingName = payload && payload.name ? String(payload.name) : '';
 
-        collabServerUrlInput.value = incomingServerUrl;
+        collabServerUrlInput.value = incomingRelayUrl;
         collabCodeInput.value = incomingCode;
         if (incomingName) {
           collabNameInput.value = incomingName;
@@ -12112,6 +12443,12 @@ if (api.onCollabEvent) {
       return;
     }
 
+    // Handle collab-local (client-only) filesystem watcher events
+    if (event && event.type === 'collab:local:fs-event' && event.payload) {
+      void handleLocalFsEvent(event.payload).catch(() => {});
+      return;
+    }
+
     const packet = {
       type: event.type,
       ...(event.payload && typeof event.payload === 'object' ? event.payload : {})
@@ -12140,6 +12477,7 @@ async function handleSharedFsEvent(payload) {
     const deleteEvents = new Set(['deleted', 'unlink', 'removed']);
     const upsertEvents = new Set(['added', 'created', 'change', 'changed', 'modified', 'rename', 'moved']);
     const exists = payload.exists === true ? true : payload.exists === false ? false : null;
+    const isDirectory = payload.isDirectory === true;
 
     if (deleteEvents.has(eventType) || ((eventType === 'rename' || eventType === 'moved') && exists === false)) {
       if (isClientIgnoredPath(rel)) {
@@ -12161,13 +12499,45 @@ async function handleSharedFsEvent(payload) {
       return;
     }
 
+    // External folder creation/rename should be mirrored as a file operation.
+    if (exists === true && isDirectory) {
+      const parts = rel.split('/').filter(Boolean);
+      const folderName = parts.pop() || '';
+      const parentPath = parts.join('/');
+      if (folderName) {
+        try {
+          await sendCollabFileOperation({
+            type: 'create-folder',
+            parentPath,
+            name: folderName
+          });
+        } catch {
+          // Best effort; tree refresh below still updates local explorer.
+        }
+      }
+      try { await refreshProjectTree(); } catch {}
+      return;
+    }
+
     if (!upsertEvents.has(eventType) && exists !== true) {
       try { await refreshProjectTree(); } catch {}
       return;
     }
 
     try {
-      const disk = await api.readCollabSharedFile({ fingerprint, relativePath: rel });
+      let disk = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          disk = await api.readCollabSharedFile({ fingerprint, relativePath: rel });
+          break;
+        } catch {
+          if (attempt >= 2) {
+            throw new Error('Could not read external file from shared mirror.');
+          }
+          await new Promise((resolve) => setTimeout(resolve, 80 * (attempt + 1)));
+        }
+      }
+
       const diskContent = typeof disk === 'string'
         ? disk
         : String(disk && typeof disk.content !== 'undefined' ? disk.content : '');
@@ -12200,9 +12570,48 @@ async function handleSharedFsEvent(payload) {
       try { await syncCollabSharedFile(rel, diskContent, isBinary ? 'base64' : 'utf8'); } catch {}
       try { await refreshProjectTree(); } catch {}
     } catch {
+      // File may have been created but not yet flushed; ensure host tree still receives create-file.
+      const parts = rel.split('/').filter(Boolean);
+      const fileName = parts.pop() || '';
+      const parentPath = parts.join('/');
+      if (fileName) {
+        try {
+          await sendCollabFileOperation({
+            type: 'create-file',
+            parentPath,
+            name: fileName
+          });
+        } catch {
+          // Best effort fallback.
+        }
+      }
       try { await refreshProjectTree(); } catch {}
     }
     return;
+  } catch {
+    // swallow
+  }
+}
+
+async function handleLocalFsEvent(payload) {
+  try {
+    if (!payload || typeof payload !== 'object') return;
+    const fingerprint = String(payload.fingerprint || '');
+    if (!fingerprint || fingerprint !== collabProjectFingerprint) return;
+
+    // Debounce refresh of collab-local manifest to avoid thrash
+    if (collabLocalRefreshTimer) {
+      clearTimeout(collabLocalRefreshTimer);
+      collabLocalRefreshTimer = null;
+    }
+
+    collabLocalRefreshTimer = setTimeout(async () => {
+      collabLocalRefreshTimer = null;
+      try {
+        await loadCollabLocalFiles(fingerprint);
+      } catch {}
+      try { renderTree(); } catch {}
+    }, 250);
   } catch {
     // swallow
   }
@@ -12350,7 +12759,11 @@ aiSendBtn.addEventListener('click', async () => {
   autoResizeAiPrompt();
   const userIndex = recordAiConversation('user', prompt);
   addAiMessage('user', prompt, { convIndex: userIndex });
-  await saveAiConversationToDisk();
+  try {
+    await saveAiConversationToDisk();
+  } catch {
+    addAiActivity('Could not persist chat history; continuing without saving.');
+  }
   aiAbortController = new AbortController();
   setAiBusy(true);
 
@@ -12393,6 +12806,14 @@ aiPromptInput.addEventListener('input', () => {
 syncAiChatControls();
 updateCollabButtons();
 setCollabInfo('Collaboration offline');
+
+if (api.getDefaultRelayUrl) {
+  api.getDefaultRelayUrl().then((defaultRelayUrl) => {
+    if (!collabServerUrlInput.value.trim() && defaultRelayUrl) {
+      collabServerUrlInput.value = defaultRelayUrl;
+    }
+  }).catch(() => {});
+}
 
 terminalResizeHandle.addEventListener('mousedown', (event) => {
   resizeState = {

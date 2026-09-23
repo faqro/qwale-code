@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   startCollabServer: (payload) => ipcRenderer.invoke('collab:startServer', payload),
   stopCollabServer: () => ipcRenderer.invoke('collab:stopServer'),
   getCollabServerInfo: () => ipcRenderer.invoke('collab:getServerInfo'),
+  getDefaultRelayUrl: () => ipcRenderer.invoke('collab:getDefaultRelayUrl'),
   openCollabJoinWindow: (payload) => ipcRenderer.invoke('collab:openJoinWindow', payload),
   createIgnoreMatcher: () => ignore(),
   isGitignorePathIgnored: (patterns, relativePath) => {
@@ -63,6 +64,8 @@ contextBridge.exposeInMainWorld('qwaleApi', {
   readCollabSharedFile:    (payload) => ipcRenderer.invoke('collab:shared:read',        payload),
   startCollabSharedWatcher: (payload) => ipcRenderer.invoke('collab:shared:startWatcher', payload),
   stopCollabSharedWatcher:  () => ipcRenderer.invoke('collab:shared:stopWatcher'),
+  startCollabLocalWatcher: (payload) => ipcRenderer.invoke('collab:local:startWatcher', payload),
+  stopCollabLocalWatcher:  () => ipcRenderer.invoke('collab:local:stopWatcher'),
   runAiCommand: (payload) => ipcRenderer.invoke('ai:runCommand', payload),
   getTerminalProfiles: () => ipcRenderer.invoke('terminal:getProfiles'),
   createTerminal: (payload) => ipcRenderer.invoke('terminal:create', payload),

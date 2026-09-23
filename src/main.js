@@ -7,7 +7,6 @@ const pty = require('node-pty');
 const ignore = require('ignore');
 const { spawnSync } = require('child_process');
 const { execFile } = require('child_process');
-const { networkInterfaces } = require('os');
 const { CollaborationHostServer } = require('./collab/server');
 const { updateElectronApp, UpdateSourceType } = require('update-electron-app');
 
@@ -38,25 +37,11 @@ const windowProjectState = new Map();
 const windowInitialProject = new Map();
 const projectWatchers = new Map();
 const collabSharedWatchers = new Map();
+const collabLocalWatchers = new Map();
 const metaFieldPattern = /^(?:_.*|timestamp|time|createdat|updatedat|requestid|traceid|metadata|meta|servertime|duration|elapsed)$/i;
 let collaborationHostServer = null;
 const filteredDevtoolsContents = new WeakSet();
-
-function getServerHostCandidates() {
-  const hosts = new Set(['127.0.0.1', 'localhost']);
-  const nets = networkInterfaces();
-
-  for (const entries of Object.values(nets || {})) {
-    for (const entry of entries || []) {
-      if (!entry || entry.internal || entry.family !== 'IPv4') {
-        continue;
-      }
-      hosts.add(entry.address);
-    }
-  }
-
-  return [...hosts];
-}
+const DEFAULT_RELAY_URL = process.env.QWALE_RELAY_URL || 'ws://localhost:8787';
 
 function killTerminalSession(termId) {
   const session = terminals.get(termId);
@@ -1059,15 +1044,9 @@ function ensureCollaborationServer() {
 
 ipcMain.handle('collab:startServer', async (event, payload = {}) => {
   const server = ensureCollaborationServer();
-  const port = Number(payload.port) || 0;
-  const info = await server.start(event.sender.id, port);
-  const hosts = getServerHostCandidates();
-
-  return {
-    ...info,
-    hosts,
-    urls: hosts.map((host) => `ws://${host}:${info.port}`)
-  };
+  const relayUrl = String(payload.relayUrl || DEFAULT_RELAY_URL).trim();
+  const info = await server.start(event.sender.id, { relayUrl, code: payload.code });
+  return info;
 });
 
 ipcMain.handle('collab:stopServer', async () => {
@@ -1083,28 +1062,22 @@ ipcMain.handle('collab:getServerInfo', async () => {
   if (!collaborationHostServer) {
     return {
       running: false,
-      clients: [],
-      hosts: getServerHostCandidates(),
-      urls: []
+      clients: []
     };
   }
 
-  const info = collaborationHostServer.getInfo();
-  const hosts = getServerHostCandidates();
-  return {
-    ...info,
-    hosts,
-    urls: info.running && info.port ? hosts.map((host) => `ws://${host}:${info.port}`) : []
-  };
+  return collaborationHostServer.getInfo();
 });
 
+ipcMain.handle('collab:getDefaultRelayUrl', async () => DEFAULT_RELAY_URL);
+
 ipcMain.handle('collab:openJoinWindow', async (_event, payload = {}) => {
-  const serverUrl = String(payload.serverUrl || '').trim();
+  const relayUrl = String(payload.relayUrl || '').trim();
   const code = String(payload.code || '').trim().toUpperCase();
   const name = String(payload.name || '').trim();
 
-  if (!serverUrl || !code) {
-    throw new Error('Enter both server URL and session code.');
+  if (!relayUrl || !code) {
+    throw new Error('Enter both the relay server URL and session code.');
   }
 
   const joinWindow = createWindow();
@@ -1116,7 +1089,7 @@ ipcMain.handle('collab:openJoinWindow', async (_event, payload = {}) => {
     joinWindow.webContents.send('menu:action', {
       action: 'collab:autoJoin',
       payload: {
-        serverUrl,
+        relayUrl,
         code,
         name
       }
@@ -1493,6 +1466,64 @@ ipcMain.handle('collab:shared:startWatcher', async (event, { fingerprint }) => {
   } catch (err) {
     return { ok: false };
   }
+});
+
+// Start watcher for collab-local (per-client) shared mirror
+ipcMain.handle('collab:local:startWatcher', async (event, { fingerprint }) => {
+  const webContentsId = event && event.sender && event.sender.id ? event.sender.id : null;
+  if (!webContentsId) return { ok: false };
+  try {
+    const rootPath = path.resolve(getCollabLocalContentDir(fingerprint));
+    await fsp.mkdir(rootPath, { recursive: true });
+    if (collabLocalWatchers.has(webContentsId)) {
+      try { collabLocalWatchers.get(webContentsId).close(); } catch {}
+      collabLocalWatchers.delete(webContentsId);
+    }
+
+    const watcher = fs.watch(rootPath, { recursive: true }, (evt, filename) => {
+      try {
+        const relativePath = filename ? String(filename).replace(/\\/g, '/') : '';
+        void (async () => {
+          let exists = null;
+          let isDirectory = null;
+
+          if (relativePath) {
+            try {
+              const stat = await fsp.stat(path.join(rootPath, relativePath));
+              exists = true;
+              isDirectory = stat.isDirectory();
+            } catch {
+              exists = false;
+            }
+          }
+
+          const payload = { fingerprint, eventType: evt, relativePath, exists, isDirectory };
+          console.debug('collab:local:watch', { webContentsId, fingerprint, eventType: evt, relativePath, exists, isDirectory });
+          sendCollabEventToRenderer(webContentsId, { type: 'collab:local:fs-event', payload });
+        })().catch((err) => {
+          console.warn('collab local watcher callback error:', err && err.stack ? err.stack : err);
+        });
+      } catch (err) {
+        console.warn('collab local watcher callback error:', err && err.stack ? err.stack : err);
+      }
+    });
+
+    collabLocalWatchers.set(webContentsId, watcher);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false };
+  }
+});
+
+ipcMain.handle('collab:local:stopWatcher', async (event) => {
+  const webContentsId = event && event.sender && event.sender.id ? event.sender.id : null;
+  if (!webContentsId) return { ok: false };
+  const watcher = collabLocalWatchers.get(webContentsId);
+  if (watcher) {
+    try { watcher.close(); } catch {}
+    collabLocalWatchers.delete(webContentsId);
+  }
+  return { ok: true };
 });
 
 ipcMain.handle('collab:shared:stopWatcher', async (event) => {
