@@ -1,8 +1,8 @@
 const path = require('path');
 const fs = require('fs/promises');
-const { randomUUID } = require('crypto');
-const { WebSocketServer } = require('ws');
+const { randomUUID, createHash } = require('crypto');
 const ignore = require('ignore');
+const { RelayHostLink } = require('./relayHostLink');
 const {
   normalizeOperation,
   transformOperationAgainstApplied,
@@ -79,22 +79,24 @@ class CollaborationHostServer {
     this.emitToHostRenderer = options.emitToHostRenderer;
     this.onServerStopped = options.onServerStopped;
 
-    this.wss = null;
+    this.relayLink = null;
+    this.relayUrl = null;
     this.sessionId = null;
     this.sessionCode = null;
-    this.port = null;
     this.hostSenderId = null;
     this.sessionHostClientId = null;
     this.projectPath = null;
+    this.projectFingerprint = null;
     this.gitignoreMatcher = null;
 
     this.clients = new Map();
+    this.peerSockets = new Map(); // connId -> proxy socket
     this.fileStates = new Map();
     this.editActivityTimers = new Map();
   }
 
   isRunning() {
-    return Boolean(this.wss);
+    return Boolean(this.relayLink);
   }
 
   getInfo() {
@@ -120,26 +122,19 @@ class CollaborationHostServer {
       running: true,
       sessionId: this.sessionId,
       code: this.sessionCode,
-      port: this.port,
+      relayUrl: this.relayUrl,
       projectName: path.basename(this.projectPath || ''),
       clients
     };
   }
 
   stop() {
-    if (!this.wss) {
+    if (!this.relayLink) {
       return;
     }
 
-    for (const socket of this.clients.keys()) {
-      try {
-        socket.close();
-      } catch {
-        // Ignore close errors during shutdown.
-      }
-    }
-
     this.clients.clear();
+    this.peerSockets.clear();
     this.fileStates.clear();
 
     for (const timer of this.editActivityTimers.values()) {
@@ -148,18 +143,19 @@ class CollaborationHostServer {
     this.editActivityTimers.clear();
 
     try {
-      this.wss.close();
+      this.relayLink.disconnect();
     } catch {
       // Ignore close errors.
     }
 
-    this.wss = null;
+    this.relayLink = null;
+    this.relayUrl = null;
     this.sessionId = null;
     this.sessionCode = null;
-    this.port = null;
     this.hostSenderId = null;
     this.sessionHostClientId = null;
     this.projectPath = null;
+    this.projectFingerprint = null;
     this.gitignoreMatcher = null;
 
     if (typeof this.onServerStopped === 'function') {
@@ -167,7 +163,7 @@ class CollaborationHostServer {
     }
   }
 
-  async start(senderId, requestedPort) {
+  async start(senderId, options = {}) {
     if (this.isRunning()) {
       return this.getInfo();
     }
@@ -177,44 +173,67 @@ class CollaborationHostServer {
       throw new Error('Open a project before starting collaboration.');
     }
 
+    const relayUrl = String((options && options.relayUrl) || '').trim();
+    if (!relayUrl) {
+      throw new Error('Relay server URL is not configured.');
+    }
+
     this.projectPath = projectPath;
     this.gitignoreMatcher = await this.createGitignoreMatcher(projectPath);
     this.hostSenderId = senderId;
-    this.sessionId = randomUUID ? randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    this.sessionCode = randomCode(6);
+    this.projectFingerprint = createHash('sha256')
+      .update(path.resolve(projectPath).replace(/\\/g, '/').toLowerCase())
+      .digest('hex')
+      .slice(0, 32);
 
-    this.wss = new WebSocketServer({
-      host: '0.0.0.0',
-      port: Number.isFinite(Number(requestedPort)) ? Number(requestedPort) : 0
+    const requestedCode = options && options.code ? String(options.code).trim().toUpperCase() : randomCode(6);
+    const link = new RelayHostLink(relayUrl);
+
+    let registration;
+    try {
+      registration = await link.connect(requestedCode);
+    } catch (error) {
+      throw new Error(error && error.message ? error.message : 'Could not reach the relay server.');
+    }
+
+    this.relayLink = link;
+    this.relayUrl = relayUrl;
+    this.sessionId = registration.sessionId || (randomUUID ? randomUUID() : `${Date.now()}`);
+    this.sessionCode = registration.code;
+
+    link.on('peer-message', (connId, raw) => {
+      void this.handleRelayPeerMessage(connId, raw);
     });
 
-    this.wss.on('connection', (socket) => {
-      this.handleSocketConnection(socket);
+    link.on('peer-left', (connId) => {
+      this.handleRelayPeerLeft(connId);
     });
 
-    await new Promise((resolve, reject) => {
-      this.wss.once('listening', resolve);
-      this.wss.once('error', reject);
+    link.on('closed', () => {
+      if (this.relayLink === link) {
+        this.stop();
+      }
     });
-
-    const address = this.wss.address();
-    this.port = address && typeof address === 'object' ? address.port : null;
 
     return this.getInfo();
   }
 
-  async handleSocketConnection(socket) {
-    socket.on('message', async (raw) => {
-      await this.handleSocketMessage(socket, raw);
-    });
+  async handleRelayPeerMessage(connId, raw) {
+    let socket = this.peerSockets.get(connId);
+    if (!socket) {
+      socket = this.relayLink.createPeerSocket(connId);
+      this.peerSockets.set(connId, socket);
+    }
 
-    socket.on('close', () => {
-      this.removeClient(socket);
-    });
+    await this.handleSocketMessage(socket, raw);
+  }
 
-    socket.on('error', () => {
+  handleRelayPeerLeft(connId) {
+    const socket = this.peerSockets.get(connId);
+    this.peerSockets.delete(connId);
+    if (socket) {
       this.removeClient(socket);
-    });
+    }
   }
 
   send(socket, type, payload = {}) {
@@ -436,6 +455,11 @@ class CollaborationHostServer {
       return;
     }
 
+    if (packet.type === 'file:sync') {
+      await this.handleFileSync(socket, packet, client);
+      return;
+    }
+
     if (packet.type === 'file:ops') {
       await this.handleFileOps(socket, packet, client);
       return;
@@ -566,6 +590,14 @@ class CollaborationHostServer {
     }
 
     const snapshot = await this.buildSnapshotPayload();
+
+    let gitignorePatterns = '';
+    try {
+      gitignorePatterns = await fs.readFile(
+        path.join(this.projectPath, '.gitignore'), 'utf8'
+      );
+    } catch { /* .gitignore is optional */ }
+
     this.send(socket, 'join:ok', {
       requestId: packet.requestId || null,
       clientId,
@@ -573,6 +605,8 @@ class CollaborationHostServer {
       isSessionHost: clientId === this.sessionHostClientId,
       sessionId: this.sessionId,
       code: this.sessionCode,
+      projectFingerprint: this.projectFingerprint,
+      gitignorePatterns,
       snapshot,
       presence: this.getPresenceList()
     });
@@ -616,6 +650,73 @@ class CollaborationHostServer {
       content: fileState.content,
       version: fileState.history.length
     });
+  }
+
+  async handleFileSync(socket, packet, client) {
+    const targetPath = String(packet.filePath || '').replace(/^[\\/]+/, '');
+    if (!targetPath) {
+      this.send(socket, 'file:sync:error', {
+        requestId: packet.requestId || null,
+        message: 'Missing file path.'
+      });
+      return;
+    }
+
+    if (!this.isSharedPath(targetPath, false)) {
+      this.send(socket, 'file:sync:error', {
+        requestId: packet.requestId || null,
+        message: 'That path is not shared in this session.'
+      });
+      return;
+    }
+
+    const encoding = String(packet.encoding || 'utf8').toLowerCase();
+    const resolved = this.resolveRelativePath(targetPath);
+    let content = packet.content != null ? packet.content : '';
+
+    if (encoding === 'base64') {
+      await fs.writeFile(resolved.absolutePath, Buffer.from(String(content), 'base64'));
+      this.fileStates.delete(targetPath);
+    } else {
+      content = String(content);
+      await fs.writeFile(resolved.absolutePath, content, 'utf8');
+      this.fileStates.set(targetPath, {
+        filePath: targetPath,
+        content,
+        history: []
+      });
+    }
+
+    const response = {
+      requestId: packet.requestId || null,
+      filePath: targetPath,
+      encoding: encoding === 'base64' ? 'base64' : 'utf8',
+      version: 0
+    };
+
+    if (encoding === 'base64' && isImageFilePath(targetPath)) {
+      response.mimeType = this.getImageMimeType(targetPath);
+    }
+
+    this.broadcast('file:sync', {
+      filePath: targetPath,
+      content: String(packet.content || ''),
+      encoding: response.encoding,
+      version: response.version,
+      mimeType: response.mimeType || null,
+      actorClientId: client.clientId,
+      actorName: client.name
+    });
+
+    try {
+      const snapshot = await this.buildSnapshotPayload();
+      this.broadcast('tree:update', {
+        tree: snapshot.tree,
+        rootName: snapshot.rootName
+      });
+    } catch { /* non-fatal */ }
+
+    this.send(socket, 'file:sync:ok', response);
   }
 
   getImageMimeType(filePath) {
@@ -924,31 +1025,40 @@ class CollaborationHostServer {
       };
     };
 
-    if (!client.isHostClient) {
-      if (type === 'create-file') {
-        await createFile(false);
+    try {
+      if (!client.isHostClient) {
+        if (type === 'create-file') {
+          await createFile(false);
+        } else if (type === 'create-folder') {
+          await createFolder(false);
+        } else if (type === 'delete') {
+          await deleteEntry(false);
+        } else if (type === 'rename') {
+          await renameEntry(false);
+        } else if (type === 'move') {
+          await moveEntry(false);
+        } else {
+          return;
+        }
+      } else if (type === 'create-file') {
+        await createFile(true);
       } else if (type === 'create-folder') {
-        await createFolder(false);
+        await createFolder(true);
       } else if (type === 'delete') {
-        await deleteEntry(false);
+        await deleteEntry(true);
       } else if (type === 'rename') {
-        await renameEntry(false);
+        await renameEntry(true);
       } else if (type === 'move') {
-        await moveEntry(false);
+        await moveEntry(true);
       } else {
         return;
       }
-    } else if (type === 'create-file') {
-      await createFile(true);
-    } else if (type === 'create-folder') {
-      await createFolder(true);
-    } else if (type === 'delete') {
-      await deleteEntry(true);
-    } else if (type === 'rename') {
-      await renameEntry(true);
-    } else if (type === 'move') {
-      await moveEntry(true);
-    } else {
+    } catch (err) {
+      this.send(socket, 'file:operation:error', {
+        requestId: packet.requestId || null,
+        type,
+        message: err && err.message ? err.message : String(err)
+      });
       return;
     }
 
@@ -971,11 +1081,13 @@ class CollaborationHostServer {
       }, socket);
     }
 
-    const snapshot = await this.buildSnapshotPayload();
-    this.broadcast('tree:update', {
-      tree: snapshot.tree,
-      rootName: snapshot.rootName
-    });
+    try {
+      const snapshot = await this.buildSnapshotPayload();
+      this.broadcast('tree:update', {
+        tree: snapshot.tree,
+        rootName: snapshot.rootName
+      });
+    } catch { /* non-fatal — tree update failure should not block the ok response */ }
 
     this.broadcast('activity:add', {
       level: 'file-op',

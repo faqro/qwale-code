@@ -218,8 +218,20 @@ let aiBusy = false;
 let aiAbortController = null;
 let aiConversation = [];
 let aiConversationCursor = -1;
+const LOCAL_FILE_PREFIX = '__local__/';
+let collabProjectFingerprint = null;
+let collabLocalFiles = new Map();   // '__local__/<name>' → { name, content, dirty }
+let collabLocalFolders = new Map(); // '__local__/<folderName>' → { name, expanded }
+let collabLocalGitignorePatterns = '';
+let collabLocalGitignoreMatcher = null;
+let collabSharedWorkspaceRoot = '';
+let collabSharedWorkspaceReady = Promise.resolve();
+let collabSharedWorkspaceSyncToken = 0;
+const collabSharedWriteTimers = new Map();
+let collabLocalOnlyPaths = new Set(); // Paths that are local-only (won't sync to host)
 let collabSocket = null;
 let collabConnected = false;
+let collabLocalRefreshTimer = null;
 let collabClientId = null;
 let collabIsSessionHost = false;
 let collabParticipantName = `User-${Math.floor(Math.random() * 900 + 100)}`;
@@ -662,6 +674,56 @@ async function loadAiConversationFromDisk() {
     return;
   }
 
+  // In remote collaboration mode, read from shared project via collaboration API
+  if (collabConnected && collabMode === 'remote') {
+    const chatConfigPath = getAiChatConfigPath();
+    if (!chatConfigPath) {
+      clearAiConversationHistory();
+      return;
+    }
+
+    // Prefer collab-local storage for .qwcode files when available
+    if (collabProjectFingerprint) {
+      try {
+        const raw = await api.readCollabLocalFile({ fingerprint: collabProjectFingerprint, name: '.qwcode/chat.json' });
+        const content = typeof raw === 'string' ? raw : '';
+        if (!content) {2
+          clearAiConversationHistory();
+          return;
+        }
+        const parsed = JSON.parse(content);
+        const source = Array.isArray(parsed) ? parsed : (parsed && parsed.conversation);
+        aiConversation = normalizeAiConversationEntries(source);
+        aiConversationCursor = aiConversation.length ? aiConversation.length - 1 : -1;
+        renderAiConversationFromState();
+        syncAiChatControls();
+      } catch {
+        clearAiConversationHistory();
+      }
+      return;
+    }
+
+    // Fallback: try remote file:get if fingerprint not available
+    try {
+      const collabPath = projectPathToCollabPath(chatConfigPath);
+      const response = await sendCollabRequest('file:get', { filePath: collabPath });
+      const raw = typeof response === 'string' ? response : (response && typeof response.content !== 'undefined' ? String(response.content) : '');
+      if (!raw) {
+        clearAiConversationHistory();
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      const source = Array.isArray(parsed) ? parsed : (parsed && parsed.conversation);
+      aiConversation = normalizeAiConversationEntries(source);
+      aiConversationCursor = aiConversation.length ? aiConversation.length - 1 : -1;
+      renderAiConversationFromState();
+      syncAiChatControls();
+    } catch {
+      clearAiConversationHistory();
+    }
+    return;
+  }
+
   const chatConfigPath = getAiChatConfigPath();
   if (!chatConfigPath) {
     clearAiConversationHistory();
@@ -692,6 +754,51 @@ async function saveAiConversationToDisk() {
     return;
   }
 
+  if (collabConnected && collabMode === 'remote') {
+    // Save to shared project via collaboration APIs as local un-synced file
+    const qwcodeFolderPath = getQwcodeStorageFolderPath();
+    const chatConfigPath = getAiChatConfigPath();
+    if (!qwcodeFolderPath || !chatConfigPath) {
+      return;
+    }
+    // Prefer collab-local storage APIs for .qwcode (client-local)
+    if (collabProjectFingerprint) {
+      try {
+        await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+      } catch {
+        // folder may already exist
+      }
+
+      try {
+        await api.writeCollabLocalFile({
+          fingerprint: collabProjectFingerprint,
+          name: '.qwcode/chat.json',
+          content: JSON.stringify({ version: 1, conversation: aiConversation }, null, 2)
+        });
+        // refresh local-collab listing so explorer shows the new file
+        try { await loadCollabLocalFiles(collabProjectFingerprint); } catch {}
+      } catch {
+        // Non-fatal: best effort to persist
+      }
+    } else {
+      // Fallback to remote write if fingerprint not ready
+      try {
+        await sendCollabFileOperation({ type: 'create-folder', parentPath: '/', name: '.qwcode' });
+      } catch {}
+      try {
+        const collabPath = projectPathToCollabPath(chatConfigPath);
+        await sendCollabRequest('file:sync', {
+          filePath: collabPath,
+          content: JSON.stringify({ version: 1, conversation: aiConversation }, null, 2),
+          encoding: 'utf8'
+        });
+      } catch {
+        // Non-fatal
+      }
+    }
+    return;
+  }
+
   const qwcodeFolderPath = getQwcodeStorageFolderPath();
   const chatConfigPath = getAiChatConfigPath();
   if (!qwcodeFolderPath || !chatConfigPath) {
@@ -700,8 +807,19 @@ async function saveAiConversationToDisk() {
 
   let createdFolder = false;
   try {
-    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
-    createdFolder = true;
+    if (collabConnected && collabMode === 'remote' && collabProjectFingerprint) {
+      try {
+        await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+        createdFolder = true;
+      } catch (error) {
+        if (!isAlreadyExistsError(error)) {
+          throw error;
+        }
+      }
+    } else {
+      await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+      createdFolder = true;
+    }
   } catch (error) {
     if (!isAlreadyExistsError(error)) {
       throw error;
@@ -929,12 +1047,29 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'get_project_tree') {
     addAiActivity('Refreshing project tree...');
+    if (collabConnected && collabMode === 'remote') {
+      await refreshProjectTree();
+      return JSON.stringify({
+        rootPath: project.rootPath,
+        rootName: project.rootName,
+        tree: Array.isArray(project.tree) ? project.tree : []
+      });
+    }
+
     const refreshed = await api.refreshProject();
     return JSON.stringify(refreshed);
   }
 
   if (name === 'read_file') {
     addAiActivity(`Reading file: ${String(args.filePath || '')}`);
+    // If in remote collaboration (non-host), read from shared project via collab request
+    if (collabConnected && collabMode === 'remote') {
+      const collabPath = projectPathToCollabPath(args.filePath || '');
+      const response = await sendCollabRequest('file:get', { filePath: collabPath });
+      if (typeof response === 'string') return response;
+      return typeof response === 'object' && typeof response.content !== 'undefined' ? String(response.content) : '';
+    }
+
     const abs = toAbsoluteProjectPath(args.filePath);
     const payload = await api.readFile(abs);
     return typeof payload === 'string' ? payload : payload.content;
@@ -942,6 +1077,14 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'write_file') {
     addAiActivity(`Edited file: ${String(args.filePath || '')}`);
+    if (collabConnected && collabMode === 'remote') {
+      const collabPath = projectPathToCollabPath(args.filePath || '');
+      // Best-effort: use file:sync to update remote host's authoritative file
+      await sendCollabRequest('file:sync', { filePath: collabPath, content: String(args.content || ''), encoding: 'utf8' });
+      await refreshProjectTree();
+      return 'ok';
+    }
+
     const abs = toAbsoluteProjectPath(args.filePath);
     await api.writeFile({ filePath: abs, content: String(args.content || '') });
     await refreshProjectTree();
@@ -950,6 +1093,13 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'create_file') {
     addAiActivity(`Created file: ${String(args.parentPath || '')}/${String(args.name || '')}`);
+    if (collabConnected && collabMode === 'remote') {
+      const parent = projectPathToCollabPath(args.parentPath || '');
+      await sendCollabFileOperation({ type: 'create-file', parentPath: parent, name: String(args.name || '') });
+      await refreshProjectTree();
+      return 'ok';
+    }
+
     const parent = toAbsoluteProjectPath(args.parentPath);
     await api.createFile({ parentPath: parent, name: String(args.name || '') });
     await refreshProjectTree();
@@ -958,6 +1108,13 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'create_folder') {
     addAiActivity(`Created folder: ${String(args.parentPath || '')}/${String(args.name || '')}`);
+    if (collabConnected && collabMode === 'remote') {
+      const parent = projectPathToCollabPath(args.parentPath || '');
+      await sendCollabFileOperation({ type: 'create-folder', parentPath: parent, name: String(args.name || '') });
+      await refreshProjectTree();
+      return 'ok';
+    }
+
     const parent = toAbsoluteProjectPath(args.parentPath);
     await api.createFolder({ parentPath: parent, name: String(args.name || '') });
     await refreshProjectTree();
@@ -966,6 +1123,13 @@ async function runAiTool(name, args, signal) {
 
   if (name === 'delete_path') {
     addAiActivity(`Deleted path: ${String(args.targetPath || '')}`);
+    if (collabConnected && collabMode === 'remote') {
+      const target = projectPathToCollabPath(args.targetPath || '');
+      await sendCollabFileOperation({ type: 'delete', targetPath: target });
+      await refreshProjectTree();
+      return 'ok';
+    }
+
     const target = toAbsoluteProjectPath(args.targetPath);
     await api.deletePath({ targetPath: target });
     await refreshProjectTree();
@@ -975,6 +1139,11 @@ async function runAiTool(name, args, signal) {
   if (name === 'run_command') {
     const command = String(args.command || '');
     addAiActivity(`Running command: ${command}`);
+    // Running shell commands from a non-host remote client is not allowed
+    if (collabConnected && collabMode === 'remote' && !collabIsSessionHost) {
+      throw new Error('Running commands is not allowed while connected as a non-host remote client.');
+    }
+
     const result = await api.runAiCommand({ command });
     const exitCode = result && typeof result.exitCode !== 'undefined' ? result.exitCode : 'unknown';
     addAiActivity(`Command finished (exit ${exitCode}): ${command}`);
@@ -1348,9 +1517,25 @@ function bindTerminalBridgeEvents() {
 }
 
 async function createTerminalSession(shellType = 'powershell') {
+  let terminalCwd = project.rootPath;
+  const collabRemoteMode = collabConnected && collabMode === 'remote' && Boolean(collabProjectFingerprint);
+  if (collabRemoteMode) {
+    try {
+      await collabSharedWorkspaceReady;
+    } catch {
+      // Terminal creation will still proceed with fallback cwd.
+    }
+
+    if (collabSharedWorkspaceRoot) {
+      terminalCwd = collabSharedWorkspaceRoot;
+    }
+  }
+
   const created = await api.createTerminal({
-    cwd: project.rootPath,
-    shellType
+    cwd: terminalCwd,
+    shellType,
+    collabFingerprint: collabRemoteMode ? collabProjectFingerprint : null,
+    collabRemoteMode
   });
 
   const session = {
@@ -2013,10 +2198,10 @@ async function moveExplorerEntries(entries, destinationPath) {
 
     let movedPath = null;
     if (collabConnected && collabMode === 'remote') {
-      const response = await sendCollabRequest('file:operation', { operation });
+      const response = await sendCollabFileOperation(operation);
       movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
     } else if (collabConnected) {
-      const response = await sendCollabRequest('file:operation', { operation });
+      const response = await sendCollabFileOperation(operation);
       movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
     } else {
       const result = await api.movePath({ sourcePath: entry.path, destinationDir: destinationPath });
@@ -2064,19 +2249,26 @@ async function deleteExplorerEntries(entries) {
   }
 
   for (const entry of compacted) {
-    if (collabConnected && collabMode === 'remote') {
-      await sendCollabRequest('file:operation', {
-        operation: {
-          type: 'delete',
-          targetPath: projectPathToCollabPath(entry.path)
+    if (entry.path.startsWith(LOCAL_FILE_PREFIX)) {
+      const name = entry.path.slice(LOCAL_FILE_PREFIX.length);
+      await api.deleteCollabLocalFile({ fingerprint: collabProjectFingerprint, name });
+      if (collabLocalFolders.has(entry.path)) {
+        collabLocalFolders.delete(entry.path);
+        for (const key of [...collabLocalFiles.keys()]) {
+          if (key.startsWith(entry.path + '/')) collabLocalFiles.delete(key);
         }
+      } else {
+        collabLocalFiles.delete(entry.path);
+      }
+    } else if (collabConnected && collabMode === 'remote') {
+      await sendCollabFileOperation({
+        type: 'delete',
+        targetPath: projectPathToCollabPath(entry.path)
       });
     } else if (collabConnected) {
-      await sendCollabRequest('file:operation', {
-        operation: {
-          type: 'delete',
-          targetPath: projectPathToCollabPath(entry.path)
-        }
+      await sendCollabFileOperation({
+        type: 'delete',
+        targetPath: projectPathToCollabPath(entry.path)
       });
     } else {
       await api.deletePath({ targetPath: entry.path });
@@ -2993,6 +3185,37 @@ async function saveLaunchConfigToDisk() {
     throw new Error('Open a project folder first.');
   }
 
+  if (collabConnected && collabMode === 'remote') {
+    await collabSharedWorkspaceReady;
+    // Save to shared project via collaboration APIs as local un-synced file
+    try {
+      // Ensure .qwcode folder exists in shared project (prefer collab-local)
+      if (!collabProjectFingerprint) {
+        throw new Error('Collaboration workspace is not ready yet.');
+      }
+      try {
+        await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+      } catch {}
+    } catch {
+      // Folder may already exist; continue
+    }
+
+    try {
+      // Write launch.json to shared project; will be treated as local un-synced
+      await api.writeCollabLocalFile({
+        fingerprint: collabProjectFingerprint,
+        name: '.qwcode/launch.json',
+        content: JSON.stringify(launchConfigState, null, 2)
+      });
+      try { await loadCollabLocalFiles(collabProjectFingerprint); } catch {}
+    } catch (error) {
+      throw new Error(`Could not save launch configuration: ${error.message}`);
+    }
+    launchConfigExists = true;
+    launchConfigLoadError = '';
+    return;
+  }
+
   await api.writeFile({
     filePath: launchConfigPath,
     content: JSON.stringify(launchConfigState, null, 2)
@@ -3056,8 +3279,17 @@ async function createLaunchConfigFromPanel() {
 
   let createdFolder = false;
   try {
-    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
-    createdFolder = true;
+    if (collabConnected && collabMode === 'remote') {
+      await collabSharedWorkspaceReady;
+      if (!collabProjectFingerprint) {
+        throw new Error('Collaboration workspace is not ready yet.');
+      }
+      await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+      createdFolder = true;
+    } else {
+      await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+      createdFolder = true;
+    }
   } catch (error) {
     if (!isAlreadyExistsError(error)) {
       throw error;
@@ -3067,7 +3299,7 @@ async function createLaunchConfigFromPanel() {
   launchConfigState = createDefaultLaunchConfig();
   await saveLaunchConfigToDisk();
 
-  if (createdFolder) {
+  if (createdFolder && !(collabConnected && collabMode === 'remote')) {
     await maybePromptAddQwcodeToGitignore();
   }
 
@@ -3096,6 +3328,65 @@ async function loadLaunchConfigFromDisk() {
   }
 
   try {
+    // Remote non-host: prefer collab-local storage for .qwcode/launch.json
+    if (collabConnected && collabMode === 'remote') {
+      if (collabProjectFingerprint) {
+        try {
+          const raw = await api.readCollabLocalFile({ fingerprint: collabProjectFingerprint, name: '.qwcode/launch.json' });
+          if (!raw) {
+            launchConfigExists = false;
+            launchConfigState = createDefaultLaunchConfig();
+            closeLaunchEditor();
+            renderRunDebugPanel();
+            return;
+          }
+          const parsed = JSON.parse(typeof raw === 'string' ? raw : '');
+          launchConfigState = normalizeLaunchConfig(parsed);
+          launchConfigExists = true;
+        } catch (error) {
+          const message = String(error && error.message ? error.message : error || '');
+          if (!/ENOENT|no such file|cannot find|not exist/i.test(message)) {
+            launchConfigLoadError = message;
+          }
+          launchConfigExists = false;
+          launchConfigState = createDefaultLaunchConfig();
+          closeLaunchEditor();
+        }
+        // Ensure UI updated
+        renderRunDebugPanel();
+        return;
+      }
+
+      // fingerprint not available: try remote file:get fallback
+      try {
+        const collabPath = projectPathToCollabPath(launchConfigPath);
+        const response = await sendCollabRequest('file:get', { filePath: collabPath });
+        const raw = typeof response === 'string' ? response : (response && typeof response.content !== 'undefined' ? String(response.content) : '');
+        if (!raw) {
+          launchConfigExists = false;
+          launchConfigState = createDefaultLaunchConfig();
+          closeLaunchEditor();
+          renderRunDebugPanel();
+          return;
+        }
+        const parsed = JSON.parse(raw);
+        launchConfigState = normalizeLaunchConfig(parsed);
+        launchConfigExists = true;
+        renderRunDebugPanel();
+        return;
+      } catch (error) {
+        const message = String(error && error.message ? error.message : error || '');
+        if (!/ENOENT|no such file|cannot find|not exist/i.test(message)) {
+          launchConfigLoadError = message;
+        }
+        launchConfigExists = false;
+        launchConfigState = createDefaultLaunchConfig();
+        closeLaunchEditor();
+        renderRunDebugPanel();
+        return;
+      }
+    }
+
     const payload = await api.readFile({ filePath: launchConfigPath, allowMissing: true });
     if (!payload) {
       launchConfigExists = false;
@@ -3179,6 +3470,26 @@ async function ensureLaunchConfigReadyForAiTools() {
     throw new Error('Could not resolve launch configuration path.');
   }
 
+  const launchFolderPath = getLaunchStorageFolderPath();
+  if (!launchFolderPath) {
+    throw new Error('Could not resolve launch folder path.');
+  }
+
+  // Remote non-host: ensure collab workspace and .qwcode folder are ready before any local file access
+  if (collabConnected && collabMode === 'remote') {
+    await collabSharedWorkspaceReady;
+    try {
+      if (!collabProjectFingerprint) {
+        throw new Error('Collaboration workspace is not ready yet.');
+      }
+      await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name: '.qwcode' });
+    } catch {
+      // Folder may already exist
+    }
+  } else {
+    await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
+  }
+
   const payload = await api.readFile({ filePath: launchConfigPath, allowMissing: true });
   if (payload) {
     try {
@@ -3191,13 +3502,6 @@ async function ensureLaunchConfigReadyForAiTools() {
       throw new Error('launch.json exists but is invalid JSON. Fix it before AI modifies launch options.');
     }
   }
-
-  const launchFolderPath = getLaunchStorageFolderPath();
-  if (!launchFolderPath) {
-    throw new Error('Could not resolve launch folder path.');
-  }
-
-  await api.createFolder({ parentPath: project.rootPath, name: '.qwcode' });
   launchConfigState = createDefaultLaunchConfig();
   await saveLaunchConfigToDisk();
 }
@@ -3508,15 +3812,23 @@ function quoteForCmdExecutable(value) {
 
 function resolveLaunchActionCwd(cwdValue) {
   const raw = String(cwdValue || '').trim();
+
+  // Determine base root path based on mode
+  let baseRoot = project.rootPath || '';
+  const collabRemoteMode = collabConnected && collabMode === 'remote' && Boolean(collabProjectFingerprint);
+  if (collabRemoteMode && collabSharedWorkspaceRoot) {
+    baseRoot = collabSharedWorkspaceRoot;
+  }
+
   if (!raw) {
-    return project.rootPath || '';
+    return baseRoot;
   }
 
   if (isAbsolutePathInput(raw)) {
     return raw;
   }
 
-  return joinPathSegments(project.rootPath || '', raw);
+  return joinPathSegments(baseRoot, raw);
 }
 
 function wrapPowerShellCommandWithLaunchCwd(command, cwdValue) {
@@ -4832,6 +5144,18 @@ function showExplorerContextMenu(event, contextNode) {
       }, { disabled: !canPaste, shortcut: explorerShortcutLabel.paste });
     }
   } else {
+    if (collabConnected && collabMode === 'remote' && !collabIsSessionHost) {
+      addExplorerMenuItem(explorerMenu, 'New Local File', async () => {
+        promptNewLocalFile();
+      }, { shortcut: explorerShortcutLabel.newFile });
+
+      addExplorerMenuItem(explorerMenu, 'New Local Folder', async () => {
+        promptNewLocalFolder();
+      });
+
+      addExplorerMenuDivider(explorerMenu);
+    }
+
     addExplorerMenuItem(explorerMenu, 'New File', async () => {
       startInlineCreate('file', project.rootPath);
     }, { disabled: !project.rootPath, shortcut: explorerShortcutLabel.newFile });
@@ -4900,15 +5224,50 @@ async function commitInlineEdit(name) {
     return;
   }
 
-  if (state.mode === 'rename') {
+  if (state.mode === 'rename' && state.targetPath && state.targetPath.startsWith(LOCAL_FILE_PREFIX)) {
+    const oldName = state.targetPath.slice(LOCAL_FILE_PREFIX.length);
+    const oldBasename = oldName.split('/').pop();
+    if (trimmed !== oldBasename) {
+      if (collabLocalFolders.has(state.targetPath)) {
+        // Renaming a local folder
+        await api.renameCollabLocalFile({ fingerprint: collabProjectFingerprint, oldName, newName: trimmed });
+        const newKey = LOCAL_FILE_PREFIX + trimmed;
+        const folderEntry = collabLocalFolders.get(state.targetPath);
+        collabLocalFolders.delete(state.targetPath);
+        collabLocalFolders.set(newKey, { ...(folderEntry || {}), name: trimmed });
+        // Remap all child file keys
+        const oldPrefix = state.targetPath + '/';
+        const newPrefix = newKey + '/';
+        for (const [fileKey, fileEntry] of [...collabLocalFiles.entries()]) {
+          if (fileKey.startsWith(oldPrefix)) {
+            const newFileKey = newPrefix + fileKey.slice(oldPrefix.length);
+            const newFileName = trimmed + '/' + fileEntry.name.split('/').pop();
+            collabLocalFiles.delete(fileKey);
+            collabLocalFiles.set(newFileKey, { ...fileEntry, name: newFileName });
+            remapOpenFilesForPathChange(fileKey, newFileKey, false);
+          }
+        }
+      } else {
+        // Renaming a file (potentially inside a folder)
+        const parentFolder = oldName.includes('/') ? oldName.split('/')[0] + '/' : '';
+        const newName = parentFolder + trimmed;
+        await api.renameCollabLocalFile({ fingerprint: collabProjectFingerprint, oldName, newName });
+        const newKey = LOCAL_FILE_PREFIX + newName;
+        const entry = collabLocalFiles.get(state.targetPath);
+        collabLocalFiles.delete(state.targetPath);
+        collabLocalFiles.set(newKey, { ...(entry || {}), name: newName });
+        remapOpenFilesForPathChange(state.targetPath, newKey, false);
+      }
+    }
+    renderTree();
+    return;
+  } else if (state.mode === 'rename') {
     let renamedPath = null;
     if (collabConnected && collabMode === 'remote') {
-      const response = await sendCollabRequest('file:operation', {
-        operation: {
-          type: 'rename',
-          targetPath: projectPathToCollabPath(state.targetPath),
-          newName: trimmed
-        }
+      const response = await sendCollabFileOperation({
+        type: 'rename',
+        targetPath: projectPathToCollabPath(state.targetPath),
+        newName: trimmed
       });
 
       renamedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
@@ -4917,12 +5276,10 @@ async function commitInlineEdit(name) {
         renamedPath = `${parent}/${trimmed}`.replace(/\\/g, '/');
       }
     } else if (collabConnected) {
-      const response = await sendCollabRequest('file:operation', {
-        operation: {
-          type: 'rename',
-          targetPath: projectPathToCollabPath(state.targetPath),
-          newName: trimmed
-        }
+      const response = await sendCollabFileOperation({
+        type: 'rename',
+        targetPath: projectPathToCollabPath(state.targetPath),
+        newName: trimmed
       });
 
       renamedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
@@ -4941,44 +5298,68 @@ async function commitInlineEdit(name) {
     }
   } else if (state.mode === 'create') {
     if (state.targetType === 'folder') {
-      if (collabConnected && collabMode === 'remote') {
-        await sendCollabRequest('file:operation', {
-          operation: {
+      if (state.parentPath === LOCAL_FILE_PREFIX) {
+        await createLocalCollabFolder(trimmed);
+        return;
+      }
+      if (collabConnected && collabMode === 'remote' && isClientIgnoredPath(trimmed)) {
+        await createLocalCollabFolder(trimmed);
+        return;
+      }
+      try {
+        if (collabConnected && collabMode === 'remote') {
+          await sendCollabFileOperation({
             type: 'create-folder',
             parentPath: projectPathToCollabPath(state.parentPath),
             name: trimmed
-          }
-        });
-      } else if (collabConnected) {
-        await sendCollabRequest('file:operation', {
-          operation: {
+          });
+        } else if (collabConnected) {
+          await sendCollabFileOperation({
             type: 'create-folder',
             parentPath: projectPathToCollabPath(state.parentPath),
             name: trimmed
-          }
-        });
-      } else {
-        await api.createFolder({ parentPath: state.parentPath, name: trimmed });
+          });
+        } else {
+          await api.createFolder({ parentPath: state.parentPath, name: trimmed });
+        }
+      } catch (err) {
+        alert(`Could not create folder: ${err && err.message ? err.message : String(err)}`);
+        renderTree();
+        return;
       }
     } else {
-      if (collabConnected && collabMode === 'remote') {
-        await sendCollabRequest('file:operation', {
-          operation: {
-            type: 'create-file',
-            parentPath: projectPathToCollabPath(state.parentPath),
-            name: trimmed
-          }
-        });
-      } else if (collabConnected) {
-        await sendCollabRequest('file:operation', {
-          operation: {
-            type: 'create-file',
-            parentPath: projectPathToCollabPath(state.parentPath),
-            name: trimmed
-          }
-        });
+      if (state.parentPath === LOCAL_FILE_PREFIX) {
+        await createLocalCollabFile(trimmed);
+        return;
+      } else if (state.parentPath.startsWith(LOCAL_FILE_PREFIX) && state.parentPath.endsWith('/')) {
+        const folderName = state.parentPath.slice(LOCAL_FILE_PREFIX.length, -1);
+        await createLocalCollabFile(folderName + '/' + trimmed);
+        return;
+      } else if (collabConnected && collabMode === 'remote' && isClientIgnoredPath(trimmed)) {
+        await createLocalCollabFile(trimmed);
+        return;
       } else {
-        await api.createFile({ parentPath: state.parentPath, name: trimmed });
+        try {
+          if (collabConnected && collabMode === 'remote') {
+            await sendCollabFileOperation({
+              type: 'create-file',
+              parentPath: projectPathToCollabPath(state.parentPath),
+              name: trimmed
+            });
+          } else if (collabConnected) {
+            await sendCollabFileOperation({
+              type: 'create-file',
+              parentPath: projectPathToCollabPath(state.parentPath),
+              name: trimmed
+            });
+          } else {
+            await api.createFile({ parentPath: state.parentPath, name: trimmed });
+          }
+        } catch (err) {
+          alert(`Could not create file: ${err && err.message ? err.message : String(err)}`);
+          renderTree();
+          return;
+        }
       }
     }
   }
@@ -5021,10 +5402,10 @@ async function pasteIntoPath(destinationPath) {
 
       let movedPath = null;
       if (collabConnected && collabMode === 'remote') {
-        const response = await sendCollabRequest('file:operation', { operation });
+        const response = await sendCollabFileOperation(operation);
         movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
       } else if (collabConnected) {
-        const response = await sendCollabRequest('file:operation', { operation });
+        const response = await sendCollabFileOperation(operation);
         movedPath = response && response.path ? collabFilePathToProjectPath(response.path) : null;
       } else {
         const result = await api.movePath({ sourcePath: item.sourcePath, destinationDir: destinationPath });
@@ -5112,8 +5493,16 @@ function hasDirtyFiles() {
   return false;
 }
 
+function hasLocalFileSaveTarget() {
+  // True when a local collab file is the active file and open for editing
+  const active = currentFilePath || (splitEnabled && activePaneId === 'right' ? rightFilePath : null);
+  if (!active || !active.startsWith(LOCAL_FILE_PREFIX)) return false;
+  const state = openFiles.get(active);
+  return !!(state && state.kind === 'text');
+}
+
 function canRunSaveActions() {
-  return openFiles.size > 0 && hasDirtyFiles();
+  return (openFiles.size > 0 && hasDirtyFiles()) || hasLocalFileSaveTarget();
 }
 
 function inferEncodingFromText(content) {
@@ -6639,6 +7028,13 @@ function disposeOpenFileState(state) {
 }
 
 function isDirty(filePath) {
+  if (String(filePath || '').startsWith(LOCAL_FILE_PREFIX)) {
+    const state = openFiles.get(filePath);
+    if (!state || state.kind !== 'text') return false;
+    const entry = collabLocalFiles.get(filePath);
+    return state.model.getValue() !== (entry && entry.content !== null ? entry.content : state.savedContent);
+  }
+
   if (isCollabAutosaveMode()) {
     return false;
   }
@@ -6710,7 +7106,9 @@ function buildTab(filePath, isActive, pane, options = {}) {
 
   const fileIcon = createFileTypeIconElement(filePath, 'tab-file-icon');
   const label = document.createElement('span');
-  label.textContent = getFileName(filePath);
+  label.textContent = String(filePath || '').startsWith(LOCAL_FILE_PREFIX)
+    ? filePath.slice(LOCAL_FILE_PREFIX.length)
+    : getFileName(filePath);
 
   const close = document.createElement('span');
   close.className = 'tab-close';
@@ -7079,10 +7477,17 @@ function initMonacoEditor() {
 
           if (collabConnected && collabMode === 'remote') {
             state.savedContent = state.model.getValue();
+            if (state.kind === 'text' && currentFilePath && !currentFilePath.startsWith(LOCAL_FILE_PREFIX)) {
+              queueCollabSharedTextWrite(currentFilePath, state.savedContent);
+            }
           }
         }
 
-        if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && currentFilePath) {
+        if (currentFilePath && currentFilePath.startsWith(LOCAL_FILE_PREFIX)) {
+          const entry = collabLocalFiles.get(currentFilePath);
+          if (entry) { entry.dirty = true; }
+          renderTabs();
+        } else if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && currentFilePath) {
           const collabPath = projectPathToCollabPath(currentFilePath);
           const baseVersion = Math.max(0, Number(collabFileVersions.get(collabPath)) || 0);
           const ops = Array.isArray(event && event.changes)
@@ -7317,10 +7722,17 @@ function enableSplit() {
 
           if (collabConnected && collabMode === 'remote') {
             state.savedContent = state.model.getValue();
+            if (state.kind === 'text' && rightFilePath && !rightFilePath.startsWith(LOCAL_FILE_PREFIX)) {
+              queueCollabSharedTextWrite(rightFilePath, state.savedContent);
+            }
           }
         }
 
-        if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && rightFilePath) {
+        if (rightFilePath && rightFilePath.startsWith(LOCAL_FILE_PREFIX)) {
+          const entry = collabLocalFiles.get(rightFilePath);
+          if (entry) { entry.dirty = true; }
+          renderTabs();
+        } else if (!collabSuppressBroadcast && collabConnected && state && state.kind === 'text' && rightFilePath) {
           const collabPath = projectPathToCollabPath(rightFilePath);
           const baseVersion = Math.max(0, Number(collabFileVersions.get(collabPath)) || 0);
           const ops = Array.isArray(event && event.changes)
@@ -7555,7 +7967,7 @@ function buildTreeNode(node) {
     });
 
     input.addEventListener('blur', async () => {
-      await commit();
+      if (document.body.contains(input)) await commit();
     });
 
     requestAnimationFrame(() => {
@@ -7686,7 +8098,7 @@ function buildTreeNode(node) {
         });
 
         createInput.addEventListener('blur', async () => {
-          await commitCreate();
+          if (document.body.contains(createInput)) await commitCreate();
         });
 
         createRow.appendChild(createIcon);
@@ -7770,6 +8182,335 @@ function buildTreeNode(node) {
   return item;
 }
 
+function promptNewLocalFile() {
+  inlineEditState = { mode: 'create', targetType: 'file', parentPath: LOCAL_FILE_PREFIX, value: '' };
+  renderTree();
+}
+
+function promptNewLocalFolder() {
+  inlineEditState = { mode: 'create', targetType: 'folder', parentPath: LOCAL_FILE_PREFIX, value: '' };
+  renderTree();
+}
+
+function buildLocalInlineCreateInput(parentPath, placeholder) {
+  const createItem = document.createElement('li');
+  const createRow = document.createElement('div');
+  createRow.className = 'tree-node local-file-node';
+  const createIcon = document.createElement('span');
+  createIcon.className = `file-type-icon ${getFileTypeIconClass('new.txt')}`;
+  const createInput = document.createElement('input');
+  createInput.className = 'tree-inline-input';
+  createInput.type = 'text';
+  createInput.placeholder = placeholder;
+  const commitCreate = async () => { await commitInlineEdit(createInput.value); };
+  createInput.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); await commitCreate(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit(); }
+  });
+  createInput.addEventListener('blur', async () => { if (document.body.contains(createInput)) await commitCreate(); });
+  createRow.appendChild(createIcon);
+  createRow.appendChild(createInput);
+  createItem.appendChild(createRow);
+  requestAnimationFrame(() => createInput.focus());
+  return createItem;
+}
+
+function buildLocalFilesSection() {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'local-files-section';
+
+  const header = document.createElement('div');
+  header.className = 'local-files-header';
+  header.textContent = 'Local Files';
+  header.title = 'Files stored only on your machine — not shared with the host';
+
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'local-files-add-btn';
+  addBtn.title = 'Create new local file';
+  addBtn.textContent = '+';
+  addBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    promptNewLocalFile();
+  });
+  header.appendChild(addBtn);
+  wrapper.appendChild(header);
+
+  const list = document.createElement('ul');
+  list.className = 'local-files-list';
+
+  // Render local folders first
+  for (const [folderKey, folder] of collabLocalFolders) {
+    list.appendChild(buildLocalFolderNode(folderKey, folder));
+  }
+
+  // Render root-level local files (not inside a folder)
+  for (const [virtualPath, entry] of collabLocalFiles) {
+    if (!entry.name.includes('/')) {
+      list.appendChild(buildLocalFileNode(virtualPath, entry));
+    }
+  }
+
+  // Root-level inline create input
+  if (inlineEditState && inlineEditState.mode === 'create' && inlineEditState.parentPath === LOCAL_FILE_PREFIX) {
+    list.appendChild(buildLocalInlineCreateInput(LOCAL_FILE_PREFIX, 'New local file name'));
+  }
+
+  wrapper.appendChild(list);
+  return wrapper;
+}
+
+function buildLocalFolderNode(folderKey, folder) {
+  const item = document.createElement('li');
+
+  const row = document.createElement('div');
+  row.className = 'tree-node local-file-node';
+  row.dataset.path = folderKey;
+
+  if (explorerSelectedPaths.has(folderKey) || selectedNodePath === folderKey) {
+    row.classList.add('selected');
+  }
+
+  const folderIcon = document.createElement('span');
+  folderIcon.className = folder.expanded ? 'node-icon node-icon-folder expanded' : 'node-icon node-icon-folder';
+
+  const label = document.createElement('span');
+  label.className = 'tree-node-label';
+
+  const badge = document.createElement('span');
+  badge.className = 'local-file-badge';
+  badge.textContent = 'local';
+  badge.title = 'Stored only on your machine';
+
+  if (inlineEditState && inlineEditState.mode === 'rename' && inlineEditState.targetPath === folderKey) {
+    const renameInput = document.createElement('input');
+    renameInput.className = 'tree-inline-input';
+    renameInput.type = 'text';
+    renameInput.value = folder.name;
+    const commitRename = async () => { await commitInlineEdit(renameInput.value); };
+    renameInput.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); await commitRename(); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit(); }
+    });
+    renameInput.addEventListener('blur', async () => { if (document.body.contains(renameInput)) await commitRename(); });
+    row.appendChild(folderIcon);
+    row.appendChild(renameInput);
+    requestAnimationFrame(() => { renameInput.focus(); renameInput.select(); });
+  } else {
+    label.textContent = folder.name;
+    row.appendChild(folderIcon);
+    row.appendChild(label);
+    row.appendChild(badge);
+  }
+
+  row.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setExplorerPanelFocus(true);
+    selectedNodePath = folderKey;
+    explorerSelectedPaths.clear();
+    explorerSelectedPaths.add(folderKey);
+    folder.expanded = !folder.expanded;
+    renderTree();
+  });
+
+  row.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    selectedNodePath = folderKey;
+    explorerSelectedPaths.clear();
+    explorerSelectedPaths.add(folderKey);
+    showLocalFolderContextMenu(e, folderKey, folder);
+  });
+
+  item.appendChild(row);
+
+  if (folder.expanded) {
+    const children = document.createElement('ul');
+    const folderPrefix = LOCAL_FILE_PREFIX + folder.name + '/';
+    for (const [virtualPath, entry] of collabLocalFiles) {
+      if (virtualPath.startsWith(folderPrefix)) {
+        children.appendChild(buildLocalFileNode(virtualPath, entry, true));
+      }
+    }
+    const childParentPath = LOCAL_FILE_PREFIX + folder.name + '/';
+    if (inlineEditState && inlineEditState.mode === 'create' && inlineEditState.parentPath === childParentPath) {
+      children.appendChild(buildLocalInlineCreateInput(childParentPath, 'New file name'));
+    }
+    item.appendChild(children);
+  }
+
+  return item;
+}
+
+function buildLocalFileNode(virtualPath, entry, insideFolder = false) {
+  const item = document.createElement('li');
+  const row = document.createElement('div');
+  row.className = 'tree-node local-file-node';
+  row.dataset.path = virtualPath;
+
+  if (explorerSelectedPaths.has(virtualPath) || selectedNodePath === virtualPath) {
+    row.classList.add('selected');
+  }
+
+  const fileIcon = document.createElement('span');
+  fileIcon.className = `file-type-icon ${getFileTypeIconClass(entry.name)}`;
+
+  const label = document.createElement('span');
+  label.className = 'tree-node-label';
+  const displayName = insideFolder ? entry.name.split('/').pop() : entry.name;
+  label.textContent = displayName;
+
+  const badge = document.createElement('span');
+  badge.className = 'local-file-badge';
+  badge.textContent = 'local';
+  badge.title = 'Stored only on your machine';
+
+  row.appendChild(fileIcon);
+  row.appendChild(label);
+  row.appendChild(badge);
+
+  const localEntry = collabLocalFiles.get(virtualPath);
+  const fileState = openFiles.get(virtualPath);
+  const isFileDirty = fileState && fileState.kind === 'text'
+    ? fileState.model.getValue() !== (localEntry ? localEntry.content : '')
+    : false;
+  if (isFileDirty) {
+    const dot = document.createElement('span');
+    dot.className = 'tab-dirty-indicator';
+    row.appendChild(dot);
+  }
+
+  if (inlineEditState && inlineEditState.mode === 'rename' && inlineEditState.targetPath === virtualPath) {
+    row.innerHTML = '';
+    row.appendChild(fileIcon);
+    const renameInput = document.createElement('input');
+    renameInput.className = 'tree-inline-input';
+    renameInput.type = 'text';
+    renameInput.value = entry.name.split('/').pop();
+    const commitRename = async () => { await commitInlineEdit(renameInput.value); };
+    renameInput.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); await commitRename(); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit(); }
+    });
+    renameInput.addEventListener('blur', async () => { if (document.body.contains(renameInput)) await commitRename(); });
+    row.appendChild(renameInput);
+    requestAnimationFrame(() => { renameInput.focus(); renameInput.select(); });
+  }
+
+  let clickTimer = null;
+  row.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (clickTimer) clearTimeout(clickTimer);
+    clickTimer = setTimeout(async () => {
+      clickTimer = null;
+      setExplorerPanelFocus(true);
+      selectedNodePath = virtualPath;
+      explorerSelectedPaths.clear();
+      explorerSelectedPaths.add(virtualPath);
+      await openFile(virtualPath, { mode: 'preview' });
+      renderTree();
+    }, 220);
+  });
+
+  row.addEventListener('dblclick', async (e) => {
+    e.stopPropagation();
+    if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
+    setExplorerPanelFocus(true);
+    selectedNodePath = virtualPath;
+    explorerSelectedPaths.clear();
+    explorerSelectedPaths.add(virtualPath);
+    await openFile(virtualPath, { mode: 'permanent' });
+    renderTree();
+  });
+
+  row.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    selectedNodePath = virtualPath;
+    explorerSelectedPaths.clear();
+    explorerSelectedPaths.add(virtualPath);
+    showLocalFileContextMenu(e, virtualPath, entry);
+  });
+
+  item.appendChild(row);
+  return item;
+}
+
+function showLocalFileContextMenu(event, virtualPath, entry) {
+  ensureExplorerContextMenu();
+  explorerMenu.innerHTML = '';
+
+  addExplorerMenuItem(explorerMenu, 'Open', async () => {
+    await openFile(virtualPath, { mode: 'permanent' });
+  });
+  addExplorerMenuDivider(explorerMenu);
+  addExplorerMenuItem(explorerMenu, 'Rename', () => {
+    inlineEditState = { mode: 'rename', targetType: 'file', targetPath: virtualPath };
+    renderTree();
+  });
+  addExplorerMenuItem(explorerMenu, 'Delete', async () => {
+    const displayName = entry.name.split('/').pop();
+    const ok = await showConfirmDialog({
+      title: 'Delete Local File',
+      message: `Delete "${displayName}" from your local storage? This cannot be undone.`,
+      confirmLabel: 'Delete',
+      confirmStyle: 'danger'
+    });
+    if (!ok) return;
+    try {
+      await api.deleteCollabLocalFile({ fingerprint: collabProjectFingerprint, name: entry.name });
+      collabLocalFiles.delete(virtualPath);
+      if (openFiles.has(virtualPath)) await closeTab(virtualPath);
+    } catch { /* ignore */ }
+    renderTree();
+  });
+
+  explorerMenu.style.left = `${event.clientX}px`;
+  explorerMenu.style.top = `${event.clientY}px`;
+  explorerMenu.classList.remove('hidden');
+}
+
+function showLocalFolderContextMenu(event, folderKey, folder) {
+  ensureExplorerContextMenu();
+  explorerMenu.innerHTML = '';
+
+  addExplorerMenuItem(explorerMenu, 'New File', () => {
+    folder.expanded = true;
+    inlineEditState = { mode: 'create', targetType: 'file', parentPath: folderKey + '/', value: '' };
+    renderTree();
+  });
+  addExplorerMenuDivider(explorerMenu);
+  addExplorerMenuItem(explorerMenu, 'Rename', () => {
+    inlineEditState = { mode: 'rename', targetType: 'folder', targetPath: folderKey };
+    renderTree();
+  });
+  addExplorerMenuItem(explorerMenu, 'Delete', async () => {
+    const ok = await showConfirmDialog({
+      title: 'Delete Local Folder',
+      message: `Delete "${folder.name}" and all its files from your local storage? This cannot be undone.`,
+      confirmLabel: 'Delete',
+      confirmStyle: 'danger'
+    });
+    if (!ok) return;
+    try {
+      await api.deleteCollabLocalFile({ fingerprint: collabProjectFingerprint, name: folder.name });
+      collabLocalFolders.delete(folderKey);
+      const prefix = folderKey + '/';
+      for (const [key] of [...collabLocalFiles.entries()]) {
+        if (key.startsWith(prefix)) {
+          if (openFiles.has(key)) await closeTab(key);
+          collabLocalFiles.delete(key);
+        }
+      }
+    } catch { /* ignore */ }
+    renderTree();
+  });
+
+  explorerMenu.style.left = `${event.clientX}px`;
+  explorerMenu.style.top = `${event.clientY}px`;
+  explorerMenu.classList.remove('hidden');
+}
+
 function renderTree() {
   treeRoot.innerHTML = '';
   clearExplorerDragVisualState();
@@ -7792,6 +8533,22 @@ function renderTree() {
   const list = document.createElement('ul');
   for (const node of project.tree) {
     list.appendChild(buildTreeNode(node));
+  }
+
+  if (collabConnected && collabMode === 'remote' && !collabIsSessionHost) {
+    for (const [folderKey, folder] of collabLocalFolders) {
+      list.appendChild(buildLocalFolderNode(folderKey, folder));
+    }
+
+    for (const [virtualPath, entry] of collabLocalFiles) {
+      if (!entry.name.includes('/')) {
+        list.appendChild(buildLocalFileNode(virtualPath, entry));
+      }
+    }
+
+    if (inlineEditState && inlineEditState.mode === 'create' && inlineEditState.parentPath === LOCAL_FILE_PREFIX) {
+      list.appendChild(buildLocalInlineCreateInput(LOCAL_FILE_PREFIX, 'New local file name'));
+    }
   }
 
   if (inlineEditState && inlineEditState.mode === 'create' && inlineEditState.parentPath === project.rootPath) {
@@ -7821,7 +8578,7 @@ function renderTree() {
       }
     });
     input.addEventListener('blur', async () => {
-      await commit();
+      if (document.body.contains(input)) await commit();
     });
 
     row.appendChild(icon);
@@ -7945,7 +8702,66 @@ function collabFilePathToProjectPath(collabPath) {
   return `${normalizedRoot}\\${normalizedPath.replace(/\//g, '\\')}`;
 }
 
+function isClientIgnoredPath(name) {
+  const rel = normalizeCollabRelativePath(name || '');
+  if (!rel) return false;
+  // Always treat .qwcode and its contents as local-only
+  if (rel === '.qwcode' || rel.startsWith('.qwcode/')) return true;
+  if (!collabLocalGitignorePatterns) return false;
+  if (!window.qwaleApi || typeof window.qwaleApi.isGitignorePathIgnored !== 'function') return false;
+  return window.qwaleApi.isGitignorePathIgnored(collabLocalGitignorePatterns, rel);
+}
+
+async function loadCollabLocalFiles(fingerprint) {
+  collabLocalFiles.clear();
+  collabLocalFolders.clear();
+  try {
+    const entries = await api.listCollabLocalFiles({ fingerprint });
+    for (const entry of entries) {
+      if (entry.type === 'folder') {
+        const folderKey = LOCAL_FILE_PREFIX + entry.name;
+        collabLocalFolders.set(folderKey, { name: entry.name, expanded: false });
+        for (const child of entry.children || []) {
+          const fileKey = LOCAL_FILE_PREFIX + entry.name + '/' + child.name;
+          collabLocalFiles.set(fileKey, { name: entry.name + '/' + child.name, content: null, dirty: false });
+        }
+      } else {
+        collabLocalFiles.set(LOCAL_FILE_PREFIX + entry.name, { name: entry.name, content: null, dirty: false });
+      }
+    }
+  } catch { /* non-fatal */ }
+  renderTree();
+}
+
+async function createLocalCollabFolder(name) {
+  if (!collabProjectFingerprint) return;
+  if (!name || name.includes('/') || name.includes('\\')) return;
+  const key = LOCAL_FILE_PREFIX + name;
+  if (collabLocalFolders.has(key)) return;
+  await api.createCollabLocalFolder({ fingerprint: collabProjectFingerprint, name });
+  collabLocalFolders.set(key, { name, expanded: true });
+  renderTree();
+}
+
+async function createLocalCollabFile(name) {
+  if (!collabProjectFingerprint) return;
+  if (!name || name.includes('\\')) return;
+  // allow at most one folder level: 'folder/file'
+  const parts = name.split('/');
+  if (parts.length > 2 || parts.some(p => !p || p === '.' || p === '..')) return;
+  const key = LOCAL_FILE_PREFIX + name;
+  if (collabLocalFiles.has(key)) {
+    await openFile(key, { mode: 'permanent' });
+    return;
+  }
+  await api.writeCollabLocalFile({ fingerprint: collabProjectFingerprint, name, content: '' });
+  collabLocalFiles.set(key, { name, content: '', dirty: false });
+  renderTree();
+  await openFile(key, { mode: 'permanent' });
+}
+
 function projectPathToCollabPath(projectPath) {
+  if (String(projectPath || '').startsWith(LOCAL_FILE_PREFIX)) return '';
   const fullPath = String(projectPath || '');
   if (!fullPath) {
     return '';
@@ -7966,6 +8782,322 @@ function projectPathToCollabPath(projectPath) {
   }
 
   return normalizedPath;
+}
+
+function normalizeCollabRelativePath(relativePath) {
+  return String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function isBinaryFile(relativePath) {
+  const p = String(relativePath || '').toLowerCase();
+  return /\.(png|jpg|jpeg|gif|webp|svg|ico|pdf|zip|tar|gz|rar|bmp|mp4|mov|mp3|wav|ogg|ttf|woff|woff2)$/i.test(p);
+}
+
+function promptExternalEditConflict(relativePath) {
+  const name = String(relativePath || '').split('/').pop() || relativePath;
+  // Return true when user chooses to use external version, false to keep local edits
+  return window.confirm(`${name} was modified externally. Replace unsaved local edits with the external version? (OK = Use external)`);
+}
+
+const collabRecentWrites = new Map();
+
+function markRecentCollabWrite(relPath) {
+  const normalizedPath = normalizeCollabRelativePath(relPath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  const expiry = Date.now() + 1500;
+  collabRecentWrites.set(normalizedPath, expiry);
+  setTimeout(() => {
+    const currentExpiry = collabRecentWrites.get(normalizedPath);
+    if (currentExpiry && currentExpiry <= Date.now()) {
+      collabRecentWrites.delete(normalizedPath);
+    }
+  }, 2000);
+}
+
+function isRecentlyCollabWritten(relPath) {
+  const normalizedPath = normalizeCollabRelativePath(relPath);
+  if (!normalizedPath) {
+    return false;
+  }
+
+  const expiry = collabRecentWrites.get(normalizedPath);
+  return Boolean(expiry && expiry > Date.now());
+}
+
+function canUseCollabSharedMirror() {
+  return collabConnected
+    && collabMode === 'remote'
+    && Boolean(collabProjectFingerprint)
+    && Boolean(collabSharedWorkspaceRoot);
+}
+
+async function syncCollabSharedFile(relativePath, content, encoding = 'utf8') {
+  if (!canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const normalizedPath = normalizeCollabRelativePath(relativePath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  markRecentCollabWrite(normalizedPath);
+  await api.writeCollabSharedFile({
+    fingerprint: collabProjectFingerprint,
+    relativePath: normalizedPath,
+    content,
+    encoding
+  });
+}
+
+async function syncCollabSharedDelete(relativePath) {
+  if (!canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const normalizedPath = normalizeCollabRelativePath(relativePath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  markRecentCollabWrite(normalizedPath);
+  await api.deleteCollabSharedPath({
+    fingerprint: collabProjectFingerprint,
+    relativePath: normalizedPath
+  });
+}
+
+async function syncCollabSharedRename(oldRelativePath, newRelativePath) {
+  if (!canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const oldPath = normalizeCollabRelativePath(oldRelativePath);
+  const newPath = normalizeCollabRelativePath(newRelativePath);
+  if (!oldPath || !newPath) {
+    return;
+  }
+
+  markRecentCollabWrite(oldPath);
+  markRecentCollabWrite(newPath);
+  await api.renameCollabSharedPath({
+    fingerprint: collabProjectFingerprint,
+    oldRelativePath: oldPath,
+    newRelativePath: newPath
+  });
+}
+
+async function syncCollabSharedEnsureFolder(relativePath) {
+  if (!canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const normalizedPath = normalizeCollabRelativePath(relativePath);
+  if (!normalizedPath) {
+    return;
+  }
+
+  markRecentCollabWrite(normalizedPath);
+  await api.ensureCollabSharedFolder({
+    fingerprint: collabProjectFingerprint,
+    relativePath: normalizedPath
+  });
+}
+
+function queueCollabSharedTextWrite(projectPath, content) {
+  if (!canUseCollabSharedMirror() || !projectPath || String(projectPath).startsWith(LOCAL_FILE_PREFIX)) {
+    return;
+  }
+
+  const collabPath = normalizeCollabRelativePath(projectPathToCollabPath(projectPath));
+  if (!collabPath) {
+    return;
+  }
+
+  if (collabSharedWriteTimers.has(collabPath)) {
+    clearTimeout(collabSharedWriteTimers.get(collabPath));
+  }
+
+  const timer = setTimeout(() => {
+    collabSharedWriteTimers.delete(collabPath);
+    markRecentCollabWrite(collabPath);
+    syncCollabSharedFile(collabPath, String(content ?? ''), 'utf8').catch(() => {});
+  }, 120);
+
+  collabSharedWriteTimers.set(collabPath, timer);
+}
+
+function collectSnapshotEntries(nodes) {
+  const folders = [];
+  const files = [];
+  const queue = Array.isArray(nodes) ? [...nodes] : [];
+
+  while (queue.length) {
+    const node = queue.shift();
+    if (!node || !node.path || !node.type) {
+      continue;
+    }
+
+    const relPath = normalizeCollabRelativePath(node.path);
+    if (!relPath) {
+      continue;
+    }
+
+    if (node.type === 'folder') {
+      folders.push(relPath);
+      if (Array.isArray(node.children) && node.children.length) {
+        queue.push(...node.children);
+      }
+    } else if (node.type === 'file') {
+      files.push(relPath);
+    }
+  }
+
+  return { folders, files };
+}
+
+async function initializeCollabSharedWorkspace(snapshot, fingerprint) {
+  if (!fingerprint) {
+    collabSharedWorkspaceRoot = '';
+    collabSharedWorkspaceReady = Promise.resolve();
+    return;
+  }
+
+  const syncToken = ++collabSharedWorkspaceSyncToken;
+  const pending = (async () => {
+    const rootPayload = await api.getCollabSharedRoot({ fingerprint });
+    if (syncToken !== collabSharedWorkspaceSyncToken) {
+      return;
+    }
+
+    collabSharedWorkspaceRoot = String(rootPayload && rootPayload.rootPath ? rootPayload.rootPath : '');
+    await api.resetCollabSharedWorkspace({ fingerprint });
+
+    const snapshotTree = Array.isArray(snapshot && snapshot.tree) ? snapshot.tree : [];
+    const { folders, files } = collectSnapshotEntries(snapshotTree);
+
+      // Populate local-only paths from the initial snapshot based on .gitignore
+      try {
+        collabLocalOnlyPaths.clear();
+        for (const p of [...folders, ...files]) {
+          try {
+            if (isClientIgnoredPath(p)) collabLocalOnlyPaths.add(p);
+          } catch { /* ignore per-path classification errors */ }
+        }
+      } catch { /* non-fatal */ }
+
+    for (const folderPath of folders) {
+      if (syncToken !== collabSharedWorkspaceSyncToken) {
+        return;
+      }
+
+      await api.ensureCollabSharedFolder({
+        fingerprint,
+        relativePath: folderPath
+      });
+    }
+
+    const queue = [...files];
+    const workerCount = Math.max(1, Math.min(6, queue.length || 1));
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (queue.length) {
+        if (syncToken !== collabSharedWorkspaceSyncToken) {
+          return;
+        }
+
+        const filePath = queue.shift();
+        if (!filePath) {
+          continue;
+        }
+
+        try {
+          const response = await sendCollabRequest('file:get', { filePath });
+          const responseContent = String(response && response.content ? response.content : '');
+          const responseEncoding = String(response && response.encoding ? response.encoding : '').toLowerCase();
+
+          await api.writeCollabSharedFile({
+            fingerprint,
+            relativePath: filePath,
+            content: responseContent,
+            encoding: responseEncoding === 'base64' ? 'base64' : 'utf8'
+          });
+        } catch {
+          // Ignore per-file fetch failures during initial sync.
+        }
+      }
+    });
+
+    await Promise.all(workers);
+  })();
+
+  collabSharedWorkspaceReady = pending;
+  await pending;
+}
+
+async function syncCollabFileOperationToSharedMirror(operation, responsePath = '') {
+  if (!operation || typeof operation.type !== 'string' || !canUseCollabSharedMirror()) {
+    return;
+  }
+
+  const type = String(operation.type || '').toLowerCase();
+  if (type === 'create-file') {
+    const fallbackPath = normalizeCollabRelativePath(`${String(operation.parentPath || '').replace(/[\\/]+$/, '')}/${String(operation.name || '').replace(/^\/+/, '')}`);
+    const targetPath = normalizeCollabRelativePath(responsePath || fallbackPath);
+    if (targetPath) {
+      await syncCollabSharedFile(targetPath, '', 'utf8');
+    }
+    return;
+  }
+
+  if (type === 'create-folder') {
+    const fallbackPath = normalizeCollabRelativePath(`${String(operation.parentPath || '').replace(/[\\/]+$/, '')}/${String(operation.name || '').replace(/^\/+/, '')}`);
+    const targetPath = normalizeCollabRelativePath(responsePath || fallbackPath);
+    if (targetPath) {
+      await syncCollabSharedEnsureFolder(targetPath);
+    }
+    return;
+  }
+
+  if (type === 'delete') {
+    const targetPath = normalizeCollabRelativePath(operation.targetPath || operation.sourcePath || responsePath);
+    if (targetPath) {
+      await syncCollabSharedDelete(targetPath);
+    }
+    return;
+  }
+
+  if (type === 'rename') {
+    const sourcePath = normalizeCollabRelativePath(operation.targetPath || operation.sourcePath);
+    const destinationPath = normalizeCollabRelativePath(responsePath || operation.destinationPath);
+    if (sourcePath && destinationPath) {
+      await syncCollabSharedRename(sourcePath, destinationPath);
+    }
+    return;
+  }
+
+  if (type === 'move') {
+    const sourcePath = normalizeCollabRelativePath(operation.sourcePath || operation.targetPath);
+    const destinationPath = normalizeCollabRelativePath(responsePath || operation.destinationPath);
+    if (sourcePath && destinationPath) {
+      await syncCollabSharedRename(sourcePath, destinationPath);
+    }
+  }
+}
+
+async function sendCollabFileOperation(operation) {
+  // Skip operations on local-only files (they won't sync to host)
+  const targetPath = operation && (operation.targetPath || operation.sourcePath || '');
+  if (targetPath && collabLocalOnlyPaths.has(normalizeCollabRelativePath(targetPath))) {
+    await syncCollabFileOperationToSharedMirror(operation, '');
+    return {};
+  }
+
+  const response = await sendCollabRequest('file:operation', { operation });
+  await syncCollabFileOperationToSharedMirror(operation, response && response.path ? response.path : '');
+  return response;
 }
 
 function addCollabActivity(message) {
@@ -9082,13 +10214,13 @@ function renderCollabQuickButton() {
 }
 
 async function copyCollabJoinDetails() {
-  const serverUrl = String(collabServerUrlInput.value || '').trim();
+  const relayUrl = String(collabServerUrlInput.value || '').trim();
   const code = String(collabCodeInput.value || collabSessionCode || '').trim().toUpperCase();
-  if (!serverUrl || !code) {
+  if (!relayUrl || !code) {
     throw new Error('Session details are not available yet.');
   }
 
-  await api.copyToClipboard(`Server: ${serverUrl}\nCode: ${code}`);
+  await api.copyToClipboard(`Relay: ${relayUrl}\nCode: ${code}`);
   setCollabInfo('Join details copied to clipboard');
 }
 
@@ -9418,7 +10550,9 @@ function sendCollabPacket(type, payload = {}) {
     return;
   }
 
-  collabSocket.send(JSON.stringify({ type, ...payload }));
+  // All collaboration-protocol traffic is wrapped in a relay envelope so the
+  // relay server can forward it to the host without understanding its contents.
+  collabSocket.send(JSON.stringify({ kind: 'relay', data: { type, ...payload } }));
 }
 
 function sendCollabRequest(type, payload = {}) {
@@ -9518,6 +10652,34 @@ function clearCollabSessionState() {
     collabCursorBroadcastTimer = null;
   }
 
+  for (const timer of collabSharedWriteTimers.values()) {
+    clearTimeout(timer);
+  }
+  collabSharedWriteTimers.clear();
+  collabSharedWorkspaceSyncToken += 1;
+  collabSharedWorkspaceReady = Promise.resolve();
+  collabSharedWorkspaceRoot = '';
+  collabLocalOnlyPaths.clear();
+
+  try {
+    api.stopCollabSharedWatcher && api.stopCollabSharedWatcher().catch(() => {});
+  } catch {
+    // ignore
+  }
+
+  if (collabProjectFingerprint) {
+    for (const [, entry] of collabLocalFiles) {
+      if (entry.dirty && entry.content !== null) {
+        api.writeCollabLocalFile({ fingerprint: collabProjectFingerprint,
+          name: entry.name, content: entry.content }).catch(() => {});
+      }
+    }
+  }
+  collabProjectFingerprint = null;
+  collabLocalFiles.clear();
+  collabLocalFolders.clear();
+  collabLocalGitignorePatterns = '';
+
   collabClientId = null;
   collabIsSessionHost = false;
   collabConnected = false;
@@ -9603,6 +10765,7 @@ function applyRemoteOperationBatchToModel(filePath, ops, nextVersion) {
   state.savedContent = model.getValue();
   state.encoding = inferEncodingFromText(state.savedContent);
   collabFileVersions.set(projectPathToCollabPath(filePath), Math.max(0, Number(nextVersion) || 0));
+  queueCollabSharedTextWrite(filePath, state.savedContent);
   updateEditorStatusBar();
   renderTabs();
   renderTree();
@@ -9704,8 +10867,11 @@ async function openFileWithCollabSupport(filePath) {
 
   const collabPath = projectPathToCollabPath(filePath);
   const response = await sendCollabRequest('file:get', { filePath: collabPath });
+  const responseContent = String(response.content || '');
+  const responseEncoding = String(response.encoding || '').toLowerCase();
+  await syncCollabSharedFile(collabPath, responseContent, responseEncoding === 'base64' ? 'base64' : 'utf8').catch(() => {});
   return {
-    content: String(response.content || ''),
+    content: responseContent,
     version: Math.max(0, Number(response.version) || 0),
     encoding: String(response.encoding || ''),
     mimeType: String(response.mimeType || '')
@@ -9868,9 +11034,20 @@ async function handleCollabPacket(packet) {
 
     const operation = packet.operation && typeof packet.operation === 'object' ? packet.operation : null;
     const changeType = String(operation && operation.type ? operation.type : '').toLowerCase();
+    if (!changeType) {
+      return;
+    }
+
+    if (changeType === 'create-file' || changeType === 'create-folder') {
+      await syncCollabFileOperationToSharedMirror(operation).catch(() => {});
+      return;
+    }
+
     if (changeType !== 'delete' && changeType !== 'rename' && changeType !== 'move') {
       return;
     }
+
+    await syncCollabFileOperationToSharedMirror(operation).catch(() => {});
 
     const sourcePath = collabFilePathToProjectPath(operation.sourcePath || operation.targetPath || '');
     const destinationPath = collabFilePathToProjectPath(operation.destinationPath || '');
@@ -9891,13 +11068,55 @@ async function handleCollabPacket(packet) {
   if (packet.type === 'file:ops') {
     const projectPath = collabFilePathToProjectPath(packet.filePath || '');
     applyRemoteOperationBatchToModel(projectPath, packet.ops || [], packet.toVersion);
+    if (!(openFiles.get(projectPath) && openFiles.get(projectPath).kind === 'text')) {
+      const collabPath = normalizeCollabRelativePath(packet.filePath || '');
+      if (collabPath) {
+        sendCollabRequest('file:get', { filePath: collabPath }).then((response) => {
+          const responseContent = String(response && response.content ? response.content : '');
+          const responseEncoding = String(response && response.encoding ? response.encoding : '').toLowerCase();
+          syncCollabSharedFile(collabPath, responseContent, responseEncoding === 'base64' ? 'base64' : 'utf8').catch(() => {});
+        }).catch(() => {});
+      }
+    }
     return;
   }
 
   if (packet.type === 'file:sync') {
     const projectPath = collabFilePathToProjectPath(packet.filePath || '');
     const state = openFiles.get(projectPath);
+    const encoding = String(packet.encoding || 'utf8').toLowerCase();
+    const collabPath = normalizeCollabRelativePath(packet.filePath || '');
+
+    if (encoding === 'base64') {
+      const content = String(packet.content || '');
+      const mimeType = String(packet.mimeType || '').trim() || (isImageFile(projectPath) ? `image/${(projectPath.match(/\.([^.\\/]+)$/) || [])[1] || 'png'}` : 'application/octet-stream');
+
+      if (state && state.kind === 'image') {
+        state.imageSrc = `data:${mimeType};base64,${content}`;
+        state.imageDimensions = null;
+        if (projectPath === currentFilePath) {
+          showImagePreview(projectPath, state.imageSrc);
+        }
+        if (splitEnabled && projectPath === rightFilePath) {
+          showImagePreviewRight(projectPath, state.imageSrc);
+        }
+      }
+
+      if (collabPath) {
+        syncCollabSharedFile(collabPath, content, 'base64').catch(() => {});
+      }
+
+      if (state && state.kind === 'image') {
+        renderTabs();
+        renderTree();
+      }
+      return;
+    }
+
     if (!state || state.kind !== 'text') {
+      if (collabPath) {
+        syncCollabSharedFile(collabPath, String(packet.content || ''), 'utf8').catch(() => {});
+      }
       return;
     }
 
@@ -9906,6 +11125,7 @@ async function handleCollabPacket(packet) {
     collabSuppressBroadcast = false;
     state.savedContent = state.model.getValue();
     collabFileVersions.set(projectPathToCollabPath(projectPath), Math.max(0, Number(packet.version) || 0));
+    queueCollabSharedTextWrite(projectPath, state.savedContent);
     renderTabs();
     renderTree();
     return;
@@ -9927,12 +11147,94 @@ async function handleCollabPacket(packet) {
   }
 }
 
-function connectCollabSocket(serverUrl, code, name, mode) {
+function connectCollabSocket(relayUrl, code, name, mode) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(serverUrl);
+    const socket = new WebSocket(relayUrl);
     let settled = false;
+    let relayJoined = false;
 
-    socket.addEventListener('open', async () => {
+    socket.addEventListener('open', () => {
+      // Relay-level handshake: ask the relay to attach this connection to the
+      // session identified by `code`. Once acknowledged, the normal collaboration
+      // protocol handshake (`join`) proceeds transparently through the relay.
+      socket.send(JSON.stringify({ kind: 'join-session', code }));
+    });
+
+    socket.addEventListener('message', (event) => {
+      const packet = (() => {
+        try {
+          return JSON.parse(String(event.data || ''));
+        } catch {
+          return null;
+        }
+      })();
+
+      if (!packet || typeof packet.kind !== 'string') {
+        return;
+      }
+
+      if (packet.kind === 'session-joined') {
+        if (relayJoined) {
+          return;
+        }
+        relayJoined = true;
+        void beginCollabHandshake();
+        return;
+      }
+
+      if (packet.kind === 'error') {
+        if (!settled) {
+          settled = true;
+          reject(new Error(packet.message || 'Could not join the collaboration session.'));
+          try {
+            socket.close();
+          } catch {
+            // Ignore close errors.
+          }
+        }
+        return;
+      }
+
+      if (packet.kind === 'host-left') {
+        collabDisconnectNotice = packet.message || 'Host ended the session.';
+        return;
+      }
+
+      if (packet.kind !== 'relay') {
+        return;
+      }
+
+      void handleCollabPacket(packet.data).catch(() => {});
+    });
+
+    socket.addEventListener('close', () => {
+      const wasRemoteSession = collabMode === 'remote';
+      const disconnectNotice = collabDisconnectNotice || 'Collaboration offline';
+      collabDisconnectNotice = '';
+      collabSocket = null;
+      clearCollabSessionState();
+      addCollabChatSystemMessage(disconnectNotice);
+      if (wasRemoteSession) {
+        teardownRemoteCollaborationWorkspace(disconnectNotice).catch((error) => {
+          setCollabInfo(error && error.message ? error.message : 'Collaboration offline');
+        });
+      } else {
+        setCollabInfo(disconnectNotice);
+      }
+      if (!settled) {
+        settled = true;
+        reject(new Error('Collaboration connection closed.'));
+      }
+    });
+
+    socket.addEventListener('error', () => {
+      if (!settled) {
+        settled = true;
+        reject(new Error('Could not connect to the relay server.'));
+      }
+    });
+
+    async function beginCollabHandshake() {
       collabSocket = socket;
       try {
         const joinResponse = await sendCollabRequest('join', {
@@ -9962,6 +11264,9 @@ function connectCollabSocket(serverUrl, code, name, mode) {
         }
 
         if (mode === 'remote') {
+          collabProjectFingerprint = joinResponse.projectFingerprint || null;
+          collabLocalGitignorePatterns = joinResponse.gitignorePatterns || '';
+          collabLocalGitignoreMatcher = null;
           project = {
             rootPath: '/',
             rootName: joinResponse.snapshot && joinResponse.snapshot.rootName ? joinResponse.snapshot.rootName : 'Shared Project',
@@ -9970,9 +11275,31 @@ function connectCollabSocket(serverUrl, code, name, mode) {
           projectInfo.textContent = `${project.rootName}  |  shared`;
           expandedFolders.clear();
           expandedFolders.add('/');
-          renderTree();
           refreshFileSearchIndex();
           applyScmState('no-project');
+          if (collabProjectFingerprint) {
+            await loadCollabLocalFiles(collabProjectFingerprint);
+            collabSharedWorkspaceReady = initializeCollabSharedWorkspace(joinResponse.snapshot || {}, collabProjectFingerprint)
+              .catch(() => {
+                collabSharedWorkspaceRoot = '';
+              });
+            await collabSharedWorkspaceReady;
+            // Start shared-folder watcher so we can classify terminal-created files
+            try {
+              await api.startCollabSharedWatcher({ fingerprint: collabProjectFingerprint });
+            } catch {
+              // ignore watcher start failures
+            }
+            try {
+              await api.startCollabLocalWatcher({ fingerprint: collabProjectFingerprint });
+            } catch {
+              // ignore local watcher start failures
+            }
+          } else {
+            collabSharedWorkspaceRoot = '';
+            collabSharedWorkspaceReady = Promise.resolve();
+            renderTree();
+          }
         }
 
         renderCollabPresence();
@@ -9987,44 +11314,7 @@ function connectCollabSocket(serverUrl, code, name, mode) {
         settled = true;
         reject(error);
       }
-    });
-
-    socket.addEventListener('message', (event) => {
-      const packet = (() => {
-        try {
-          return JSON.parse(String(event.data || ''));
-        } catch {
-          return null;
-        }
-      })();
-
-      void handleCollabPacket(packet).catch(() => {});
-    });
-
-    socket.addEventListener('close', () => {
-      const wasRemoteSession = collabMode === 'remote';
-      const disconnectNotice = collabDisconnectNotice || 'Collaboration offline';
-      collabDisconnectNotice = '';
-      collabSocket = null;
-      clearCollabSessionState();
-      addCollabChatSystemMessage(disconnectNotice);
-      if (wasRemoteSession) {
-        teardownRemoteCollaborationWorkspace(disconnectNotice).catch((error) => {
-          setCollabInfo(error && error.message ? error.message : 'Collaboration offline');
-        });
-      } else {
-        setCollabInfo(disconnectNotice);
-      }
-      if (!settled) {
-        reject(new Error('Collaboration connection closed.'));
-      }
-    });
-
-    socket.addEventListener('error', () => {
-      if (!settled) {
-        reject(new Error('Could not connect to collaboration host.'));
-      }
-    });
+    }
   });
 }
 
@@ -10033,17 +11323,19 @@ async function startCollaborationAsHost() {
     throw new Error('Open a local project first.');
   }
 
-  const info = await api.startCollabServer({});
-  const defaultUrl = Array.isArray(info.urls) && info.urls.length > 0 ? info.urls[0] : '';
-  const shareUrl = defaultUrl || `ws://127.0.0.1:${info.port}`;
-  collabServerUrlInput.value = shareUrl;
+  const relayUrl = String(collabServerUrlInput.value || '').trim();
+  if (!relayUrl) {
+    throw new Error('Enter the relay server URL first.');
+  }
+
+  const info = await api.startCollabServer({ relayUrl });
   collabCodeInput.value = info.code || '';
 
   if (!collabConnected) {
-    await connectCollabSocket(shareUrl, info.code, getRequestedCollabName(), 'host');
+    await connectCollabSocket(relayUrl, info.code, getRequestedCollabName(), 'host');
   }
 
-  setCollabInfo(`Sharing on ${shareUrl} - Code ${info.code}`);
+  setCollabInfo(`Sharing via ${relayUrl} - Code ${info.code}`);
   addCollabActivity(`Sharing started. Code: ${info.code}`);
   addCollabChatSystemMessage(`Sharing started. Code: ${info.code}`);
 }
@@ -10053,22 +11345,22 @@ async function joinCollaborationAsClient() {
     return;
   }
 
-  const serverUrl = String(collabServerUrlInput.value || '').trim();
+  const relayUrl = String(collabServerUrlInput.value || '').trim();
   const code = String(collabCodeInput.value || '').trim().toUpperCase();
-  if (!serverUrl || !code) {
-    throw new Error('Enter both server URL and session code.');
+  if (!relayUrl || !code) {
+    throw new Error('Enter the relay server URL and session code.');
   }
 
   if (project.rootPath) {
     await api.openCollabJoinWindow({
-      serverUrl,
+      relayUrl,
       code,
       name: getRequestedCollabName()
     });
     return;
   }
 
-  await connectCollabSocket(serverUrl, code, getRequestedCollabName(), 'remote');
+  await connectCollabSocket(relayUrl, code, getRequestedCollabName(), 'remote');
 }
 
 async function stopCollaborationSession() {
@@ -10090,7 +11382,6 @@ async function stopCollaborationSession() {
 
   if (wasHostSession) {
     await api.stopCollabServer();
-    collabServerUrlInput.value = '';
     collabCodeInput.value = '';
   }
 
@@ -10240,7 +11531,15 @@ async function openFile(filePath, options = {}) {
     let content = '';
     let encoding = 'UTF-8';
 
-    if (collabConnected && collabMode === 'remote') {
+    const isLocalFile = String(filePath || '').startsWith(LOCAL_FILE_PREFIX);
+    if (isLocalFile && collabProjectFingerprint) {
+      const name = filePath.slice(LOCAL_FILE_PREFIX.length);
+      const raw = await api.readCollabLocalFile({ fingerprint: collabProjectFingerprint, name });
+      content = typeof raw === 'string' ? raw : '';
+      const entry = collabLocalFiles.get(filePath);
+      if (entry && entry.content === null) entry.content = content;
+      encoding = inferEncodingFromText(content);
+    } else if (collabConnected && collabMode === 'remote') {
       const collabFile = await openFileWithCollabSupport(filePath);
       content = collabFile && typeof collabFile.content === 'string' ? collabFile.content : '';
       encoding = inferEncodingFromText(content);
@@ -10272,11 +11571,13 @@ async function openFile(filePath, options = {}) {
 }
 
 async function saveCurrentFile() {
-  if (!canRunSaveActions()) {
+  if (!currentFilePath) {
     return;
   }
 
-  if (!currentFilePath) {
+  const isLocalFile = currentFilePath.startsWith(LOCAL_FILE_PREFIX);
+
+  if (!isLocalFile && !canRunSaveActions()) {
     return;
   }
 
@@ -10287,7 +11588,12 @@ async function saveCurrentFile() {
 
   const content = fileState.model.getValue();
 
-  if (!isCollabAutosaveMode()) {
+  if (isLocalFile && collabProjectFingerprint) {
+    const name = currentFilePath.slice(LOCAL_FILE_PREFIX.length);
+    await api.writeCollabLocalFile({ fingerprint: collabProjectFingerprint, name, content });
+    const entry = collabLocalFiles.get(currentFilePath);
+    if (entry) { entry.content = content; entry.dirty = false; }
+  } else if (!isCollabAutosaveMode()) {
     await api.writeFile({
       filePath: currentFilePath,
       content
@@ -11082,11 +12388,11 @@ if (api.onMenuAction) {
         toggleThemeMode();
       } else if (action === 'collab:autoJoin') {
         setSidebarPanel('collaborate');
-        const incomingServerUrl = payload && payload.serverUrl ? String(payload.serverUrl) : '';
+        const incomingRelayUrl = payload && payload.relayUrl ? String(payload.relayUrl) : '';
         const incomingCode = payload && payload.code ? String(payload.code).toUpperCase() : '';
         const incomingName = payload && payload.name ? String(payload.name) : '';
 
-        collabServerUrlInput.value = incomingServerUrl;
+        collabServerUrlInput.value = incomingRelayUrl;
         collabCodeInput.value = incomingCode;
         if (incomingName) {
           collabNameInput.value = incomingName;
@@ -11131,6 +12437,17 @@ if (api.onCollabEvent) {
     if (!event || typeof event !== 'object') {
       return;
     }
+    // Handle shared filesystem watcher events first
+    if (event && event.type === 'collab:shared:fs-event' && event.payload) {
+      void handleSharedFsEvent(event.payload).catch(() => {});
+      return;
+    }
+
+    // Handle collab-local (client-only) filesystem watcher events
+    if (event && event.type === 'collab:local:fs-event' && event.payload) {
+      void handleLocalFsEvent(event.payload).catch(() => {});
+      return;
+    }
 
     const packet = {
       type: event.type,
@@ -11138,6 +12455,166 @@ if (api.onCollabEvent) {
     };
     void handleCollabPacket(packet).catch(() => {});
   });
+}
+
+async function handleSharedFsEvent(payload) {
+  try {
+    if (!payload || typeof payload !== 'object') return;
+    const fingerprint = String(payload.fingerprint || '');
+    if (!fingerprint || fingerprint !== collabProjectFingerprint) return;
+    const eventType = String(payload.eventType || '').toLowerCase();
+    const rel = normalizeCollabRelativePath(payload.relativePath || '');
+    if (!rel) return;
+    if (!canUseCollabSharedMirror()) return;
+
+    console.debug('handleSharedFsEvent', { eventType, relativePath: rel, fingerprint });
+
+    if (isRecentlyCollabWritten(rel)) {
+      console.debug('handleSharedFsEvent:suppressed', { eventType, relativePath: rel, fingerprint });
+      return;
+    }
+
+    const deleteEvents = new Set(['deleted', 'unlink', 'removed']);
+    const upsertEvents = new Set(['added', 'created', 'change', 'changed', 'modified', 'rename', 'moved']);
+    const exists = payload.exists === true ? true : payload.exists === false ? false : null;
+    const isDirectory = payload.isDirectory === true;
+
+    if (deleteEvents.has(eventType) || ((eventType === 'rename' || eventType === 'moved') && exists === false)) {
+      if (isClientIgnoredPath(rel)) {
+        collabLocalOnlyPaths.delete(rel);
+        try { await refreshProjectTree(); } catch {}
+        return;
+      }
+
+      try {
+        await sendCollabFileOperation({ type: 'delete', targetPath: rel });
+      } catch {}
+      try { await refreshProjectTree(); } catch {}
+      return;
+    }
+
+    if (isClientIgnoredPath(rel)) {
+      collabLocalOnlyPaths.add(rel);
+      try { await refreshProjectTree(); } catch {}
+      return;
+    }
+
+    // External folder creation/rename should be mirrored as a file operation.
+    if (exists === true && isDirectory) {
+      const parts = rel.split('/').filter(Boolean);
+      const folderName = parts.pop() || '';
+      const parentPath = parts.join('/');
+      if (folderName) {
+        try {
+          await sendCollabFileOperation({
+            type: 'create-folder',
+            parentPath,
+            name: folderName
+          });
+        } catch {
+          // Best effort; tree refresh below still updates local explorer.
+        }
+      }
+      try { await refreshProjectTree(); } catch {}
+      return;
+    }
+
+    if (!upsertEvents.has(eventType) && exists !== true) {
+      try { await refreshProjectTree(); } catch {}
+      return;
+    }
+
+    try {
+      let disk = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          disk = await api.readCollabSharedFile({ fingerprint, relativePath: rel });
+          break;
+        } catch {
+          if (attempt >= 2) {
+            throw new Error('Could not read external file from shared mirror.');
+          }
+          await new Promise((resolve) => setTimeout(resolve, 80 * (attempt + 1)));
+        }
+      }
+
+      const diskContent = typeof disk === 'string'
+        ? disk
+        : String(disk && typeof disk.content !== 'undefined' ? disk.content : '');
+      const diskEnc = typeof disk === 'object' && disk
+        ? String(disk.encoding || '').toLowerCase()
+        : '';
+      const isBinary = (diskEnc === 'base64') || isBinaryFile(rel);
+
+      const projPath = resolveProjectFilePath(rel);
+      if (projPath && isDirty(projPath)) {
+        const useExternal = promptExternalEditConflict(rel);
+        if (!useExternal) {
+          return;
+        }
+      }
+
+      try {
+        const ack = await sendCollabRequest('file:sync', {
+          filePath: rel,
+          content: diskContent,
+          encoding: isBinary ? 'base64' : 'utf8'
+        });
+        if (ack && typeof ack.version !== 'undefined') {
+          collabFileVersions.set(rel, Math.max(0, Number(ack.version) || 0));
+        }
+      } catch {
+        // Best effort: the mirror still drives the local explorer state.
+      }
+
+      try { await syncCollabSharedFile(rel, diskContent, isBinary ? 'base64' : 'utf8'); } catch {}
+      try { await refreshProjectTree(); } catch {}
+    } catch {
+      // File may have been created but not yet flushed; ensure host tree still receives create-file.
+      const parts = rel.split('/').filter(Boolean);
+      const fileName = parts.pop() || '';
+      const parentPath = parts.join('/');
+      if (fileName) {
+        try {
+          await sendCollabFileOperation({
+            type: 'create-file',
+            parentPath,
+            name: fileName
+          });
+        } catch {
+          // Best effort fallback.
+        }
+      }
+      try { await refreshProjectTree(); } catch {}
+    }
+    return;
+  } catch {
+    // swallow
+  }
+}
+
+async function handleLocalFsEvent(payload) {
+  try {
+    if (!payload || typeof payload !== 'object') return;
+    const fingerprint = String(payload.fingerprint || '');
+    if (!fingerprint || fingerprint !== collabProjectFingerprint) return;
+
+    // Debounce refresh of collab-local manifest to avoid thrash
+    if (collabLocalRefreshTimer) {
+      clearTimeout(collabLocalRefreshTimer);
+      collabLocalRefreshTimer = null;
+    }
+
+    collabLocalRefreshTimer = setTimeout(async () => {
+      collabLocalRefreshTimer = null;
+      try {
+        await loadCollabLocalFiles(fingerprint);
+      } catch {}
+      try { renderTree(); } catch {}
+    }, 250);
+  } catch {
+    // swallow
+  }
 }
 
 document.addEventListener('keydown', async (event) => {
@@ -11176,10 +12653,6 @@ document.addEventListener('keydown', async (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
     try {
-      if (!canRunSaveActions()) {
-        return;
-      }
-
       if (event.shiftKey) {
         await saveCurrentFileAs();
       } else if (event.altKey) {
@@ -11286,7 +12759,11 @@ aiSendBtn.addEventListener('click', async () => {
   autoResizeAiPrompt();
   const userIndex = recordAiConversation('user', prompt);
   addAiMessage('user', prompt, { convIndex: userIndex });
-  await saveAiConversationToDisk();
+  try {
+    await saveAiConversationToDisk();
+  } catch {
+    addAiActivity('Could not persist chat history; continuing without saving.');
+  }
   aiAbortController = new AbortController();
   setAiBusy(true);
 
@@ -11329,6 +12806,14 @@ aiPromptInput.addEventListener('input', () => {
 syncAiChatControls();
 updateCollabButtons();
 setCollabInfo('Collaboration offline');
+
+if (api.getDefaultRelayUrl) {
+  api.getDefaultRelayUrl().then((defaultRelayUrl) => {
+    if (!collabServerUrlInput.value.trim() && defaultRelayUrl) {
+      collabServerUrlInput.value = defaultRelayUrl;
+    }
+  }).catch(() => {});
+}
 
 terminalResizeHandle.addEventListener('mousedown', (event) => {
   resizeState = {
